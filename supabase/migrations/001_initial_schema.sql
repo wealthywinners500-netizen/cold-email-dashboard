@@ -1,6 +1,6 @@
--- Cold Email Dashboard — Initial Schema
+-- Cold Email Dashboard â Initial Schema
 -- Multi-tenant with Clerk Organizations + Supabase RLS
--- Clerk uses string IDs (not UUIDs) — org_id is text throughout
+-- Clerk uses string IDs (not UUIDs) â org_id is text throughout
 
 -- Organizations table (synced from Clerk via webhook)
 CREATE TABLE organizations (
@@ -183,7 +183,37 @@ CREATE INDEX idx_follow_ups_org ON follow_ups(org_id);
 CREATE INDEX idx_follow_ups_campaign ON follow_ups(campaign_id);
 CREATE INDEX idx_sending_domains_pair ON sending_domains(pair_id);
 
+-- SMS workflow stages (GHL)
+CREATE TABLE sms_workflows (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id text NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  stage text NOT NULL,
+  name text NOT NULL,
+  message_type text NOT NULL DEFAULT 'SMS',
+  message_count int NOT NULL DEFAULT 0,
+  description text,
+  tag_applied text,
+  region text NOT NULL DEFAULT 'NY',
+  store_chains text[] NOT NULL DEFAULT '{}',
+  status text NOT NULL DEFAULT 'pending_build',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE sms_workflows ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "sms_select" ON sms_workflows FOR SELECT
+  USING (org_id = (auth.jwt()->>'org_id'));
+CREATE POLICY "sms_insert" ON sms_workflows FOR INSERT
+  WITH CHECK (org_id = (auth.jwt()->>'org_id'));
+CREATE POLICY "sms_update" ON sms_workflows FOR UPDATE
+  USING (org_id = (auth.jwt()->>'org_id'));
+CREATE POLICY "sms_delete" ON sms_workflows FOR DELETE
+  USING (org_id = (auth.jwt()->>'org_id') AND (auth.jwt()->>'org_role') = 'org:admin');
+
+CREATE INDEX idx_sms_workflows_org ON sms_workflows(org_id);
+
 -- Enable Supabase Realtime on key tables
 ALTER PUBLICATION supabase_realtime ADD TABLE server_pairs;
 ALTER PUBLICATION supabase_realtime ADD TABLE campaigns;
 ALTER PUBLICATION supabase_realtime ADD TABLE follow_ups;
+ALTER PUBLICATION supabase_realtime ADD TABLE sms_workflows;
