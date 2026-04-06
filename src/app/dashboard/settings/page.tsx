@@ -8,7 +8,7 @@ import { Separator } from "@/components/ui/separator";
 import { Settings as SettingsIcon, Key, Bell, Zap, CreditCard } from "lucide-react";
 import { OrganizationProfile } from "@clerk/nextjs";
 import { getPlanLimits } from "@/lib/plan-limits";
-import Link from "next/link";
+import { BillingButton } from "./billing-button";
 
 async function getOrganization() {
   const { orgId } = await auth();
@@ -145,12 +145,7 @@ export default async function SettingsPage() {
           </div>
           <Separator className="bg-gray-800" />
           <div>
-            <Link
-              href="/pricing"
-              className="inline-block px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-semibold transition-colors"
-            >
-              Manage Billing
-            </Link>
+            <BillingButton />
           </div>
         </CardContent>
       </Card>

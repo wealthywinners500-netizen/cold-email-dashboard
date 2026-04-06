@@ -1,5 +1,9 @@
+'use client';
+
 import Link from 'next/link';
 import { Check } from 'lucide-react';
+import { useState } from 'react';
+import { useRouter } from 'next/navigation';
 
 const pricingTiers = [
   {
@@ -14,8 +18,8 @@ const pricingTiers = [
       'Email support',
       '14-day free trial',
     ],
+    plan: 'starter' as const,
     cta: 'Get Started',
-    ctaHref: '/sign-up',
     highlighted: false,
   },
   {
@@ -31,8 +35,8 @@ const pricingTiers = [
       'Priority support',
       '14-day free trial',
     ],
+    plan: 'pro' as const,
     cta: 'Get Started',
-    ctaHref: '/sign-up',
     highlighted: true,
   },
   {
@@ -55,6 +59,32 @@ const pricingTiers = [
 ];
 
 export default function Pricing() {
+  const router = useRouter();
+  const [loading, setLoading] = useState<string | null>(null);
+
+  const handleCheckout = async (plan: 'starter' | 'pro') => {
+    try {
+      setLoading(plan);
+      const response = await fetch('/api/billing/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ plan }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to create checkout session');
+      }
+
+      const { url } = await response.json();
+      router.push(url);
+    } catch (error) {
+      console.error('Checkout error:', error);
+      alert('Failed to start checkout. Please try again.');
+    } finally {
+      setLoading(null);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-b from-background to-secondary/30">
       <nav className="flex items-center justify-between px-6 py-4 border-b border-border">
@@ -96,16 +126,30 @@ export default function Pricing() {
                 <span className="text-4xl font-bold text-primary">{tier.price}</span>
                 {tier.period !== 'pricing' && <span className="text-muted-foreground ml-2">{tier.period}</span>}
               </div>
-              <Link
-                href={tier.ctaHref}
-                className={`inline-block w-full text-center py-3 px-6 rounded-lg font-semibold mb-6 transition-colors ${
-                  tier.highlighted
-                    ? 'bg-primary text-primary-foreground hover:bg-primary/90'
-                    : 'border border-border text-foreground hover:bg-secondary'
-                }`}
-              >
-                {tier.cta}
-              </Link>
+              {'plan' in tier ? (
+                <button
+                  onClick={() => handleCheckout(tier.plan as 'starter' | 'pro')}
+                  disabled={loading === tier.plan}
+                  className={`inline-block w-full text-center py-3 px-6 rounded-lg font-semibold mb-6 transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                    tier.highlighted
+                      ? 'bg-primary text-primary-foreground hover:bg-primary/90 disabled:hover:bg-primary/90'
+                      : 'border border-border text-foreground hover:bg-secondary disabled:hover:bg-transparent'
+                  }`}
+                >
+                  {loading === tier.plan ? 'Loading...' : tier.cta}
+                </button>
+              ) : (
+                <Link
+                  href={tier.ctaHref!}
+                  className={`inline-block w-full text-center py-3 px-6 rounded-lg font-semibold mb-6 transition-colors ${
+                    tier.highlighted
+                      ? 'bg-primary text-primary-foreground hover:bg-primary/90'
+                      : 'border border-border text-foreground hover:bg-secondary'
+                  }`}
+                >
+                  {tier.cta}
+                </Link>
+              )}
               <ul className="space-y-3">
                 {tier.features.map((feature) => (
                   <li key={feature} className="flex items-center gap-3 text-sm text-muted-foreground">
