@@ -47,7 +47,13 @@ export default function CampaignsClient({ campaigns }: CampaignsClientProps) {
   }, [campaigns]);
 
   const filteredCampaigns = useMemo(() => {
-    return campaigns.filter((campaign) => {
+    return campaigns.map(c => ({
+      ...c,
+      recipients: c.recipients ?? 0,
+      open_rate: c.open_rate ?? 0,
+      reply_rate: c.reply_rate ?? 0,
+      bounce_rate: c.bounce_rate ?? 0,
+    })).filter((campaign) => {
       const regionMatch =
         selectedRegion === "All" || campaign.region === selectedRegion;
       const statusMatch =

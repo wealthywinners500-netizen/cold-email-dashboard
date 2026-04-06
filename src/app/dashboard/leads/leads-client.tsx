@@ -37,10 +37,17 @@ interface LeadsClientProps {
 export default function LeadsClient({ leads }: LeadsClientProps) {
   const [selectedStatus, setSelectedStatus] = useState<string>("all");
 
+  const safeLeads = useMemo(() => leads.map(l => ({
+    ...l,
+    total_scraped: l.total_scraped ?? 0,
+    verified_count: l.verified_count ?? 0,
+    cost_per_lead: l.cost_per_lead ?? 0,
+  })), [leads]);
+
   const filteredLeads = useMemo(() => {
-    if (selectedStatus === "all") return leads;
-    return leads.filter((lead) => lead.status === selectedStatus);
-  }, [leads, selectedStatus]);
+    if (selectedStatus === "all") return safeLeads;
+    return safeLeads.filter((lead) => lead.status === selectedStatus);
+  }, [safeLeads, selectedStatus]);
 
   const metrics = useMemo(() => {
     const totalScraped = filteredLeads.reduce((sum, l) => sum + l.total_scraped, 0);
