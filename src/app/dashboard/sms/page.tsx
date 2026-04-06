@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic';
+
 import { getSmsWorkflows } from "@/lib/supabase/queries";
 import SmsClient from "./sms-client";
 

@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic';
+
 import { getOrganization, getTableCounts, getServerPairs, getCampaigns } from "@/lib/supabase/queries";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";

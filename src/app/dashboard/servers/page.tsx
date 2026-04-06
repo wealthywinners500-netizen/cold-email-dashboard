@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic';
+
 import { getServerPairs } from "@/lib/supabase/queries";
 import ServersClient from "./servers-client";
 

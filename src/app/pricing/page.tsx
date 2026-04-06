@@ -15,6 +15,7 @@ const pricingTiers = [
       '14-day free trial',
     ],
     cta: 'Get Started',
+    ctaHref: '/sign-up',
     highlighted: false,
   },
   {
@@ -31,6 +32,7 @@ const pricingTiers = [
       '14-day free trial',
     ],
     cta: 'Get Started',
+    ctaHref: '/sign-up',
     highlighted: true,
   },
   {
@@ -47,6 +49,7 @@ const pricingTiers = [
       '14-day free trial',
     ],
     cta: 'Contact Sales',
+    ctaHref: 'mailto:dean.hofer@thestealthmail.com',
     highlighted: false,
   },
 ];
@@ -93,15 +96,16 @@ export default function Pricing() {
                 <span className="text-4xl font-bold text-primary">{tier.price}</span>
                 {tier.period !== 'pricing' && <span className="text-muted-foreground ml-2">{tier.period}</span>}
               </div>
-              <button
-                className={`w-full py-3 px-6 rounded-lg font-semibold mb-6 transition-colors ${
+              <Link
+                href={tier.ctaHref}
+                className={`inline-block w-full text-center py-3 px-6 rounded-lg font-semibold mb-6 transition-colors ${
                   tier.highlighted
                     ? 'bg-primary text-primary-foreground hover:bg-primary/90'
                     : 'border border-border text-foreground hover:bg-secondary'
                 }`}
               >
                 {tier.cta}
-              </button>
+              </Link>
               <ul className="space-y-3">
                 {tier.features.map((feature) => (
                   <li key={feature} className="flex items-center gap-3 text-sm text-muted-foreground">
@@ -120,9 +124,12 @@ export default function Pricing() {
         <p className="text-muted-foreground mb-8">
           Contact our team for custom pricing or enterprise solutions.
         </p>
-        <button className="px-8 py-3 bg-primary text-primary-foreground rounded-lg font-semibold hover:bg-primary/90 transition-colors">
+        <Link
+          href="mailto:dean.hofer@thestealthmail.com"
+          className="inline-block px-8 py-3 bg-primary text-primary-foreground rounded-lg font-semibold hover:bg-primary/90 transition-colors"
+        >
           Contact Sales
-        </button>
+        </Link>
       </section>
     </div>
   );

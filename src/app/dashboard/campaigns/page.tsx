@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic';
+
 import { getCampaigns } from "@/lib/supabase/queries";
 import CampaignsClient from "./campaigns-client";
 

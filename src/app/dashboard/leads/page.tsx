@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic';
+
 import { getLeads } from "@/lib/supabase/queries";
 import LeadsClient from "./leads-client";
 

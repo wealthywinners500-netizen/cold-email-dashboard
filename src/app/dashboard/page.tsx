@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic';
+
 import { getDashboardOverview } from "@/lib/supabase/queries";
 import OverviewClient from "./overview-client";
 
