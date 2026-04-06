@@ -6,6 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Mail, Filter } from "lucide-react";
 import CreateCampaignModal from "@/components/modals/create-campaign-modal";
+import { useRealtimeRefresh } from "@/hooks/use-realtime";
 import {
   BarChart,
   Bar,
@@ -44,6 +45,7 @@ export default function CampaignsClient({ campaigns }: CampaignsClientProps) {
   const [selectedStatus, setSelectedStatus] = useState<string>("All");
   const [modalOpen, setModalOpen] = useState(false);
   const [editingCampaign, setEditingCampaign] = useState<any>(null);
+  useRealtimeRefresh("campaigns");
 
   const regions = useMemo(() => {
     const unique = new Set(campaigns.map((c) => c.region));

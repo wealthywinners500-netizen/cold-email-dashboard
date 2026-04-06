@@ -119,6 +119,13 @@ export async function getTableCounts() {
   const orgId = await getInternalOrgId();
   const supabase = await createAdminClient();
 
+  // First get pair IDs for domain lookup
+  const { data: pairData } = await supabase
+    .from("server_pairs")
+    .select("id")
+    .eq("org_id", orgId);
+  const pairIds = pairData?.map((p) => p.id) || [];
+
   const [servers, campaigns, leads, followUps, sms, domains] =
     await Promise.all([
       supabase
@@ -141,18 +148,12 @@ export async function getTableCounts() {
         .from("sms_workflows")
         .select("id", { count: "exact", head: true })
         .eq("org_id", orgId),
-      supabase
-        .from("sending_domains")
-        .select("id", { count: "exact", head: true })
-        .in(
-          "pair_id",
-          (
-            await supabase
-              .from("server_pairs")
-              .select("id")
-              .eq("org_id", orgId)
-          ).data?.map((p) => p.id) || []
-        ),
+      pairIds.length > 0
+        ? supabase
+            .from("sending_domains")
+            .select("id", { count: "exact", head: true })
+            .in("pair_id", pairIds)
+        : Promise.resolve({ count: 0 }),
     ]);
 
   return {

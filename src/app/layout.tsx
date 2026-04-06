@@ -1,10 +1,18 @@
 import type { Metadata } from 'next';
 import { ClerkProvider } from '@clerk/nextjs';
+import { Toaster } from 'sonner';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'StealthMail Dashboard',
-  description: 'Cold email operations dashboard',
+  title: 'StealthMail — Cold Email Infrastructure Dashboard',
+  description:
+    'Manage your cold email servers, campaigns, leads, and deliverability from one dashboard. Built for operators who scale.',
+  openGraph: {
+    title: 'StealthMail',
+    description: 'Cold Email Infrastructure Management Dashboard',
+    url: 'https://cold-email-dashboard.vercel.app',
+    type: 'website',
+  },
 };
 
 export default function RootLayout({
@@ -15,7 +23,10 @@ export default function RootLayout({
   return (
     <ClerkProvider>
       <html lang="en">
-        <body>{children}</body>
+        <body>
+          {children}
+          <Toaster position="bottom-right" theme="dark" richColors />
+        </body>
       </html>
     </ClerkProvider>
   );

@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { MessageSquare, AlertCircle } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useRealtimeRefresh } from "@/hooks/use-realtime";
 
 interface FollowUp {
   id: string;
@@ -42,6 +43,7 @@ const classificationBadgeVariants: Record<string, "default" | "secondary" | "des
 
 export default function FollowUpsClient({ followUps }: FollowUpsClientProps) {
   const [activeTab, setActiveTab] = useState("group-a");
+  useRealtimeRefresh("follow_ups");
 
   // Calculate classification breakdown
   const classificationBreakdown = useMemo(() => {
@@ -62,7 +64,10 @@ export default function FollowUpsClient({ followUps }: FollowUpsClientProps) {
         <div className="flex flex-col items-center justify-center py-20 text-center">
           <MessageSquare className="w-16 h-16 text-gray-600 mb-4" />
           <h3 className="text-xl font-semibold text-white mb-2">No follow-up threads yet</h3>
-          <p className="text-gray-400 mb-6 max-w-md">Follow-up threads will appear here as campaign replies come in.</p>
+          <p className="text-gray-400 mb-6 max-w-md">Follow-up threads will appear here once your campaigns start receiving replies.</p>
+          <a href="/dashboard/campaigns" className="px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold transition-colors">
+            View Campaigns
+          </a>
         </div>
       </div>
     );

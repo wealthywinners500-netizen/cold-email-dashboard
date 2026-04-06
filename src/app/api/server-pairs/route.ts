@@ -1,5 +1,6 @@
 import { auth } from "@clerk/nextjs/server";
 import { createAdminClient } from "@/lib/supabase/server";
+import { getPlanLimits } from "@/lib/plan-limits";
 import { NextResponse } from "next/server";
 
 async function getInternalOrgId(): Promise<string | null> {
@@ -59,6 +60,33 @@ export async function POST(req: Request) {
 
     const body = await req.json();
     const supabase = await createAdminClient();
+
+    // Check plan limits
+    const { data: org } = await supabase
+      .from("organizations")
+      .select("plan_tier")
+      .eq("id", orgId)
+      .single();
+
+    if (org) {
+      const limits = getPlanLimits(org.plan_tier);
+      const { count } = await supabase
+        .from("server_pairs")
+        .select("id", { count: "exact", head: true })
+        .eq("org_id", orgId);
+
+      if (
+        typeof limits.maxServerPairs === "number" &&
+        (count ?? 0) >= limits.maxServerPairs
+      ) {
+        return NextResponse.json(
+          {
+            error: `Plan limit reached. ${org.plan_tier} plan allows ${limits.maxServerPairs} server pairs. Upgrade to add more.`,
+          },
+          { status: 403 }
+        );
+      }
+    }
 
     const { data, error } = await supabase
       .from("server_pairs")

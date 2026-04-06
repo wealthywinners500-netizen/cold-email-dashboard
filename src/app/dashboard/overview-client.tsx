@@ -5,8 +5,6 @@ import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { TrendingUp, AlertCircle } from "lucide-react";
 import {
-  AreaChart,
-  Area,
   BarChart,
   Bar,
   XAxis,
@@ -15,31 +13,6 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "recharts";
-
-// Generate 30 days of email volume data
-const generateEmailVolumeData = () => {
-  const data = [];
-  const today = new Date();
-  for (let i = 29; i >= 0; i--) {
-    const date = new Date(today);
-    date.setDate(date.getDate() - i);
-    const day = date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-
-    // Ramp sent from ~200 to ~4500
-    const sent = Math.floor(200 + (i / 29) * 4300);
-    const delivered = Math.floor(sent * (0.94 + Math.random() * 0.02));
-    const bounced = Math.floor(sent * (0.01 + Math.random() * 0.02));
-
-    data.push({
-      date,
-      day,
-      sent,
-      delivered,
-      bounced,
-    });
-  }
-  return data;
-};
 
 interface DashboardData {
   serverPairs: Array<{
@@ -64,8 +37,6 @@ interface DashboardData {
 }
 
 export default function OverviewClient({ data }: { data: DashboardData }) {
-  const emailVolumeData = generateEmailVolumeData();
-
   // Compute server pair stats
   const completePairs = data.serverPairs.filter((p) => p.status === "complete").length;
   const needsAttentionPairs = data.serverPairs.filter((p) => p.status === "needs_attention").length;
@@ -94,21 +65,6 @@ export default function OverviewClient({ data }: { data: DashboardData }) {
     }))
     .sort((a, b) => b.leads - a.leads);
 
-  // Recent activity (static placeholder)
-  const recentActivity = [
-    {
-      id: 1,
-      event: "Data synced from Supabase",
-      timestamp: "Just now",
-      status: "success",
-    },
-    {
-      id: 2,
-      event: "Dashboard loaded",
-      timestamp: "moments ago",
-      status: "success",
-    },
-  ];
 
   // Compute percentages
   const warmingPercentage = totalAccountsCapacity > 0 ? Math.round((warmingAccounts / totalAccountsCapacity) * 100) : 0;
@@ -199,51 +155,13 @@ export default function OverviewClient({ data }: { data: DashboardData }) {
         <CardHeader>
           <CardTitle className='text-white flex items-center gap-2'>
             <TrendingUp className='w-5 h-5' />
-            Email Volume (Last 30 Days)
+            Email Volume
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <ResponsiveContainer width='100%' height={300}>
-            <AreaChart data={emailVolumeData}>
-              <defs>
-                <linearGradient id='colorDelivered' x1='0' y1='0' x2='0' y2='1'>
-                  <stop offset='5%' stopColor='#10b981' stopOpacity={0.8} />
-                  <stop offset='95%' stopColor='#10b981' stopOpacity={0} />
-                </linearGradient>
-                <linearGradient id='colorBounced' x1='0' y1='0' x2='0' y2='1'>
-                  <stop offset='5%' stopColor='#ef4444' stopOpacity={0.8} />
-                  <stop offset='95%' stopColor='#ef4444' stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid strokeDasharray='3 3' stroke='#374151' />
-              <XAxis dataKey='day' stroke='#9ca3af' />
-              <YAxis stroke='#9ca3af' />
-              <Tooltip
-                contentStyle={{
-                  backgroundColor: "#1f2937",
-                  border: "1px solid #374151",
-                  borderRadius: "0.5rem",
-                }}
-                labelStyle={{ color: "#f3f4f6" }}
-              />
-              <Area
-                type='monotone'
-                dataKey='delivered'
-                stroke='#10b981'
-                fillOpacity={1}
-                fill='url(#colorDelivered)'
-                name='Delivered'
-              />
-              <Area
-                type='monotone'
-                dataKey='bounced'
-                stroke='#ef4444'
-                fillOpacity={1}
-                fill='url(#colorBounced)'
-                name='Bounced'
-              />
-            </AreaChart>
-          </ResponsiveContainer>
+          <div className='flex items-center justify-center py-12'>
+            <p className='text-gray-400'>Email volume tracking will be available once campaign sending begins. Estimated daily volume based on account warm-up schedule.</p>
+          </div>
         </CardContent>
       </Card>
 
@@ -280,21 +198,7 @@ export default function OverviewClient({ data }: { data: DashboardData }) {
           <CardTitle className='text-white'>Recent Activity</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className='space-y-4'>
-            {recentActivity.map((activity) => (
-              <div key={activity.id} className='flex items-start gap-3 pb-4 border-b border-gray-800 last:border-b-0'>
-                <div
-                  className={`w-2 h-2 rounded-full mt-1.5 flex-shrink-0 ${
-                    activity.status === "success" ? "bg-green-500" : "bg-yellow-500"
-                  }`}
-                ></div>
-                <div className='flex-1'>
-                  <p className='text-white text-sm'>{activity.event}</p>
-                  <p className='text-gray-400 text-xs'>{activity.timestamp}</p>
-                </div>
-              </div>
-            ))}
-          </div>
+          <p className='text-gray-400'>Recent activity will appear here as you use the dashboard</p>
         </CardContent>
       </Card>
     </div>

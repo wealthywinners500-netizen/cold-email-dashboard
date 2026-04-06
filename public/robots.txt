@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+Disallow: /dashboard
+Disallow: /api
+Sitemap: https://cold-email-dashboard.vercel.app/sitemap.xml

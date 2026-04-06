@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import * as Dialog from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
+import { toast } from "sonner";
 
 interface CreateServerPairModalProps {
   open: boolean;
@@ -19,6 +20,25 @@ export default function CreateServerPairModal({
   const router = useRouter();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+
+  function validate(): boolean {
+    const newErrors: Record<string, string> = {};
+    if (!formData.pair_number || formData.pair_number <= 0)
+      newErrors.pair_number = "Pair number must be a positive integer";
+    if (!formData.ns_domain?.trim() || !/^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(formData.ns_domain.trim()))
+      newErrors.ns_domain = "Enter a valid domain (e.g., ns.example.com)";
+    if (!formData.s1_ip?.trim() || !/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(formData.s1_ip.trim()))
+      newErrors.s1_ip = "Enter a valid IPv4 address";
+    if (!formData.s1_hostname?.trim() || !/^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(formData.s1_hostname.trim()))
+      newErrors.s1_hostname = "Enter a valid hostname";
+    if (!formData.s2_ip?.trim() || !/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(formData.s2_ip.trim()))
+      newErrors.s2_ip = "Enter a valid IPv4 address";
+    if (!formData.s2_hostname?.trim() || !/^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(formData.s2_hostname.trim()))
+      newErrors.s2_hostname = "Enter a valid hostname";
+    setFieldErrors(newErrors);
+    return Object.keys(newErrors).length === 0;
+  }
 
   const [formData, setFormData] = useState({
     pair_number: editData?.pair_number || "",
@@ -39,6 +59,7 @@ export default function CreateServerPairModal({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!validate()) return;
     setLoading(true);
     setError(null);
 
@@ -59,9 +80,12 @@ export default function CreateServerPairModal({
       }
 
       onOpenChange(false);
+      toast.success("Server pair saved successfully");
       router.refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "An error occurred");
+      const errorMessage = err instanceof Error ? err.message : "Failed to save server pair";
+      setError(errorMessage);
+      toast.error(errorMessage);
     } finally {
       setLoading(false);
     }
@@ -85,9 +109,12 @@ export default function CreateServerPairModal({
       }
 
       onOpenChange(false);
+      toast.success("Server pair deleted");
       router.refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "An error occurred");
+      const errorMessage = err instanceof Error ? err.message : "Failed to delete server pair";
+      setError(errorMessage);
+      toast.error(errorMessage);
     } finally {
       setLoading(false);
     }
@@ -120,6 +147,9 @@ export default function CreateServerPairModal({
                 className="w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 required
               />
+              {fieldErrors.pair_number && (
+                <p className="text-red-400 text-xs mt-1">{fieldErrors.pair_number}</p>
+              )}
             </div>
 
             <div>
@@ -134,6 +164,9 @@ export default function CreateServerPairModal({
                 className="w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 required
               />
+              {fieldErrors.ns_domain && (
+                <p className="text-red-400 text-xs mt-1">{fieldErrors.ns_domain}</p>
+              )}
             </div>
 
             <div className="grid grid-cols-2 gap-4">
@@ -149,6 +182,9 @@ export default function CreateServerPairModal({
                   className="w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   required
                 />
+                {fieldErrors.s1_ip && (
+                  <p className="text-red-400 text-xs mt-1">{fieldErrors.s1_ip}</p>
+                )}
               </div>
               <div>
                 <label className="text-sm font-medium text-gray-300">
@@ -162,6 +198,9 @@ export default function CreateServerPairModal({
                   className="w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   required
                 />
+                {fieldErrors.s1_hostname && (
+                  <p className="text-red-400 text-xs mt-1">{fieldErrors.s1_hostname}</p>
+                )}
               </div>
             </div>
 
@@ -178,6 +217,9 @@ export default function CreateServerPairModal({
                   className="w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   required
                 />
+                {fieldErrors.s2_ip && (
+                  <p className="text-red-400 text-xs mt-1">{fieldErrors.s2_ip}</p>
+                )}
               </div>
               <div>
                 <label className="text-sm font-medium text-gray-300">
@@ -191,6 +233,9 @@ export default function CreateServerPairModal({
                   className="w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   required
                 />
+                {fieldErrors.s2_hostname && (
+                  <p className="text-red-400 text-xs mt-1">{fieldErrors.s2_hostname}</p>
+                )}
               </div>
             </div>
 

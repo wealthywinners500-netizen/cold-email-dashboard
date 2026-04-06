@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { AlertCircle, Server } from "lucide-react";
 import CreateServerPairModal from "@/components/modals/create-server-pair-modal";
+import { useRealtimeRefresh } from "@/hooks/use-realtime";
 
 interface ServerPair {
   pair_number: number;
@@ -28,6 +29,7 @@ interface ServersClientProps {
 export default function ServersClient({ serverPairs }: ServersClientProps) {
   const [modalOpen, setModalOpen] = useState(false);
   const [editingPair, setEditingPair] = useState<any>(null);
+  useRealtimeRefresh("server_pairs");
 
   if (serverPairs.length === 0) {
     return (

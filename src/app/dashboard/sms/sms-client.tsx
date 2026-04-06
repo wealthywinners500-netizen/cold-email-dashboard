@@ -12,6 +12,7 @@ import {
   Cloud,
   AlertTriangle,
 } from "lucide-react";
+import { useRealtimeRefresh } from "@/hooks/use-realtime";
 
 interface SmsWorkflow {
   id: string;
@@ -47,6 +48,8 @@ const stageBadgeVariants: Record<string, "default" | "secondary" | "destructive"
 };
 
 export default function SmsClient({ workflows }: SmsClientProps) {
+  useRealtimeRefresh("sms_workflows");
+
   // Calculate overview stats
   const stats = useMemo(() => {
     const totalMessages = workflows.reduce((sum, w) => sum + w.message_count, 0);
@@ -72,9 +75,10 @@ export default function SmsClient({ workflows }: SmsClientProps) {
           <Smartphone className="w-16 h-16 text-gray-600 mb-4" />
           <h3 className="text-xl font-semibold text-white mb-2">No SMS workflows configured yet</h3>
           <p className="text-gray-400 mb-6 max-w-md">Set up your first Go High Level SMS workflow to start text marketing.</p>
-          <button className="px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold transition-colors">
-            Configure Workflow
-          </button>
+          <a href="https://app.gohighlevel.com" target="_blank" rel="noopener noreferrer"
+             className="px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold transition-colors inline-block">
+            Open Go High Level
+          </a>
         </div>
       </div>
     );

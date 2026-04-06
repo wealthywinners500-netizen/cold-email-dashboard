@@ -6,6 +6,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Users, TrendingUp, Filter } from "lucide-react";
 import CreateLeadModal from "@/components/modals/create-lead-modal";
+import CsvImportModal from "@/components/import/csv-import-modal";
+import { useRealtimeRefresh } from "@/hooks/use-realtime";
 import {
   BarChart,
   Bar,
@@ -39,7 +41,9 @@ interface LeadsClientProps {
 export default function LeadsClient({ leads }: LeadsClientProps) {
   const [selectedStatus, setSelectedStatus] = useState<string>("all");
   const [modalOpen, setModalOpen] = useState(false);
+  const [csvModalOpen, setCsvModalOpen] = useState(false);
   const [editingLead, setEditingLead] = useState<any>(null);
+  useRealtimeRefresh("leads");
 
   const safeLeads = useMemo(() => leads.map(l => ({
     ...l,
@@ -59,17 +63,26 @@ export default function LeadsClient({ leads }: LeadsClientProps) {
           <Users className="w-16 h-16 text-gray-600 mb-4" />
           <h3 className="text-xl font-semibold text-white mb-2">No leads imported yet</h3>
           <p className="text-gray-400 mb-6 max-w-md">Import your first batch of leads to start building your outreach pipeline.</p>
-          <button
-            onClick={() => {
-              setEditingLead(null);
-              setModalOpen(true);
-            }}
-            className="px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold transition-colors"
-          >
-            Import Leads
-          </button>
+          <div className="flex gap-3">
+            <button
+              onClick={() => {
+                setEditingLead(null);
+                setModalOpen(true);
+              }}
+              className="px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold transition-colors"
+            >
+              Add Lead
+            </button>
+            <button
+              onClick={() => setCsvModalOpen(true)}
+              className="px-6 py-3 bg-gray-700 hover:bg-gray-600 text-white rounded-lg font-semibold transition-colors"
+            >
+              Import CSV
+            </button>
+          </div>
         </div>
         <CreateLeadModal open={modalOpen} onOpenChange={setModalOpen} editData={editingLead} />
+        <CsvImportModal open={csvModalOpen} onOpenChange={setCsvModalOpen} />
       </div>
     );
   }
@@ -161,16 +174,24 @@ export default function LeadsClient({ leads }: LeadsClientProps) {
             Manage and track lead sources and verification
           </p>
         </div>
-        <button
-          onClick={() => {
-            setEditingLead(null);
-            setModalOpen(true);
-          }}
-          className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold"
-        >
-          <Users className="w-5 h-5 inline mr-2" />
-          Import Leads
-        </button>
+        <div className="flex gap-3">
+          <button
+            onClick={() => setCsvModalOpen(true)}
+            className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg font-semibold"
+          >
+            Import CSV
+          </button>
+          <button
+            onClick={() => {
+              setEditingLead(null);
+              setModalOpen(true);
+            }}
+            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold"
+          >
+            <Users className="w-5 h-5 inline mr-2" />
+            Add Lead
+          </button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
@@ -433,6 +454,7 @@ export default function LeadsClient({ leads }: LeadsClientProps) {
       </Card>
 
       <CreateLeadModal open={modalOpen} onOpenChange={setModalOpen} editData={editingLead} />
+      <CsvImportModal open={csvModalOpen} onOpenChange={setCsvModalOpen} />
     </div>
   );
 }

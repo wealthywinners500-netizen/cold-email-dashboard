@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import * as Dialog from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
+import { toast } from "sonner";
 
 interface CreateCampaignModalProps {
   open: boolean;
@@ -19,6 +20,15 @@ export default function CreateCampaignModal({
   const router = useRouter();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+
+  function validate(): boolean {
+    const newErrors: Record<string, string> = {};
+    if (!formData.name?.trim()) newErrors.name = "Campaign name is required";
+    if (!formData.region?.trim()) newErrors.region = "Region is required";
+    setFieldErrors(newErrors);
+    return Object.keys(newErrors).length === 0;
+  }
 
   const [formData, setFormData] = useState({
     name: editData?.name || "",
@@ -37,6 +47,7 @@ export default function CreateCampaignModal({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!validate()) return;
     setLoading(true);
     setError(null);
 
@@ -55,9 +66,12 @@ export default function CreateCampaignModal({
       }
 
       onOpenChange(false);
+      toast.success("Campaign saved successfully");
       router.refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "An error occurred");
+      const errorMessage = err instanceof Error ? err.message : "Failed to save campaign";
+      setError(errorMessage);
+      toast.error(errorMessage);
     } finally {
       setLoading(false);
     }
@@ -81,9 +95,12 @@ export default function CreateCampaignModal({
       }
 
       onOpenChange(false);
+      toast.success("Campaign deleted");
       router.refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "An error occurred");
+      const errorMessage = err instanceof Error ? err.message : "Failed to delete campaign";
+      setError(errorMessage);
+      toast.error(errorMessage);
     } finally {
       setLoading(false);
     }
@@ -116,6 +133,9 @@ export default function CreateCampaignModal({
                 className="w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 required
               />
+              {fieldErrors.name && (
+                <p className="text-red-400 text-xs mt-1">{fieldErrors.name}</p>
+              )}
             </div>
 
             <div>
@@ -128,6 +148,9 @@ export default function CreateCampaignModal({
                 className="w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 required
               />
+              {fieldErrors.region && (
+                <p className="text-red-400 text-xs mt-1">{fieldErrors.region}</p>
+              )}
             </div>
 
             <div>

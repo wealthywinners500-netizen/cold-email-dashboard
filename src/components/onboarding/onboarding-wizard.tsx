@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { CreateOrganization } from '@clerk/nextjs';
+import { toast } from 'sonner';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import {
@@ -73,6 +74,7 @@ export default function OnboardingWizard({ hasOrg }: OnboardingWizardProps) {
       }
 
       setServerSuccess(true);
+      toast.success("Your first server pair has been added!");
       // Refresh server data
       router.refresh();
       // Move to completion step

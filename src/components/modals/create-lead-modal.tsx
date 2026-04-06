@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import * as Dialog from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
+import { toast } from "sonner";
 
 interface CreateLeadModalProps {
   open: boolean;
@@ -19,6 +20,22 @@ export default function CreateLeadModal({
   const router = useRouter();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+
+  function validate(): boolean {
+    const newErrors: Record<string, string> = {};
+    if (!formData.source?.trim()) newErrors.source = "Source is required";
+    if (!formData.city?.trim()) newErrors.city = "City is required";
+    if (!formData.state?.trim()) newErrors.state = "State is required";
+    if (formData.total_scraped !== "" && Number(formData.total_scraped) < 0)
+      newErrors.total_scraped = "Must be non-negative";
+    if (formData.verified_count !== "" && Number(formData.verified_count) < 0)
+      newErrors.verified_count = "Must be non-negative";
+    if (formData.cost_per_lead !== "" && Number(formData.cost_per_lead) < 0)
+      newErrors.cost_per_lead = "Must be non-negative";
+    setFieldErrors(newErrors);
+    return Object.keys(newErrors).length === 0;
+  }
 
   const [formData, setFormData] = useState({
     source: editData?.source || "",
@@ -47,6 +64,7 @@ export default function CreateLeadModal({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!validate()) return;
     setLoading(true);
     setError(null);
 
@@ -65,9 +83,12 @@ export default function CreateLeadModal({
       }
 
       onOpenChange(false);
+      toast.success("Lead saved successfully");
       router.refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "An error occurred");
+      const errorMessage = err instanceof Error ? err.message : "Failed to save lead";
+      setError(errorMessage);
+      toast.error(errorMessage);
     } finally {
       setLoading(false);
     }
@@ -91,9 +112,12 @@ export default function CreateLeadModal({
       }
 
       onOpenChange(false);
+      toast.success("Lead deleted");
       router.refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "An error occurred");
+      const errorMessage = err instanceof Error ? err.message : "Failed to delete lead";
+      setError(errorMessage);
+      toast.error(errorMessage);
     } finally {
       setLoading(false);
     }
@@ -124,6 +148,9 @@ export default function CreateLeadModal({
                 className="w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 required
               />
+              {fieldErrors.source && (
+                <p className="text-red-400 text-xs mt-1">{fieldErrors.source}</p>
+              )}
             </div>
 
             <div className="grid grid-cols-2 gap-4">
@@ -137,6 +164,9 @@ export default function CreateLeadModal({
                   className="w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   required
                 />
+                {fieldErrors.city && (
+                  <p className="text-red-400 text-xs mt-1">{fieldErrors.city}</p>
+                )}
               </div>
               <div>
                 <label className="text-sm font-medium text-gray-300">State</label>
@@ -148,6 +178,9 @@ export default function CreateLeadModal({
                   className="w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   required
                 />
+                {fieldErrors.state && (
+                  <p className="text-red-400 text-xs mt-1">{fieldErrors.state}</p>
+                )}
               </div>
             </div>
 
@@ -163,6 +196,9 @@ export default function CreateLeadModal({
                 className="w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 required
               />
+              {fieldErrors.total_scraped && (
+                <p className="text-red-400 text-xs mt-1">{fieldErrors.total_scraped}</p>
+              )}
             </div>
 
             <div>
@@ -177,6 +213,9 @@ export default function CreateLeadModal({
                 className="w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 required
               />
+              {fieldErrors.verified_count && (
+                <p className="text-red-400 text-xs mt-1">{fieldErrors.verified_count}</p>
+              )}
             </div>
 
             <div>
@@ -192,6 +231,9 @@ export default function CreateLeadModal({
                 className="w-full bg-gray-700 border border-gray-600 text-white rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 required
               />
+              {fieldErrors.cost_per_lead && (
+                <p className="text-red-400 text-xs mt-1">{fieldErrors.cost_per_lead}</p>
+              )}
             </div>
 
             <div>
