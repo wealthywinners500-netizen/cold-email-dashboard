@@ -1,9 +1,12 @@
 "use client";
 
+import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { AlertCircle, Server } from "lucide-react";
+import CreateServerPairModal from "@/components/modals/create-server-pair-modal";
 
 interface ServerPair {
   pair_number: number;
@@ -23,6 +26,35 @@ interface ServersClientProps {
 }
 
 export default function ServersClient({ serverPairs }: ServersClientProps) {
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editingPair, setEditingPair] = useState<any>(null);
+
+  if (serverPairs.length === 0) {
+    return (
+      <div className="space-y-8">
+        <div>
+          <h1 className="text-3xl font-bold text-white">Server Pairs</h1>
+          <p className="text-gray-400 mt-2">Manage HestiaCP server pairs and SMTP relay status</p>
+        </div>
+        <div className="flex flex-col items-center justify-center py-20 text-center">
+          <Server className="w-16 h-16 text-gray-600 mb-4" />
+          <h3 className="text-xl font-semibold text-white mb-2">No server pairs yet</h3>
+          <p className="text-gray-400 mb-6 max-w-md">Add your first HestiaCP server pair to start monitoring your email infrastructure.</p>
+          <button
+            onClick={() => {
+              setEditingPair(null);
+              setModalOpen(true);
+            }}
+            className="px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold transition-colors"
+          >
+            Add Server Pair
+          </button>
+        </div>
+        <CreateServerPairModal open={modalOpen} onOpenChange={setModalOpen} editData={editingPair} />
+      </div>
+    );
+  }
+
   // Helper to get status badge color
   const getStatusBadge = (status: string) => {
     if (status === "complete") {
@@ -75,9 +107,20 @@ export default function ServersClient({ serverPairs }: ServersClientProps) {
 
   return (
     <div className='space-y-8'>
-      <div>
-        <h1 className='text-3xl font-bold text-white'>Server Pairs</h1>
-        <p className='text-gray-400 mt-2'>Manage HestiaCP server pairs and SMTP relay status</p>
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className='text-3xl font-bold text-white'>Server Pairs</h1>
+          <p className='text-gray-400 mt-2'>Manage HestiaCP server pairs and SMTP relay status</p>
+        </div>
+        <button
+          onClick={() => {
+            setEditingPair(null);
+            setModalOpen(true);
+          }}
+          className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold transition-colors"
+        >
+          Add Server Pair
+        </button>
       </div>
 
       {/* Summary Stats */}
@@ -133,7 +176,14 @@ export default function ServersClient({ serverPairs }: ServersClientProps) {
                   const progress = getWarmupProgress(pair.warmup_day);
 
                   return (
-                    <tr key={pair.pair_number} className='border-b border-gray-800 hover:bg-gray-800/50'>
+                    <tr
+                      key={pair.pair_number}
+                      onClick={() => {
+                        setEditingPair(pair);
+                        setModalOpen(true);
+                      }}
+                      className='border-b border-gray-800 hover:bg-gray-800/50 cursor-pointer'
+                    >
                       <td className='py-3 px-4 text-white font-medium'>P{pair.pair_number}</td>
                       <td className='py-3 px-4 text-white'>{pair.ns_domain}</td>
                       <td className='py-3 px-4'>
@@ -200,6 +250,8 @@ export default function ServersClient({ serverPairs }: ServersClientProps) {
           </div>
         </CardContent>
       </Card>
+
+      <CreateServerPairModal open={modalOpen} onOpenChange={setModalOpen} editData={editingPair} />
     </div>
   );
 }

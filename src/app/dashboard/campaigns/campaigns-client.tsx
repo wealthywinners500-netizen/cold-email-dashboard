@@ -1,9 +1,11 @@
 "use client";
 
 import { useState, useMemo } from "react";
+import { useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Mail, Filter } from "lucide-react";
+import CreateCampaignModal from "@/components/modals/create-campaign-modal";
 import {
   BarChart,
   Bar,
@@ -40,11 +42,39 @@ interface CampaignsClientProps {
 export default function CampaignsClient({ campaigns }: CampaignsClientProps) {
   const [selectedRegion, setSelectedRegion] = useState<string>("All");
   const [selectedStatus, setSelectedStatus] = useState<string>("All");
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editingCampaign, setEditingCampaign] = useState<any>(null);
 
   const regions = useMemo(() => {
     const unique = new Set(campaigns.map((c) => c.region));
     return ["All", ...Array.from(unique).sort()];
   }, [campaigns]);
+
+  if (campaigns.length === 0) {
+    return (
+      <div className="space-y-8">
+        <div>
+          <h1 className="text-3xl font-bold text-white">Campaigns</h1>
+          <p className="text-gray-400 mt-2">Manage email campaigns and track performance</p>
+        </div>
+        <div className="flex flex-col items-center justify-center py-20 text-center">
+          <Mail className="w-16 h-16 text-gray-600 mb-4" />
+          <h3 className="text-xl font-semibold text-white mb-2">No campaigns yet</h3>
+          <p className="text-gray-400 mb-6 max-w-md">Create your first email campaign to start reaching prospects.</p>
+          <button
+            onClick={() => {
+              setEditingCampaign(null);
+              setModalOpen(true);
+            }}
+            className="px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold transition-colors"
+          >
+            Create Campaign
+          </button>
+        </div>
+        <CreateCampaignModal open={modalOpen} onOpenChange={setModalOpen} editData={editingCampaign} />
+      </div>
+    );
+  }
 
   const filteredCampaigns = useMemo(() => {
     return campaigns.map(c => ({
@@ -143,7 +173,13 @@ export default function CampaignsClient({ campaigns }: CampaignsClientProps) {
             Manage email campaigns and track performance
           </p>
         </div>
-        <button className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold">
+        <button
+          onClick={() => {
+            setEditingCampaign(null);
+            setModalOpen(true);
+          }}
+          className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold"
+        >
           <Mail className="w-5 h-5 inline mr-2" />
           Create Campaign
         </button>
@@ -342,7 +378,11 @@ export default function CampaignsClient({ campaigns }: CampaignsClientProps) {
                 {filteredCampaigns.map((campaign) => (
                   <tr
                     key={campaign.id}
-                    className="border-b border-gray-800 hover:bg-gray-800/50"
+                    onClick={() => {
+                      setEditingCampaign(campaign);
+                      setModalOpen(true);
+                    }}
+                    className="border-b border-gray-800 hover:bg-gray-800/50 cursor-pointer"
                   >
                     <td className="py-3 px-4 text-white font-medium">
                       {campaign.name}
@@ -411,6 +451,8 @@ export default function CampaignsClient({ campaigns }: CampaignsClientProps) {
           </CardContent>
         </Card>
       </div>
+
+      <CreateCampaignModal open={modalOpen} onOpenChange={setModalOpen} editData={editingCampaign} />
     </div>
   );
 }

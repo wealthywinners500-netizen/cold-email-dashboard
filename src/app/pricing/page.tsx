@@ -131,6 +131,24 @@ export default function Pricing() {
           Contact Sales
         </Link>
       </section>
+
+      {/* Footer */}
+      <footer className="px-6 py-12 border-t border-border text-center text-muted-foreground mt-16">
+        <div className="mb-4">
+          <div className="flex justify-center gap-6 mb-4">
+            <Link href="/" className="hover:text-primary transition-colors">
+              Home
+            </Link>
+            <Link href="/terms" className="hover:text-primary transition-colors">
+              Terms
+            </Link>
+            <Link href="/privacy" className="hover:text-primary transition-colors">
+              Privacy
+            </Link>
+          </div>
+        </div>
+        <p>© 2026 StealthMail. All rights reserved.</p>
+      </footer>
     </div>
   );
 }

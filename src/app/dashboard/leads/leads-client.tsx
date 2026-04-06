@@ -1,9 +1,11 @@
 "use client";
 
 import { useState, useMemo } from "react";
+import { useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Users, TrendingUp, Filter } from "lucide-react";
+import CreateLeadModal from "@/components/modals/create-lead-modal";
 import {
   BarChart,
   Bar,
@@ -36,6 +38,8 @@ interface LeadsClientProps {
 
 export default function LeadsClient({ leads }: LeadsClientProps) {
   const [selectedStatus, setSelectedStatus] = useState<string>("all");
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editingLead, setEditingLead] = useState<any>(null);
 
   const safeLeads = useMemo(() => leads.map(l => ({
     ...l,
@@ -43,6 +47,32 @@ export default function LeadsClient({ leads }: LeadsClientProps) {
     verified_count: l.verified_count ?? 0,
     cost_per_lead: l.cost_per_lead ?? 0,
   })), [leads]);
+
+  if (leads.length === 0) {
+    return (
+      <div className="space-y-8">
+        <div>
+          <h1 className="text-3xl font-bold text-white">Lead Pipeline</h1>
+          <p className="text-gray-400 mt-2">Manage and track lead sources and verification</p>
+        </div>
+        <div className="flex flex-col items-center justify-center py-20 text-center">
+          <Users className="w-16 h-16 text-gray-600 mb-4" />
+          <h3 className="text-xl font-semibold text-white mb-2">No leads imported yet</h3>
+          <p className="text-gray-400 mb-6 max-w-md">Import your first batch of leads to start building your outreach pipeline.</p>
+          <button
+            onClick={() => {
+              setEditingLead(null);
+              setModalOpen(true);
+            }}
+            className="px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold transition-colors"
+          >
+            Import Leads
+          </button>
+        </div>
+        <CreateLeadModal open={modalOpen} onOpenChange={setModalOpen} editData={editingLead} />
+      </div>
+    );
+  }
 
   const filteredLeads = useMemo(() => {
     if (selectedStatus === "all") return safeLeads;
@@ -131,7 +161,13 @@ export default function LeadsClient({ leads }: LeadsClientProps) {
             Manage and track lead sources and verification
           </p>
         </div>
-        <button className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold">
+        <button
+          onClick={() => {
+            setEditingLead(null);
+            setModalOpen(true);
+          }}
+          className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold"
+        >
           <Users className="w-5 h-5 inline mr-2" />
           Import Leads
         </button>
@@ -229,7 +265,14 @@ export default function LeadsClient({ leads }: LeadsClientProps) {
               </thead>
               <tbody>
                 {filteredLeads.map((lead) => (
-                  <tr key={lead.id} className="border-b border-gray-800 hover:bg-gray-800/50">
+                  <tr
+                    key={lead.id}
+                    onClick={() => {
+                      setEditingLead(lead);
+                      setModalOpen(true);
+                    }}
+                    className="border-b border-gray-800 hover:bg-gray-800/50 cursor-pointer"
+                  >
                     <td className="py-3 px-4 text-white font-medium">
                       {lead.city}, {lead.state}
                     </td>
@@ -388,6 +431,8 @@ export default function LeadsClient({ leads }: LeadsClientProps) {
           </div>
         </CardContent>
       </Card>
+
+      <CreateLeadModal open={modalOpen} onOpenChange={setModalOpen} editData={editingLead} />
     </div>
   );
 }

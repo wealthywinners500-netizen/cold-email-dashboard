@@ -61,6 +61,25 @@ export default function SmsClient({ workflows }: SmsClientProps) {
     };
   }, [workflows]);
 
+  if (workflows.length === 0) {
+    return (
+      <div className="space-y-8">
+        <div>
+          <h1 className="text-3xl font-bold text-white">SMS & Text Marketing</h1>
+          <p className="text-gray-400 mt-2">Go High Level text campaigns and workflows</p>
+        </div>
+        <div className="flex flex-col items-center justify-center py-20 text-center">
+          <Smartphone className="w-16 h-16 text-gray-600 mb-4" />
+          <h3 className="text-xl font-semibold text-white mb-2">No SMS workflows configured yet</h3>
+          <p className="text-gray-400 mb-6 max-w-md">Set up your first Go High Level SMS workflow to start text marketing.</p>
+          <button className="px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold transition-colors">
+            Configure Workflow
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-8">
       <div className="flex items-center justify-between">

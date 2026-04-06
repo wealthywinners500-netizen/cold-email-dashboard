@@ -52,6 +52,22 @@ export default function FollowUpsClient({ followUps }: FollowUpsClientProps) {
     return breakdown;
   }, [followUps]);
 
+  if (followUps.length === 0) {
+    return (
+      <div className="space-y-8">
+        <div>
+          <h1 className="text-3xl font-bold text-white">Follow-Ups</h1>
+          <p className="text-gray-400 mt-2">Manage follow-up replies and track engagement</p>
+        </div>
+        <div className="flex flex-col items-center justify-center py-20 text-center">
+          <MessageSquare className="w-16 h-16 text-gray-600 mb-4" />
+          <h3 className="text-xl font-semibold text-white mb-2">No follow-up threads yet</h3>
+          <p className="text-gray-400 mb-6 max-w-md">Follow-up threads will appear here as campaign replies come in.</p>
+        </div>
+      </div>
+    );
+  }
+
   // Group A: INTERESTED with action_needed
   const groupA = useMemo(() => {
     return followUps.filter(
