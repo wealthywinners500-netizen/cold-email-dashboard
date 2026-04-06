@@ -9,6 +9,7 @@ import {
   MessageSquare,
   Smartphone,
   Settings,
+  Shield,
 } from "lucide-react";
 import { OrganizationSwitcher, UserButton } from "@clerk/nextjs";
 import Link from "next/link";
@@ -48,6 +49,11 @@ const navigationItems = [
     label: "Settings",
     href: "/dashboard/settings",
     icon: Settings,
+  },
+  {
+    label: "Admin",
+    href: "/dashboard/admin",
+    icon: Shield,
   },
 ];
 
