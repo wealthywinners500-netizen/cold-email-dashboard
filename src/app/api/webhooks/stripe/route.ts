@@ -2,9 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import Stripe from 'stripe';
 import { createAdminClient } from '@/lib/supabase/server';
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
-
 export const dynamic = 'force-dynamic';
+
+function getStripe() {
+  return new Stripe(process.env.STRIPE_SECRET_KEY!);
+}
 
 type CheckoutSessionCompletedEvent = Stripe.Event & {
   data: {
@@ -45,6 +47,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
+    const stripe = getStripe();
     const body = await request.text();
     const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET!;
 

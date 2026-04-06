@@ -3,10 +3,15 @@ import { auth } from '@clerk/nextjs/server';
 import Stripe from 'stripe';
 import { createAdminClient } from '@/lib/supabase/server';
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+export const dynamic = 'force-dynamic';
+
+function getStripe() {
+  return new Stripe(process.env.STRIPE_SECRET_KEY!);
+}
 
 export async function POST(request: NextRequest) {
   try {
+    const stripe = getStripe();
     const { orgId } = await auth();
 
     if (!orgId) {
