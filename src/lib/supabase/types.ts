@@ -128,6 +128,7 @@ export type Database = {
           total_clicked: number;
           total_replied: number;
           total_bounced: number;
+          total_unsubscribed: number;
           started_at: string | null;
           completed_at: string | null;
           created_at: string;
@@ -153,6 +154,7 @@ export type Database = {
           total_clicked?: number;
           total_replied?: number;
           total_bounced?: number;
+          total_unsubscribed?: number;
           started_at?: string | null;
           completed_at?: string | null;
           created_at?: string;
@@ -178,6 +180,7 @@ export type Database = {
           total_clicked?: number;
           total_replied?: number;
           total_bounced?: number;
+          total_unsubscribed?: number;
           started_at?: string | null;
           completed_at?: string | null;
           created_at?: string;
@@ -427,6 +430,7 @@ export type Database = {
           status: string;
           last_error: string | null;
           last_sent_at: string | null;
+          sync_state: Record<string, unknown>;
           created_at: string;
           updated_at: string;
         };
@@ -450,6 +454,7 @@ export type Database = {
           status?: string;
           last_error?: string | null;
           last_sent_at?: string | null;
+          sync_state?: Record<string, unknown>;
           created_at?: string;
           updated_at?: string;
         };
@@ -473,6 +478,7 @@ export type Database = {
           status?: string;
           last_error?: string | null;
           last_sent_at?: string | null;
+          sync_state?: Record<string, unknown>;
           created_at?: string;
           updated_at?: string;
         };
@@ -805,6 +811,154 @@ export type Database = {
           created_at?: string;
         };
       };
+      tracking_events: {
+        Row: {
+          id: number;
+          org_id: string;
+          campaign_id: string | null;
+          recipient_id: string | null;
+          send_log_id: string | null;
+          tracking_id: string;
+          event_type: string;
+          clicked_url: string | null;
+          bounce_type: string | null;
+          bounce_code: string | null;
+          bounce_message: string | null;
+          ip_address: string | null;
+          user_agent: string | null;
+          created_at: string;
+        };
+        Insert: {
+          id?: number;
+          org_id: string;
+          campaign_id?: string | null;
+          recipient_id?: string | null;
+          send_log_id?: string | null;
+          tracking_id: string;
+          event_type: string;
+          clicked_url?: string | null;
+          bounce_type?: string | null;
+          bounce_code?: string | null;
+          bounce_message?: string | null;
+          ip_address?: string | null;
+          user_agent?: string | null;
+          created_at?: string;
+        };
+        Update: {
+          id?: number;
+          org_id?: string;
+          campaign_id?: string | null;
+          recipient_id?: string | null;
+          send_log_id?: string | null;
+          tracking_id?: string;
+          event_type?: string;
+          clicked_url?: string | null;
+          bounce_type?: string | null;
+          bounce_code?: string | null;
+          bounce_message?: string | null;
+          ip_address?: string | null;
+          user_agent?: string | null;
+          created_at?: string;
+        };
+      };
+      lead_contacts: {
+        Row: {
+          id: string;
+          org_id: string;
+          business_name: string | null;
+          business_type: string | null;
+          first_name: string | null;
+          last_name: string | null;
+          email: string | null;
+          phone: string | null;
+          website: string | null;
+          address: string | null;
+          city: string | null;
+          state: string | null;
+          zip: string | null;
+          country: string;
+          google_rating: number | null;
+          google_reviews_count: number | null;
+          google_place_id: string | null;
+          email_status: string;
+          verified_at: string | null;
+          verification_source: string | null;
+          scrape_source: string;
+          scrape_query: string | null;
+          scraped_at: string | null;
+          times_emailed: number;
+          last_emailed_at: string | null;
+          suppressed: boolean;
+          tags: string[];
+          custom_fields: Record<string, unknown>;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          org_id: string;
+          business_name?: string | null;
+          business_type?: string | null;
+          first_name?: string | null;
+          last_name?: string | null;
+          email?: string | null;
+          phone?: string | null;
+          website?: string | null;
+          address?: string | null;
+          city?: string | null;
+          state?: string | null;
+          zip?: string | null;
+          country?: string;
+          google_rating?: number | null;
+          google_reviews_count?: number | null;
+          google_place_id?: string | null;
+          email_status?: string;
+          verified_at?: string | null;
+          verification_source?: string | null;
+          scrape_source?: string;
+          scrape_query?: string | null;
+          scraped_at?: string | null;
+          times_emailed?: number;
+          last_emailed_at?: string | null;
+          suppressed?: boolean;
+          tags?: string[];
+          custom_fields?: Record<string, unknown>;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: {
+          id?: string;
+          org_id?: string;
+          business_name?: string | null;
+          business_type?: string | null;
+          first_name?: string | null;
+          last_name?: string | null;
+          email?: string | null;
+          phone?: string | null;
+          website?: string | null;
+          address?: string | null;
+          city?: string | null;
+          state?: string | null;
+          zip?: string | null;
+          country?: string;
+          google_rating?: number | null;
+          google_reviews_count?: number | null;
+          google_place_id?: string | null;
+          email_status?: string;
+          verified_at?: string | null;
+          verification_source?: string | null;
+          scrape_source?: string;
+          scrape_query?: string | null;
+          scraped_at?: string | null;
+          times_emailed?: number;
+          last_emailed_at?: string | null;
+          suppressed?: boolean;
+          tags?: string[];
+          custom_fields?: Record<string, unknown>;
+          created_at?: string;
+          updated_at?: string;
+        };
+      };
     };
   };
 };
@@ -830,6 +984,7 @@ export interface EmailAccount {
   status: string;
   last_error: string | null;
   last_sent_at: string | null;
+  sync_state: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 }
@@ -898,6 +1053,7 @@ export interface Campaign {
   total_clicked: number;
   total_replied: number;
   total_bounced: number;
+  total_unsubscribed: number;
   started_at: string | null;
   completed_at: string | null;
   created_at: string;
@@ -1048,4 +1204,99 @@ export interface SuppressionEntry {
   reason: string;
   source: string | null;
   created_at: string;
+}
+
+// B10: Tracking + Bounce Handling
+
+export interface TrackingEvent {
+  id: number;
+  org_id: string;
+  campaign_id: string | null;
+  recipient_id: string | null;
+  send_log_id: string | null;
+  tracking_id: string;
+  event_type: 'open' | 'click' | 'bounce_hard' | 'bounce_soft' | 'unsubscribe';
+  clicked_url: string | null;
+  bounce_type: string | null;
+  bounce_code: string | null;
+  bounce_message: string | null;
+  ip_address: string | null;
+  user_agent: string | null;
+  created_at: string;
+}
+
+export interface CampaignAnalytics {
+  total_sent: number;
+  total_delivered: number;
+  total_opened: number;
+  total_clicked: number;
+  total_replied: number;
+  total_bounced: number;
+  total_unsubscribed: number;
+  open_rate: number;
+  click_rate: number;
+  reply_rate: number;
+  bounce_rate: number;
+  unsubscribe_rate: number;
+}
+
+// B11: Lead Database — Individual Contacts
+
+export interface LeadContact {
+  id: string;
+  org_id: string;
+  business_name: string | null;
+  business_type: string | null;
+  first_name: string | null;
+  last_name: string | null;
+  email: string | null;
+  phone: string | null;
+  website: string | null;
+  address: string | null;
+  city: string | null;
+  state: string | null;
+  zip: string | null;
+  country: string;
+  google_rating: number | null;
+  google_reviews_count: number | null;
+  google_place_id: string | null;
+  email_status: 'valid' | 'invalid' | 'risky' | 'unknown' | 'pending';
+  verified_at: string | null;
+  verification_source: string | null;
+  scrape_source: 'outscraper' | 'csv' | 'manual';
+  scrape_query: string | null;
+  scraped_at: string | null;
+  times_emailed: number;
+  last_emailed_at: string | null;
+  suppressed: boolean;
+  tags: string[];
+  custom_fields: Record<string, any>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface LeadContactStats {
+  total: number;
+  pending: number;
+  valid: number;
+  invalid: number;
+  risky: number;
+  unknown: number;
+  suppressed: number;
+  by_state: { state: string; count: number }[];
+  by_type: { type: string; count: number }[];
+}
+
+export interface OutscraperSearchResult {
+  found: number;
+  imported: number;
+  duplicates: number;
+  contacts: LeadContact[];
+}
+
+export interface VerificationResult {
+  verified: number;
+  valid: number;
+  invalid: number;
+  risky: number;
 }

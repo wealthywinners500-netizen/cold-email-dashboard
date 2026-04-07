@@ -1,11 +1,19 @@
 export const dynamic = 'force-dynamic';
 
+import { auth } from "@clerk/nextjs/server";
+import { redirect } from "next/navigation";
 import { getOrganization, getTableCounts, getServerPairs, getCampaigns } from "@/lib/supabase/queries";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Shield, Database, Activity, Server } from "lucide-react";
 
 export default async function AdminPage() {
+  // RBAC: Only org admins can access this page
+  const { orgRole } = await auth();
+  if (orgRole !== 'org:admin') {
+    redirect('/dashboard');
+  }
+
   const [organization, tableCounts, serverPairs, campaigns] = await Promise.all([
     getOrganization(),
     getTableCounts(),
@@ -14,10 +22,10 @@ export default async function AdminPage() {
   ]);
 
   // Calculate total accounts across all server pairs
-  const totalAccounts = serverPairs.reduce((sum: number, pair: any) => sum + (pair.total_accounts || 0), 0);
+  const totalAccounts = serverPairs.reduce((sum: number, pair: { total_accounts?: number }) => sum + (pair.total_accounts || 0), 0);
 
   // Count active campaigns
-  const activeCampaigns = campaigns.filter((c: any) => c.status === "active").length;
+  const activeCampaigns = campaigns.filter((c: { status: string }) => c.status === "active").length;
 
   return (
     <div className="space-y-8">

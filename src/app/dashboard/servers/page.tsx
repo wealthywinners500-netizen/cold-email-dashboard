@@ -4,6 +4,11 @@ import { getServerPairs } from "@/lib/supabase/queries";
 import ServersClient from "./servers-client";
 
 export default async function ServersPage() {
-  const serverPairs = await getServerPairs();
+  let serverPairs: Awaited<ReturnType<typeof getServerPairs>> = [];
+  try {
+    serverPairs = await getServerPairs();
+  } catch {
+    serverPairs = [];
+  }
   return <ServersClient serverPairs={serverPairs} />;
 }

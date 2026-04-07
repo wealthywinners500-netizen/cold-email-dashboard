@@ -42,6 +42,28 @@ export async function handleSyncAllAccounts(): Promise<void> {
 }
 
 /**
+ * Check if a message is a bounce (before classification).
+ * Bounces come from mailer-daemon/postmaster or have delivery-status content type.
+ */
+function isBounceMessage(fromEmail: string, bodyText: string | null): boolean {
+  const lowerFrom = (fromEmail || '').toLowerCase();
+  if (lowerFrom.includes('mailer-daemon') || lowerFrom.includes('postmaster')) {
+    return true;
+  }
+  // Check for common bounce indicators in body
+  const lowerBody = (bodyText || '').toLowerCase();
+  if (
+    lowerBody.includes('delivery status notification') ||
+    lowerBody.includes('undeliverable') ||
+    lowerBody.includes('delivery failure') ||
+    lowerBody.includes('returned mail')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Classify a single reply immediately after sync
  */
 export async function handleClassifyReply(data: { messageId: number }): Promise<void> {
@@ -49,12 +71,25 @@ export async function handleClassifyReply(data: { messageId: number }): Promise<
 
   const { data: message, error } = await supabase
     .from('inbox_messages')
-    .select('id, reply_only_text, body_text, subject, campaign_id, recipient_id, org_id')
+    .select('id, reply_only_text, body_text, subject, campaign_id, recipient_id, org_id, from_email')
     .eq('id', data.messageId)
     .single();
 
   if (error || !message) {
     console.error(`[ClassifyReply] Message ${data.messageId} not found`);
+    return;
+  }
+
+  // B10: Bounce detection BEFORE classification — Hard Lesson #11
+  if (isBounceMessage(message.from_email, message.body_text)) {
+    console.log(`[ClassifyReply] Bounce detected for message ${data.messageId}, routing to bounce handler`);
+    const { handleProcessBounce } = await import('./process-bounce');
+    await handleProcessBounce({
+      messageId: data.messageId,
+      bodyText: message.body_text || message.reply_only_text || '',
+      fromEmail: message.from_email,
+      orgId: message.org_id,
+    });
     return;
   }
 

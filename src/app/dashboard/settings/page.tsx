@@ -9,6 +9,7 @@ import { Settings as SettingsIcon, Key, Bell, Zap, CreditCard } from "lucide-rea
 import { OrganizationProfile } from "@clerk/nextjs";
 import { getPlanLimits } from "@/lib/plan-limits";
 import { BillingButton } from "./billing-button";
+import IntegrationsSection from "./integrations-section";
 
 async function getOrganization() {
   const { orgId } = await auth();
@@ -21,7 +22,7 @@ async function getOrganization() {
 
   const { data, error } = await supabase
     .from("organizations")
-    .select("id, name, plan_tier, clerk_org_id")
+    .select("id, name, plan_tier, clerk_org_id, integrations")
     .eq("clerk_org_id", orgId)
     .single();
 
@@ -149,6 +150,17 @@ export default async function SettingsPage() {
           </div>
         </CardContent>
       </Card>
+
+      <IntegrationsSection
+        initialKeys={{
+          outscraper_api_key: (org as any).integrations?.outscraper_api_key
+            ? "••••" + ((org as any).integrations.outscraper_api_key as string).slice(-4)
+            : "",
+          reoon_api_key: (org as any).integrations?.reoon_api_key
+            ? "••••" + ((org as any).integrations.reoon_api_key as string).slice(-4)
+            : "",
+        }}
+      />
 
       <Card className="bg-gray-900 border-gray-800">
         <CardHeader>

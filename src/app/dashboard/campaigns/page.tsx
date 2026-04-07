@@ -4,6 +4,11 @@ import { getCampaigns } from "@/lib/supabase/queries";
 import CampaignsClient from "./campaigns-client";
 
 export default async function CampaignsPage() {
-  const campaigns = await getCampaigns();
+  let campaigns: Awaited<ReturnType<typeof getCampaigns>> = [];
+  try {
+    campaigns = await getCampaigns();
+  } catch {
+    campaigns = [];
+  }
   return <CampaignsClient campaigns={campaigns} />;
 }

@@ -3,6 +3,7 @@ import { handleSendEmail } from "./handlers/send-email";
 import { handleProcessSequenceStep } from "./handlers/process-sequence-step";
 import { handleCheckNoReply } from "./handlers/check-no-reply";
 import { handleSyncAllAccounts, handleClassifyReply, handleClassifyBatch } from "./handlers/sync-inbox";
+import { handleProcessBounce } from "./handlers/process-bounce";
 import { closeAll } from "../lib/email/smtp-manager";
 import { createClient } from "@supabase/supabase-js";
 
@@ -132,6 +133,27 @@ async function main() {
         console.log(`[Worker] Classify job ${job.id} completed successfully`);
       } catch (err) {
         console.error(`[Worker] Classify job ${job.id} failed:`, err);
+        throw err;
+      }
+    }
+  });
+
+  // Register process-bounce handler (B10)
+  interface ProcessBouncePayload {
+    messageId: number;
+    bodyText: string;
+    fromEmail: string;
+    orgId: string;
+  }
+
+  await boss.work<ProcessBouncePayload>("process-bounce", async (jobs) => {
+    for (const job of jobs) {
+      console.log(`[Worker] Processing bounce for message ${job.data.messageId}`);
+      try {
+        await handleProcessBounce(job.data);
+        console.log(`[Worker] Bounce job ${job.id} completed successfully`);
+      } catch (err) {
+        console.error(`[Worker] Bounce job ${job.id} failed:`, err);
         throw err;
       }
     }

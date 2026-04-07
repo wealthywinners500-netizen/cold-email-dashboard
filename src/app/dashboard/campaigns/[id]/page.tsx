@@ -1,6 +1,6 @@
 export const dynamic = 'force-dynamic';
 
-import { getCampaigns, getSequences, getLeadSequenceStates, getCampaignStats } from "@/lib/supabase/queries";
+import { getCampaigns, getSequences, getLeadSequenceStates, getCampaignStats, getCampaignAnalytics, getDailySendVolume, getCampaignRecipientsForAnalytics } from "@/lib/supabase/queries";
 import CampaignDetailClient from "./campaign-detail-client";
 
 export default async function CampaignDetailPage({
@@ -12,7 +12,12 @@ export default async function CampaignDetailPage({
   const campaignId = id;
 
   // Fetch campaign by finding it in the full list
-  const campaigns = await getCampaigns();
+  let campaigns: Awaited<ReturnType<typeof getCampaigns>> = [];
+  try {
+    campaigns = await getCampaigns();
+  } catch {
+    campaigns = [];
+  }
   const campaign = campaigns.find((c: any) => c.id === campaignId);
 
   if (!campaign) {
@@ -26,11 +31,14 @@ export default async function CampaignDetailPage({
     );
   }
 
-  // Fetch sequences and lead states
-  const [sequences, leadStatesResult, stats] = await Promise.all([
+  // Fetch sequences, lead states, and analytics
+  const [sequences, leadStatesResult, stats, analytics, dailyVolume, recipientsResult] = await Promise.all([
     getSequences(campaignId),
     getLeadSequenceStates(campaignId, { limit: 50 }),
     getCampaignStats(campaignId),
+    getCampaignAnalytics(campaignId).catch(() => null),
+    getDailySendVolume(campaignId).catch(() => []),
+    getCampaignRecipientsForAnalytics(campaignId, 1, 50).catch(() => ({ data: [], count: 0 })),
   ]);
 
   return (
@@ -39,6 +47,10 @@ export default async function CampaignDetailPage({
       sequences={sequences}
       leadStates={leadStatesResult.data}
       stats={stats}
+      analytics={analytics}
+      dailyVolume={dailyVolume}
+      analyticsRecipients={recipientsResult.data || []}
+      analyticsRecipientsCount={recipientsResult.count ?? 0}
     />
   );
 }
