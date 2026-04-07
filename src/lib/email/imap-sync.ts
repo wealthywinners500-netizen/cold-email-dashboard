@@ -242,18 +242,13 @@ export async function syncAccount(accountId: string): Promise<number> {
       }
     }
 
-    // Update sync state on the account
-    // Note: email_accounts doesn't have a sync_state column yet — store in a JSON field or use last_error as temp
-    // For now, we'll use a convention of storing sync state in the account's updated_at comment
-    // A better approach would be adding a sync_state JSONB column in a future migration
-    // For now, store in localStorage-style approach via a separate query
-    const newSyncState = { uidvalidity: currentUidValidity, last_uid: maxUid };
+    // Persist sync state for incremental IMAP syncs
+    const newSyncState: SyncState = { uidvalidity: Number(currentUidValidity), last_uid: maxUid };
     await supabase
       .from('email_accounts')
       .update({
         updated_at: new Date().toISOString(),
-        // Store sync state in last_error field temporarily (hacky but works without migration)
-        // TODO: Add proper sync_state JSONB column in next migration
+        sync_state: newSyncState,
       })
       .eq('id', accountId);
 

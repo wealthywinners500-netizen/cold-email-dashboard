@@ -5,6 +5,7 @@
  */
 import { NextRequest } from "next/server";
 import { createClient } from "@supabase/supabase-js";
+import { rateLimit } from "@/lib/rate-limit";
 
 // Hard Lesson #34: Lazy init for all clients
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -41,6 +42,12 @@ export async function GET(request: NextRequest) {
     });
 
   if (!trackingId) {
+    return pixelResponse();
+  }
+
+  // Rate limit: 100 requests per IP per minute
+  const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+  if (!rateLimit(`track:open:${ip}`, 100)) {
     return pixelResponse();
   }
 
@@ -82,20 +89,12 @@ export async function GET(request: NextRequest) {
         .is("opened_at", null);
     }
 
-    // Increment campaigns.total_opened
+    // Atomically increment campaigns.total_opened (no race condition)
     if (sendLog.campaign_id) {
-      const { data: campaign } = await supabase
-        .from("campaigns")
-        .select("total_opened")
-        .eq("id", sendLog.campaign_id)
-        .single();
-
-      if (campaign) {
-        await supabase
-          .from("campaigns")
-          .update({ total_opened: (campaign.total_opened ?? 0) + 1 })
-          .eq("id", sendLog.campaign_id);
-      }
+      await supabase.rpc('increment_campaign_counter', {
+        p_campaign_id: sendLog.campaign_id,
+        p_counter_name: 'total_opened',
+      });
     }
   } catch (err) {
     // Never fail the pixel response — tracking is best-effort

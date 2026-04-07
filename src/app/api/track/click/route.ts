@@ -5,6 +5,7 @@
  */
 import { NextRequest } from "next/server";
 import { createClient } from "@supabase/supabase-js";
+import { rateLimit } from "@/lib/rate-limit";
 
 // Hard Lesson #34: Lazy init
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -26,6 +27,12 @@ export async function GET(request: NextRequest) {
 
   if (!trackingId || !encodedUrl) {
     return new Response("Missing parameters", { status: 400 });
+  }
+
+  // Rate limit: 100 requests per IP per minute
+  const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+  if (!rateLimit(`track:click:${ip}`, 100)) {
+    return new Response("Too many requests", { status: 429 });
   }
 
   const decodedUrl = decodeURIComponent(encodedUrl);
@@ -72,20 +79,12 @@ export async function GET(request: NextRequest) {
           .is("clicked_at", null);
       }
 
-      // Increment campaigns.total_clicked
+      // Atomically increment campaigns.total_clicked (no race condition)
       if (sendLog.campaign_id) {
-        const { data: campaign } = await supabase
-          .from("campaigns")
-          .select("total_clicked")
-          .eq("id", sendLog.campaign_id)
-          .single();
-
-        if (campaign) {
-          await supabase
-            .from("campaigns")
-            .update({ total_clicked: (campaign.total_clicked ?? 0) + 1 })
-            .eq("id", sendLog.campaign_id);
-        }
+        await supabase.rpc('increment_campaign_counter', {
+          p_campaign_id: sendLog.campaign_id,
+          p_counter_name: 'total_clicked',
+        });
       }
     }
   } catch (err) {

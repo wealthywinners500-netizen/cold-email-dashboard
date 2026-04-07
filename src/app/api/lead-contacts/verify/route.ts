@@ -87,8 +87,8 @@ export async function POST(request: NextRequest) {
 
     // Get emails and filter out nulls
     const emails = contacts
-      .filter((c: any) => c.email)
-      .map((c: any) => ({ id: c.id, email: c.email }));
+      .filter((c: { id: string; email: string | null }) => c.email)
+      .map((c: { id: string; email: string | null }) => ({ id: c.id, email: c.email as string }));
 
     if (emails.length === 0) {
       return NextResponse.json(
@@ -97,10 +97,18 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Guard: max 5000 contacts per request
+    if (emails.length > 5000) {
+      return NextResponse.json(
+        { error: "Maximum 5000 contacts per verification request" },
+        { status: 400, headers: { "Cache-Control": "no-store" } }
+      );
+    }
+
     // Verify batch
     const verificationResults = await verifyBatch(
       reoon_api_key,
-      emails.map((e: any) => e.email)
+      emails.map((e: { id: string; email: string }) => e.email)
     );
 
     // Build email-to-result map
@@ -109,27 +117,36 @@ export async function POST(request: NextRequest) {
       resultMap.set(r.email, r.email_status);
     }
 
-    // Update contacts with verification results
+    // Update contacts with verification results — batched for performance
     const now = new Date().toISOString();
     let validCount = 0;
     let invalidCount = 0;
     let riskyCount = 0;
 
-    for (const { id, email } of emails) {
+    const updates = emails.map(({ id, email }: { id: string; email: string }) => {
       const status = resultMap.get(email) || 'unknown';
-
       if (status === 'valid') validCount++;
       else if (status === 'invalid') invalidCount++;
       else if (status === 'risky') riskyCount++;
+      return { id, status };
+    });
 
-      await supabase
-        .from("lead_contacts")
-        .update({
-          email_status: status,
-          verified_at: now,
-          verification_source: "reoon",
-        })
-        .eq("id", id);
+    // Batch updates in chunks of 50 with Promise.all
+    const BATCH_SIZE = 50;
+    for (let i = 0; i < updates.length; i += BATCH_SIZE) {
+      const batch = updates.slice(i, i + BATCH_SIZE);
+      await Promise.all(
+        batch.map(({ id, status }) =>
+          supabase
+            .from("lead_contacts")
+            .update({
+              email_status: status,
+              verified_at: now,
+              verification_source: "reoon",
+            })
+            .eq("id", id)
+        )
+      );
     }
 
     return NextResponse.json(

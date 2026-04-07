@@ -6,6 +6,7 @@
  */
 import { NextRequest } from "next/server";
 import { createClient } from "@supabase/supabase-js";
+import { rateLimit } from "@/lib/rate-limit";
 
 // Hard Lesson #34: Lazy init
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -64,6 +65,13 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   const trackingId = request.nextUrl.searchParams.get("id");
+
+  // Rate limit: 20 requests per IP per minute (stricter for unsubscribe)
+  const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+  if (!rateLimit(`track:unsub:${ip}`, 20)) {
+    return htmlResponse(`<!DOCTYPE html><html><head><title>Error</title>${PAGE_STYLE}</head>
+      <body><div class="card"><h1>Too Many Requests</h1><p>Please wait a moment and try again.</p></div></body></html>`, 429);
+  }
 
   if (!trackingId) {
     return htmlResponse(`<!DOCTYPE html><html><head><title>Error</title>${PAGE_STYLE}</head>
@@ -126,20 +134,12 @@ export async function POST(request: NextRequest) {
       user_agent: userAgent,
     });
 
-    // 4. Increment campaigns.total_unsubscribed
+    // 4. Atomically increment campaigns.total_unsubscribed (no race condition)
     if (sendLog.campaign_id) {
-      const { data: campaign } = await supabase
-        .from("campaigns")
-        .select("total_unsubscribed")
-        .eq("id", sendLog.campaign_id)
-        .single();
-
-      if (campaign) {
-        await supabase
-          .from("campaigns")
-          .update({ total_unsubscribed: (campaign.total_unsubscribed ?? 0) + 1 })
-          .eq("id", sendLog.campaign_id);
-      }
+      await supabase.rpc('increment_campaign_counter', {
+        p_campaign_id: sendLog.campaign_id,
+        p_counter_name: 'total_unsubscribed',
+      });
     }
 
     return htmlResponse(`<!DOCTYPE html><html><head><title>Unsubscribed</title>${PAGE_STYLE}</head>

@@ -430,6 +430,7 @@ export type Database = {
           status: string;
           last_error: string | null;
           last_sent_at: string | null;
+          sync_state: Record<string, unknown>;
           created_at: string;
           updated_at: string;
         };
@@ -453,6 +454,7 @@ export type Database = {
           status?: string;
           last_error?: string | null;
           last_sent_at?: string | null;
+          sync_state?: Record<string, unknown>;
           created_at?: string;
           updated_at?: string;
         };
@@ -476,6 +478,7 @@ export type Database = {
           status?: string;
           last_error?: string | null;
           last_sent_at?: string | null;
+          sync_state?: Record<string, unknown>;
           created_at?: string;
           updated_at?: string;
         };
@@ -981,6 +984,7 @@ export interface EmailAccount {
   status: string;
   last_error: string | null;
   last_sent_at: string | null;
+  sync_state: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 }

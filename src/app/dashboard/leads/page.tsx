@@ -34,8 +34,8 @@ export default async function LeadsPage({
   const leads = await getLeads();
 
   // Fetch contacts data if we have an org
-  let contactsData = { data: [], total: 0, page: 1, totalPages: 0 };
-  let contactStats = { total: 0, pending: 0, valid: 0, invalid: 0, risky: 0, unknown: 0, suppressed: 0, by_state: [], by_type: [] };
+  let contactsData: { data: Awaited<ReturnType<typeof getLeadContacts>>['data']; total: number; page: number; totalPages: number } = { data: [], total: 0, page: 1, totalPages: 0 };
+  let contactStats: Awaited<ReturnType<typeof getLeadContactStats>> = { total: 0, pending: 0, valid: 0, invalid: 0, risky: 0, unknown: 0, suppressed: 0, by_state: [], by_type: [] };
   let hasOutscraper = false;
   let hasReoon = false;
 
@@ -56,8 +56,8 @@ export default async function LeadsPage({
         getLeadContactStats(orgId),
         getOrganizationIntegrations(orgId),
       ]);
-      contactsData = contacts as any;
-      contactStats = stats as any;
+      contactsData = contacts;
+      contactStats = stats;
       hasOutscraper = !!integrations.outscraper_api_key;
       hasReoon = !!integrations.reoon_api_key;
     } catch (err) {
@@ -101,8 +101,8 @@ export default async function LeadsPage({
       {/* Tab Content */}
       {tab === "contacts" ? (
         <LeadContactsClient
-          contacts={contactsData.data as any}
-          stats={contactStats as any}
+          contacts={contactsData.data}
+          stats={contactStats}
           total={contactsData.total}
           page={contactsData.page}
           totalPages={contactsData.totalPages}
@@ -110,7 +110,7 @@ export default async function LeadsPage({
           hasReoon={hasReoon}
         />
       ) : (
-        <LeadsClient leads={leads as any} />
+        <LeadsClient leads={leads} />
       )}
     </div>
   );

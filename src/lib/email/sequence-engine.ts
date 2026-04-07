@@ -93,7 +93,7 @@ export async function initializeSequence(
   let accountRoundRobinIndex = 0;
 
   for (const recipient of recipients || []) {
-    const assignedVariant = variants[Math.floor(Math.random() * 4)];
+    const assignedVariant = variants[Math.floor(Math.random() * variants.length)];
     const assignedAccount =
       activeAccounts[accountRoundRobinIndex % activeAccounts.length];
     accountRoundRobinIndex++;
