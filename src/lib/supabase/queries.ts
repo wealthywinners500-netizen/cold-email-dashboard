@@ -1114,3 +1114,155 @@ export async function updateWorkerHeartbeatQuery(orgId: string): Promise<void> {
 
   if (error) throw error;
 }
+
+// ============================================
+// B15: Provisioning Queries
+// ============================================
+
+export async function getVPSProviders(orgId: string) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('vps_providers')
+    .select('*')
+    .eq('org_id', orgId)
+    .order('created_at', { ascending: true });
+
+  if (error) throw error;
+  return data;
+}
+
+export async function createVPSProvider(orgId: string, provider: {
+  name: string;
+  provider_type: string;
+  api_key_encrypted?: string | null;
+  api_secret_encrypted?: string | null;
+  config?: Record<string, unknown>;
+  is_default?: boolean;
+}) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('vps_providers')
+    .insert([{ ...provider, org_id: orgId }])
+    .select();
+
+  if (error) throw error;
+  return data[0];
+}
+
+export async function updateVPSProvider(orgId: string, id: string, updates: Record<string, unknown>) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('vps_providers')
+    .update({ ...updates, updated_at: new Date().toISOString() })
+    .eq('id', id)
+    .eq('org_id', orgId)
+    .select();
+
+  if (error) throw error;
+  return data[0];
+}
+
+export async function deleteVPSProvider(orgId: string, id: string) {
+  const supabase = await createAdminClient();
+  const { error } = await supabase
+    .from('vps_providers')
+    .delete()
+    .eq('id', id)
+    .eq('org_id', orgId);
+
+  if (error) throw error;
+}
+
+export async function getDNSRegistrars(orgId: string) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('dns_registrars')
+    .select('*')
+    .eq('org_id', orgId)
+    .order('created_at', { ascending: true });
+
+  if (error) throw error;
+  return data;
+}
+
+export async function createDNSRegistrar(orgId: string, registrar: {
+  name: string;
+  registrar_type: string;
+  api_key_encrypted?: string | null;
+  api_secret_encrypted?: string | null;
+  config?: Record<string, unknown>;
+  is_default?: boolean;
+}) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('dns_registrars')
+    .insert([{ ...registrar, org_id: orgId }])
+    .select();
+
+  if (error) throw error;
+  return data[0];
+}
+
+export async function updateDNSRegistrar(orgId: string, id: string, updates: Record<string, unknown>) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('dns_registrars')
+    .update({ ...updates, updated_at: new Date().toISOString() })
+    .eq('id', id)
+    .eq('org_id', orgId)
+    .select();
+
+  if (error) throw error;
+  return data[0];
+}
+
+export async function deleteDNSRegistrar(orgId: string, id: string) {
+  const supabase = await createAdminClient();
+  const { error } = await supabase
+    .from('dns_registrars')
+    .delete()
+    .eq('id', id)
+    .eq('org_id', orgId);
+
+  if (error) throw error;
+}
+
+export async function getProvisioningJobs(orgId: string) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('provisioning_jobs')
+    .select('*')
+    .eq('org_id', orgId)
+    .order('created_at', { ascending: false });
+
+  if (error) throw error;
+  return data;
+}
+
+export async function getProvisioningJob(jobId: string) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('provisioning_jobs')
+    .select('*, provisioning_steps(*)')
+    .eq('id', jobId)
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+export async function getSSHCredentials(orgId: string, serverIp?: string) {
+  const supabase = await createAdminClient();
+  let query = supabase
+    .from('ssh_credentials')
+    .select('*')
+    .eq('org_id', orgId);
+
+  if (serverIp) {
+    query = query.eq('server_ip', serverIp);
+  }
+
+  const { data, error } = await query;
+  if (error) throw error;
+  return data;
+}

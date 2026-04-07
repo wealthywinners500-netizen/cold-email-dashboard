@@ -15,6 +15,7 @@ import {
   X as XIcon,
   AtSign,
   Inbox,
+  Rocket,
 } from "lucide-react";
 import { OrganizationSwitcher, UserButton } from "@clerk/nextjs";
 import Link from "next/link";
@@ -59,6 +60,11 @@ const navigationItems = [
     label: "SMS",
     href: "/dashboard/sms",
     icon: Smartphone,
+  },
+  {
+    label: "Provisioning",
+    href: "/dashboard/provisioning",
+    icon: Rocket,
   },
   {
     label: "Settings",

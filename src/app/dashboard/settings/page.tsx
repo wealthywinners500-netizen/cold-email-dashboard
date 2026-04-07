@@ -10,6 +10,7 @@ import { OrganizationProfile } from "@clerk/nextjs";
 import { getPlanLimits } from "@/lib/plan-limits";
 import { BillingButton } from "./billing-button";
 import IntegrationsSection from "./integrations-section";
+import ProvidersSection from "./providers-section";
 
 async function getOrganization() {
   const { orgId } = await auth();
@@ -150,6 +151,8 @@ export default async function SettingsPage() {
           </div>
         </CardContent>
       </Card>
+
+      <ProvidersSection />
 
       <IntegrationsSection
         initialKeys={{
