@@ -55,10 +55,6 @@ export default function LeadsClient({ leads }: LeadsClientProps) {
   if (leads.length === 0) {
     return (
       <div className="space-y-8">
-        <div>
-          <h1 className="text-3xl font-bold text-white">Lead Pipeline</h1>
-          <p className="text-gray-400 mt-2">Manage and track lead sources and verification</p>
-        </div>
         <div className="flex flex-col items-center justify-center py-20 text-center">
           <Users className="w-16 h-16 text-gray-600 mb-4" />
           <h3 className="text-xl font-semibold text-white mb-2">No leads imported yet</h3>
@@ -167,13 +163,7 @@ export default function LeadsClient({ leads }: LeadsClientProps) {
 
   return (
     <div className="space-y-8">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold text-white">Lead Pipeline</h1>
-          <p className="text-gray-400 mt-2">
-            Manage and track lead sources and verification
-          </p>
-        </div>
+      <div className="flex items-center justify-end">
         <div className="flex gap-3">
           <button
             onClick={() => setCsvModalOpen(true)}
@@ -189,7 +179,7 @@ export default function LeadsClient({ leads }: LeadsClientProps) {
             className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold"
           >
             <Users className="w-5 h-5 inline mr-2" />
-            Add Lead
+            Add Batch
           </button>
         </div>
       </div>

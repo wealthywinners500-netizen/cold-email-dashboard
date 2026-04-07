@@ -608,3 +608,200 @@ export async function getCampaignRecipientsForAnalytics(
   if (error) throw error;
   return { data, count };
 }
+
+// ============================================
+// B11: Lead Contacts Queries
+// ============================================
+
+export async function getLeadContacts(
+  orgId: string,
+  filters?: {
+    page?: number;
+    perPage?: number;
+    city?: string;
+    state?: string;
+    business_type?: string;
+    email_status?: string;
+    tags?: string[];
+    suppressed?: boolean;
+    search?: string;
+    sortBy?: string;
+    sortOrder?: 'asc' | 'desc';
+  }
+) {
+  const supabase = await createAdminClient();
+  const page = filters?.page || 1;
+  const perPage = filters?.perPage || 50;
+  const sortBy = filters?.sortBy || 'created_at';
+  const sortOrder = filters?.sortOrder || 'desc';
+
+  let query = supabase
+    .from('lead_contacts')
+    .select('*', { count: 'exact' })
+    .eq('org_id', orgId);
+
+  if (filters?.city) {
+    query = query.ilike('city', `%${filters.city}%`);
+  }
+  if (filters?.state) {
+    query = query.eq('state', filters.state);
+  }
+  if (filters?.business_type) {
+    query = query.ilike('business_type', `%${filters.business_type}%`);
+  }
+  if (filters?.email_status) {
+    query = query.eq('email_status', filters.email_status);
+  }
+  if (filters?.tags && filters.tags.length > 0) {
+    query = query.overlaps('tags', filters.tags);
+  }
+  if (filters?.suppressed !== undefined) {
+    query = query.eq('suppressed', filters.suppressed);
+  }
+  if (filters?.search) {
+    query = query.or(
+      `business_name.ilike.%${filters.search}%,email.ilike.%${filters.search}%,first_name.ilike.%${filters.search}%,last_name.ilike.%${filters.search}%`
+    );
+  }
+
+  query = query
+    .order(sortBy, { ascending: sortOrder === 'asc' })
+    .range((page - 1) * perPage, page * perPage - 1);
+
+  const { data, error, count } = await query;
+  if (error) throw error;
+
+  return {
+    data: data || [],
+    total: count || 0,
+    page,
+    totalPages: Math.ceil((count || 0) / perPage),
+  };
+}
+
+export async function getLeadContact(orgId: string, contactId: string) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('lead_contacts')
+    .select('*')
+    .eq('id', contactId)
+    .eq('org_id', orgId)
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+export async function getLeadContactStats(orgId: string) {
+  const supabase = await createAdminClient();
+
+  // Get counts by email_status
+  const { data: contacts, error } = await supabase
+    .from('lead_contacts')
+    .select('email_status, state, business_type, suppressed')
+    .eq('org_id', orgId);
+
+  if (error) throw error;
+
+  const stats = {
+    total: contacts?.length || 0,
+    pending: 0,
+    valid: 0,
+    invalid: 0,
+    risky: 0,
+    unknown: 0,
+    suppressed: 0,
+    by_state: [] as { state: string; count: number }[],
+    by_type: [] as { type: string; count: number }[],
+  };
+
+  const stateMap = new Map<string, number>();
+  const typeMap = new Map<string, number>();
+
+  for (const c of contacts || []) {
+    if (c.suppressed) stats.suppressed++;
+    switch (c.email_status) {
+      case 'pending': stats.pending++; break;
+      case 'valid': stats.valid++; break;
+      case 'invalid': stats.invalid++; break;
+      case 'risky': stats.risky++; break;
+      case 'unknown': stats.unknown++; break;
+    }
+    if (c.state) {
+      stateMap.set(c.state, (stateMap.get(c.state) || 0) + 1);
+    }
+    if (c.business_type) {
+      typeMap.set(c.business_type, (typeMap.get(c.business_type) || 0) + 1);
+    }
+  }
+
+  stats.by_state = Array.from(stateMap.entries())
+    .map(([state, count]) => ({ state, count }))
+    .sort((a, b) => b.count - a.count);
+
+  stats.by_type = Array.from(typeMap.entries())
+    .map(([type, count]) => ({ type, count }))
+    .sort((a, b) => b.count - a.count);
+
+  return stats;
+}
+
+export async function upsertLeadContacts(
+  orgId: string,
+  contacts: Partial<Record<string, unknown>>[]
+) {
+  const supabase = await createAdminClient();
+
+  const rows = contacts.map((c) => ({
+    ...c,
+    org_id: orgId,
+  }));
+
+  const { data, error } = await supabase
+    .from('lead_contacts')
+    .upsert(rows, {
+      onConflict: 'org_id,email',
+      ignoreDuplicates: false,
+    })
+    .select();
+
+  if (error) throw error;
+  return { inserted: data?.length || 0, data };
+}
+
+export async function searchLeadContactsByEmail(orgId: string, emails: string[]) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('lead_contacts')
+    .select('email')
+    .eq('org_id', orgId)
+    .in('email', emails);
+
+  if (error) throw error;
+  return new Set((data || []).map((d: { email: string }) => d.email));
+}
+
+export async function getOrganizationIntegrations(orgId: string) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('organizations')
+    .select('integrations')
+    .eq('id', orgId)
+    .single();
+
+  if (error) throw error;
+  return (data?.integrations || {}) as Record<string, string>;
+}
+
+export async function updateOrganizationIntegrations(
+  orgId: string,
+  integrations: Record<string, string>
+) {
+  const supabase = await createAdminClient();
+  const { error } = await supabase
+    .from('organizations')
+    .update({ integrations })
+    .eq('id', orgId);
+
+  if (error) throw error;
+}
