@@ -58,7 +58,8 @@ export async function sendEmail(
   subject: string,
   html: string,
   text?: string,
-  trackingId?: string
+  trackingId?: string,
+  extraHeaders?: Record<string, string>
 ): Promise<SendResult> {
   const transporter = getTransporter(
     account.smtp_host,
@@ -72,13 +73,17 @@ export async function sendEmail(
     ? `"${account.display_name}" <${account.email}>`
     : account.email;
 
+  const headers: Record<string, string> = {};
+  if (trackingId) headers["X-Tracking-Id"] = trackingId;
+  if (extraHeaders) Object.assign(headers, extraHeaders);
+
   const info = await transporter.sendMail({
     from: fromAddress,
     to,
     subject,
     html,
     text: text || undefined,
-    headers: trackingId ? { "X-Tracking-Id": trackingId } : undefined,
+    headers: Object.keys(headers).length > 0 ? headers : undefined,
   });
 
   return {

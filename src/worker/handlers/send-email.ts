@@ -1,6 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { sendEmail } from "../../lib/email/smtp-manager";
 import { renderTemplate, renderSubjectLine } from "../../lib/email/template-renderer";
+import { prepareEmail } from "../../lib/email/email-preparer";
 import { randomUUID } from "crypto";
 
 function getSupabase() {
@@ -92,11 +93,20 @@ export async function handleSendEmail(payload: SendEmailPayload): Promise<void> 
   // 5. Generate tracking ID
   const trackingId = randomUUID();
 
-  // 6. Send email
-  try {
-    const result = await sendEmail(account, recipient.email, subject, html, text, trackingId);
+  // 6. Prepare email with tracking (pixel, click rewrite, unsub link + headers)
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://cold-email-dashboard.vercel.app";
+  const prepared = prepareEmail(html, trackingId, baseUrl);
+  const trackedHtml = prepared.html;
+  const extraHeaders: Record<string, string> = {
+    "List-Unsubscribe": prepared.listUnsubscribe,
+    "List-Unsubscribe-Post": prepared.listUnsubscribePost,
+  };
 
-    // 7a. Success: update recipient
+  // 7. Send email
+  try {
+    const result = await sendEmail(account, recipient.email, subject, trackedHtml, text, trackingId, extraHeaders);
+
+    // 8a. Success: update recipient
     await supabase
       .from("campaign_recipients")
       .update({
@@ -116,7 +126,7 @@ export async function handleSendEmail(payload: SendEmailPayload): Promise<void> 
       from_name: account.display_name,
       to_email: recipient.email,
       subject,
-      body_html: html,
+      body_html: trackedHtml,
       body_text: text || null,
       message_id: result.messageId,
       smtp_response: result.response,
@@ -138,7 +148,7 @@ export async function handleSendEmail(payload: SendEmailPayload): Promise<void> 
       })
       .eq("id", accountId);
   } catch (sendErr) {
-    // 7b. Failure: log error
+    // 8b. Failure: log error
     const errorMessage = sendErr instanceof Error ? sendErr.message : "Unknown send error";
 
     await supabase.from("email_send_log").insert({
@@ -150,7 +160,7 @@ export async function handleSendEmail(payload: SendEmailPayload): Promise<void> 
       from_name: account.display_name,
       to_email: recipient.email,
       subject,
-      body_html: html,
+      body_html: trackedHtml,
       body_text: text || null,
       status: "failed",
       error_message: errorMessage,

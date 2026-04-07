@@ -128,6 +128,7 @@ export type Database = {
           total_clicked: number;
           total_replied: number;
           total_bounced: number;
+          total_unsubscribed: number;
           started_at: string | null;
           completed_at: string | null;
           created_at: string;
@@ -153,6 +154,7 @@ export type Database = {
           total_clicked?: number;
           total_replied?: number;
           total_bounced?: number;
+          total_unsubscribed?: number;
           started_at?: string | null;
           completed_at?: string | null;
           created_at?: string;
@@ -178,6 +180,7 @@ export type Database = {
           total_clicked?: number;
           total_replied?: number;
           total_bounced?: number;
+          total_unsubscribed?: number;
           started_at?: string | null;
           completed_at?: string | null;
           created_at?: string;
@@ -805,6 +808,56 @@ export type Database = {
           created_at?: string;
         };
       };
+      tracking_events: {
+        Row: {
+          id: number;
+          org_id: string;
+          campaign_id: string | null;
+          recipient_id: string | null;
+          send_log_id: string | null;
+          tracking_id: string;
+          event_type: string;
+          clicked_url: string | null;
+          bounce_type: string | null;
+          bounce_code: string | null;
+          bounce_message: string | null;
+          ip_address: string | null;
+          user_agent: string | null;
+          created_at: string;
+        };
+        Insert: {
+          id?: number;
+          org_id: string;
+          campaign_id?: string | null;
+          recipient_id?: string | null;
+          send_log_id?: string | null;
+          tracking_id: string;
+          event_type: string;
+          clicked_url?: string | null;
+          bounce_type?: string | null;
+          bounce_code?: string | null;
+          bounce_message?: string | null;
+          ip_address?: string | null;
+          user_agent?: string | null;
+          created_at?: string;
+        };
+        Update: {
+          id?: number;
+          org_id?: string;
+          campaign_id?: string | null;
+          recipient_id?: string | null;
+          send_log_id?: string | null;
+          tracking_id?: string;
+          event_type?: string;
+          clicked_url?: string | null;
+          bounce_type?: string | null;
+          bounce_code?: string | null;
+          bounce_message?: string | null;
+          ip_address?: string | null;
+          user_agent?: string | null;
+          created_at?: string;
+        };
+      };
     };
   };
 };
@@ -898,6 +951,7 @@ export interface Campaign {
   total_clicked: number;
   total_replied: number;
   total_bounced: number;
+  total_unsubscribed: number;
   started_at: string | null;
   completed_at: string | null;
   created_at: string;
@@ -1048,4 +1102,38 @@ export interface SuppressionEntry {
   reason: string;
   source: string | null;
   created_at: string;
+}
+
+// B10: Tracking + Bounce Handling
+
+export interface TrackingEvent {
+  id: number;
+  org_id: string;
+  campaign_id: string | null;
+  recipient_id: string | null;
+  send_log_id: string | null;
+  tracking_id: string;
+  event_type: 'open' | 'click' | 'bounce_hard' | 'bounce_soft' | 'unsubscribe';
+  clicked_url: string | null;
+  bounce_type: string | null;
+  bounce_code: string | null;
+  bounce_message: string | null;
+  ip_address: string | null;
+  user_agent: string | null;
+  created_at: string;
+}
+
+export interface CampaignAnalytics {
+  total_sent: number;
+  total_delivered: number;
+  total_opened: number;
+  total_clicked: number;
+  total_replied: number;
+  total_bounced: number;
+  total_unsubscribed: number;
+  open_rate: number;
+  click_rate: number;
+  reply_rate: number;
+  bounce_rate: number;
+  unsubscribe_rate: number;
 }

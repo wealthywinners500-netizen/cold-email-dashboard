@@ -2,18 +2,56 @@
 
 import { useState } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { Campaign, CampaignSequence, LeadSequenceState, CampaignStats } from "@/lib/supabase/types";
+import { Campaign, CampaignSequence, LeadSequenceState, CampaignStats, CampaignAnalytics } from "@/lib/supabase/types";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { SequenceStepEditor } from "@/components/sequence/sequence-step-editor";
 import { SequenceFlowDiagram } from "@/components/sequence/sequence-flow-diagram";
-import { Users, Mail, MessageCircle, AlertCircle } from "lucide-react";
+import { Users, Mail, MessageCircle, AlertCircle, Eye, MousePointerClick, UserMinus, BarChart3, TrendingUp } from "lucide-react";
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  PieChart,
+  Pie,
+  Cell,
+  Legend,
+} from "recharts";
+
+interface DailyVolume {
+  date: string;
+  sent: number;
+  opened: number;
+  clicked: number;
+}
+
+interface AnalyticsRecipient {
+  id: string;
+  email: string;
+  status: string;
+  sent_at: string | null;
+  opened_at: string | null;
+  clicked_at: string | null;
+  replied_at: string | null;
+  bounced_at: string | null;
+  bounce_type: string | null;
+}
 
 interface CampaignDetailClientProps {
   campaign: Campaign;
   sequences: CampaignSequence[];
   leadStates: LeadSequenceState[];
   stats: CampaignStats;
+  analytics: CampaignAnalytics | null;
+  dailyVolume: DailyVolume[];
+  analyticsRecipients: AnalyticsRecipient[];
+  analyticsRecipientsCount: number;
 }
 
 const statusColorMap: Record<string, string> = {
@@ -23,11 +61,28 @@ const statusColorMap: Record<string, string> = {
   draft: "bg-yellow-900 text-yellow-200",
 };
 
+const STATUS_COLORS: Record<string, string> = {
+  pending: "#6b7280",
+  sent: "#3b82f6",
+  opened: "#22c55e",
+  clicked: "#f59e0b",
+  replied: "#a855f7",
+  bounced: "#ef4444",
+  unsubscribed: "#f97316",
+  failed: "#dc2626",
+};
+
+const PIE_COLORS = ["#6b7280", "#3b82f6", "#22c55e", "#f59e0b", "#a855f7", "#ef4444", "#f97316"];
+
 export default function CampaignDetailClient({
   campaign,
   sequences,
   leadStates,
   stats,
+  analytics,
+  dailyVolume,
+  analyticsRecipients,
+  analyticsRecipientsCount,
 }: CampaignDetailClientProps) {
   const [expandedSequence, setExpandedSequence] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState("overview");
@@ -382,14 +437,265 @@ export default function CampaignDetailClient({
           </Card>
         </Tabs.Content>
 
-        {/* Analytics Tab */}
+        {/* Analytics Tab (B10) */}
         <Tabs.Content value="analytics" className="space-y-6 pt-6">
-          <Card className="bg-gray-900 border-gray-800">
-            <CardContent className="p-12 flex flex-col items-center justify-center text-center">
-              <Mail className="w-16 h-16 text-gray-600 mb-4" />
-              <p className="text-gray-400 text-lg">Analytics coming in B10</p>
-            </CardContent>
-          </Card>
+          {analytics ? (
+            <>
+              {/* Stats Cards Row */}
+              <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
+                <Card className="bg-gray-900 border-gray-800">
+                  <CardContent className="p-4 text-center">
+                    <Mail className="w-5 h-5 text-blue-400 mx-auto mb-1" />
+                    <p className="text-xs text-gray-400">Sent</p>
+                    <p className="text-xl font-bold text-white">{(analytics.total_sent ?? 0).toLocaleString()}</p>
+                  </CardContent>
+                </Card>
+                <Card className="bg-gray-900 border-gray-800">
+                  <CardContent className="p-4 text-center">
+                    <TrendingUp className="w-5 h-5 text-green-400 mx-auto mb-1" />
+                    <p className="text-xs text-gray-400">Delivered</p>
+                    <p className="text-xl font-bold text-white">{(analytics.total_delivered ?? 0).toLocaleString()}</p>
+                    <p className="text-xs text-gray-500">{analytics.total_sent > 0 ? ((analytics.total_delivered / analytics.total_sent) * 100).toFixed(1) : '0'}%</p>
+                  </CardContent>
+                </Card>
+                <Card className="bg-gray-900 border-gray-800">
+                  <CardContent className="p-4 text-center">
+                    <Eye className="w-5 h-5 text-emerald-400 mx-auto mb-1" />
+                    <p className="text-xs text-gray-400">Opened</p>
+                    <p className="text-xl font-bold text-white">{(analytics.total_opened ?? 0).toLocaleString()}</p>
+                    <p className="text-xs text-gray-500">{(analytics.open_rate ?? 0).toFixed(1)}%</p>
+                  </CardContent>
+                </Card>
+                <Card className="bg-gray-900 border-gray-800">
+                  <CardContent className="p-4 text-center">
+                    <MousePointerClick className="w-5 h-5 text-yellow-400 mx-auto mb-1" />
+                    <p className="text-xs text-gray-400">Clicked</p>
+                    <p className="text-xl font-bold text-white">{(analytics.total_clicked ?? 0).toLocaleString()}</p>
+                    <p className="text-xs text-gray-500">{(analytics.click_rate ?? 0).toFixed(1)}%</p>
+                  </CardContent>
+                </Card>
+                <Card className="bg-gray-900 border-gray-800">
+                  <CardContent className="p-4 text-center">
+                    <MessageCircle className="w-5 h-5 text-purple-400 mx-auto mb-1" />
+                    <p className="text-xs text-gray-400">Replied</p>
+                    <p className="text-xl font-bold text-white">{(analytics.total_replied ?? 0).toLocaleString()}</p>
+                    <p className="text-xs text-gray-500">{(analytics.reply_rate ?? 0).toFixed(1)}%</p>
+                  </CardContent>
+                </Card>
+                <Card className={`bg-gray-900 ${(analytics.bounce_rate ?? 0) > 5 ? 'border-red-600' : 'border-gray-800'}`}>
+                  <CardContent className="p-4 text-center">
+                    <AlertCircle className="w-5 h-5 text-red-400 mx-auto mb-1" />
+                    <p className="text-xs text-gray-400">Bounced</p>
+                    <p className="text-xl font-bold text-white">{(analytics.total_bounced ?? 0).toLocaleString()}</p>
+                    <p className={`text-xs ${(analytics.bounce_rate ?? 0) > 5 ? 'text-red-400' : 'text-gray-500'}`}>{(analytics.bounce_rate ?? 0).toFixed(1)}%</p>
+                  </CardContent>
+                </Card>
+                <Card className="bg-gray-900 border-gray-800">
+                  <CardContent className="p-4 text-center">
+                    <UserMinus className="w-5 h-5 text-orange-400 mx-auto mb-1" />
+                    <p className="text-xs text-gray-400">Unsub</p>
+                    <p className="text-xl font-bold text-white">{(analytics.total_unsubscribed ?? 0).toLocaleString()}</p>
+                    <p className="text-xs text-gray-500">{(analytics.unsubscribe_rate ?? 0).toFixed(1)}%</p>
+                  </CardContent>
+                </Card>
+              </div>
+
+              {/* Charts Row */}
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                {/* Daily Volume Line Chart */}
+                <Card className="bg-gray-900 border-gray-800">
+                  <CardHeader>
+                    <CardTitle className="text-white text-sm">Daily Volume</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    {dailyVolume.length > 0 ? (
+                      <ResponsiveContainer width="100%" height={250}>
+                        <LineChart data={dailyVolume}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                          <XAxis dataKey="date" tick={{ fill: "#9ca3af", fontSize: 11 }} tickFormatter={(v) => v.slice(5)} />
+                          <YAxis tick={{ fill: "#9ca3af", fontSize: 11 }} />
+                          <Tooltip
+                            contentStyle={{ backgroundColor: "#1e293b", border: "1px solid #374151", borderRadius: 8 }}
+                            labelStyle={{ color: "#f8fafc" }}
+                          />
+                          <Line type="monotone" dataKey="sent" stroke="#3b82f6" strokeWidth={2} dot={false} name="Sent" />
+                          <Line type="monotone" dataKey="opened" stroke="#22c55e" strokeWidth={2} dot={false} name="Opened" />
+                          <Line type="monotone" dataKey="clicked" stroke="#f59e0b" strokeWidth={2} dot={false} name="Clicked" />
+                          <Legend />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <div className="flex items-center justify-center h-[250px] text-gray-500">No data yet</div>
+                    )}
+                  </CardContent>
+                </Card>
+
+                {/* Funnel Bar Chart */}
+                <Card className="bg-gray-900 border-gray-800">
+                  <CardHeader>
+                    <CardTitle className="text-white text-sm">Engagement Funnel</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <ResponsiveContainer width="100%" height={250}>
+                      <BarChart
+                        data={[
+                          { name: "Sent", value: analytics.total_sent ?? 0, fill: "#3b82f6" },
+                          { name: "Delivered", value: analytics.total_delivered ?? 0, fill: "#06b6d4" },
+                          { name: "Opened", value: analytics.total_opened ?? 0, fill: "#22c55e" },
+                          { name: "Clicked", value: analytics.total_clicked ?? 0, fill: "#f59e0b" },
+                          { name: "Replied", value: analytics.total_replied ?? 0, fill: "#a855f7" },
+                        ]}
+                        layout="vertical"
+                      >
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis type="number" tick={{ fill: "#9ca3af", fontSize: 11 }} />
+                        <YAxis dataKey="name" type="category" tick={{ fill: "#9ca3af", fontSize: 11 }} width={70} />
+                        <Tooltip
+                          contentStyle={{ backgroundColor: "#1e293b", border: "1px solid #374151", borderRadius: 8 }}
+                          labelStyle={{ color: "#f8fafc" }}
+                        />
+                        <Bar dataKey="value" radius={[0, 4, 4, 0]}>
+                          {[
+                            { name: "Sent", fill: "#3b82f6" },
+                            { name: "Delivered", fill: "#06b6d4" },
+                            { name: "Opened", fill: "#22c55e" },
+                            { name: "Clicked", fill: "#f59e0b" },
+                            { name: "Replied", fill: "#a855f7" },
+                          ].map((entry, index) => (
+                            <Cell key={`cell-${index}`} fill={entry.fill} />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </CardContent>
+                </Card>
+              </div>
+
+              {/* Recipient Status Pie Chart */}
+              {(() => {
+                const statusCounts = new Map<string, number>();
+                analyticsRecipients.forEach((r) => {
+                  const s = r.status || "pending";
+                  statusCounts.set(s, (statusCounts.get(s) || 0) + 1);
+                });
+                const pieData = Array.from(statusCounts.entries()).map(([name, value]) => ({
+                  name,
+                  value,
+                }));
+
+                return pieData.length > 0 ? (
+                  <Card className="bg-gray-900 border-gray-800">
+                    <CardHeader>
+                      <CardTitle className="text-white text-sm">Recipient Status Distribution</CardTitle>
+                    </CardHeader>
+                    <CardContent className="flex justify-center">
+                      <ResponsiveContainer width="100%" height={250}>
+                        <PieChart>
+                          <Pie
+                            data={pieData}
+                            cx="50%"
+                            cy="50%"
+                            outerRadius={90}
+                            dataKey="value"
+                            label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
+                          >
+                            {pieData.map((entry, index) => (
+                              <Cell
+                                key={`pie-${index}`}
+                                fill={STATUS_COLORS[entry.name] || PIE_COLORS[index % PIE_COLORS.length]}
+                              />
+                            ))}
+                          </Pie>
+                          <Tooltip
+                            contentStyle={{ backgroundColor: "#1e293b", border: "1px solid #374151", borderRadius: 8 }}
+                          />
+                          <Legend />
+                        </PieChart>
+                      </ResponsiveContainer>
+                    </CardContent>
+                  </Card>
+                ) : null;
+              })()}
+
+              {/* Recipient Table */}
+              <Card className="bg-gray-900 border-gray-800 overflow-hidden">
+                <CardHeader>
+                  <CardTitle className="text-white text-sm">
+                    Recipients ({analyticsRecipientsCount})
+                  </CardTitle>
+                </CardHeader>
+                <div className="overflow-x-auto">
+                  <table className="w-full">
+                    <thead className="bg-gray-800 border-b border-gray-700">
+                      <tr>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Email</th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Status</th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Sent</th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Opened</th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Clicked</th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Replied</th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Bounce</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {analyticsRecipients.length > 0 ? (
+                        analyticsRecipients.map((r) => {
+                          const statusBadgeColor =
+                            r.status === "replied" ? "bg-purple-900 text-purple-200" :
+                            r.status === "opened" || r.status === "sent" ? "bg-blue-900 text-blue-200" :
+                            r.status === "clicked" ? "bg-yellow-900 text-yellow-200" :
+                            r.status === "bounced" ? "bg-red-900 text-red-200" :
+                            r.status === "unsubscribed" ? "bg-orange-900 text-orange-200" :
+                            "bg-gray-700 text-gray-200";
+                          return (
+                            <tr key={r.id} className="border-b border-gray-700 hover:bg-gray-800/50">
+                              <td className="px-4 py-3 text-sm text-gray-300">{r.email}</td>
+                              <td className="px-4 py-3 text-sm">
+                                <Badge className={statusBadgeColor}>{r.status}</Badge>
+                              </td>
+                              <td className="px-4 py-3 text-sm text-gray-400">
+                                {r.sent_at ? new Date(r.sent_at).toLocaleDateString() : "—"}
+                              </td>
+                              <td className="px-4 py-3 text-sm text-gray-400">
+                                {r.opened_at ? new Date(r.opened_at).toLocaleDateString() : "—"}
+                              </td>
+                              <td className="px-4 py-3 text-sm text-gray-400">
+                                {r.clicked_at ? new Date(r.clicked_at).toLocaleDateString() : "—"}
+                              </td>
+                              <td className="px-4 py-3 text-sm text-gray-400">
+                                {r.replied_at ? new Date(r.replied_at).toLocaleDateString() : "—"}
+                              </td>
+                              <td className="px-4 py-3 text-sm text-gray-400">
+                                {r.bounced_at ? (
+                                  <span className="text-red-400">
+                                    {r.bounce_type || "bounced"} — {new Date(r.bounced_at).toLocaleDateString()}
+                                  </span>
+                                ) : "—"}
+                              </td>
+                            </tr>
+                          );
+                        })
+                      ) : (
+                        <tr>
+                          <td colSpan={7} className="px-4 py-8 text-center text-gray-400">
+                            No recipients yet
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </Card>
+            </>
+          ) : (
+            <Card className="bg-gray-900 border-gray-800">
+              <CardContent className="p-12 flex flex-col items-center justify-center text-center">
+                <BarChart3 className="w-16 h-16 text-gray-600 mb-4" />
+                <p className="text-gray-400 text-lg">No analytics data available yet</p>
+                <p className="text-gray-500 text-sm mt-2">Analytics will appear once emails are sent</p>
+              </CardContent>
+            </Card>
+          )}
         </Tabs.Content>
       </Tabs.Root>
     </div>

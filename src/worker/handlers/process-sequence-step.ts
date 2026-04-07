@@ -1,6 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { sendEmail } from "../../lib/email/smtp-manager";
 import { renderTemplate } from "../../lib/email/template-renderer";
+import { prepareEmail } from "../../lib/email/email-preparer";
 import { advanceStep } from "../../lib/email/sequence-engine";
 import { randomUUID } from "crypto";
 
@@ -143,15 +144,30 @@ export async function handleProcessSequenceStep(
   // 9. Generate tracking ID
   const trackingId = randomUUID();
 
+  // 9b. Prepare email with tracking (pixel, click rewrite, unsub link + headers)
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://cold-email-dashboard.vercel.app";
+  const prepared = prepareEmail(renderedHtml, trackingId, baseUrl);
+  const trackedHtml = prepared.html;
+  const extraHeaders: Record<string, string> = {
+    "List-Unsubscribe": prepared.listUnsubscribe,
+    "List-Unsubscribe-Post": prepared.listUnsubscribePost,
+  };
+
+  // Add threading headers on top
+  if (Object.keys(threadingHeaders).length > 0) {
+    Object.assign(extraHeaders, threadingHeaders);
+  }
+
   // 10. Send email
   try {
     const result = await sendEmail(
       account,
       recipient.email,
       finalSubject,
-      renderedHtml,
+      trackedHtml,
       renderedText,
-      trackingId
+      trackingId,
+      extraHeaders
     );
 
     // 11. Log to email_send_log table
@@ -164,7 +180,7 @@ export async function handleProcessSequenceStep(
       from_name: account.display_name,
       to_email: recipient.email,
       subject: finalSubject,
-      body_html: renderedHtml,
+      body_html: trackedHtml,
       body_text: renderedText || null,
       message_id: result.messageId,
       smtp_response: result.response,
@@ -208,7 +224,7 @@ export async function handleProcessSequenceStep(
       from_name: account.display_name,
       to_email: recipient.email,
       subject: finalSubject,
-      body_html: renderedHtml,
+      body_html: trackedHtml,
       body_text: renderedText || null,
       status: "failed",
       error_message: errorMessage,

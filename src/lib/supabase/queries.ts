@@ -437,3 +437,174 @@ export async function searchInboxMessages(orgId: string, query: string) {
   if (error) throw error;
   return data;
 }
+
+// ============================================
+// B10: Tracking + Analytics Queries
+// ============================================
+
+export async function getTrackingEvents(
+  orgId: string,
+  opts?: { campaignId?: string; eventType?: string; limit?: number }
+) {
+  const supabase = await createAdminClient();
+  let query = supabase
+    .from("tracking_events")
+    .select("*")
+    .eq("org_id", orgId)
+    .order("created_at", { ascending: false });
+
+  if (opts?.campaignId) {
+    query = query.eq("campaign_id", opts.campaignId);
+  }
+  if (opts?.eventType) {
+    query = query.eq("event_type", opts.eventType);
+  }
+
+  query = query.limit(opts?.limit || 100);
+
+  const { data, error } = await query;
+  if (error) throw error;
+  return data;
+}
+
+export async function getCampaignAnalytics(campaignId: string) {
+  const orgId = await getInternalOrgId();
+  const supabase = await createAdminClient();
+
+  // Get campaign aggregate numbers
+  const { data: campaign, error: campaignErr } = await supabase
+    .from("campaigns")
+    .select(
+      "total_sent, total_opened, total_clicked, total_replied, total_bounced, total_unsubscribed"
+    )
+    .eq("id", campaignId)
+    .eq("org_id", orgId)
+    .single();
+
+  if (campaignErr || !campaign) {
+    throw new Error("Campaign not found");
+  }
+
+  const totalSent = campaign.total_sent ?? 0;
+  const totalBounced = campaign.total_bounced ?? 0;
+  const totalDelivered = totalSent - totalBounced;
+  const totalOpened = campaign.total_opened ?? 0;
+  const totalClicked = campaign.total_clicked ?? 0;
+  const totalReplied = campaign.total_replied ?? 0;
+  const totalUnsubscribed = campaign.total_unsubscribed ?? 0;
+
+  // Rates based on delivered (or sent if no bounces)
+  const denominator = totalDelivered > 0 ? totalDelivered : totalSent || 1;
+
+  return {
+    total_sent: totalSent,
+    total_delivered: totalDelivered,
+    total_opened: totalOpened,
+    total_clicked: totalClicked,
+    total_replied: totalReplied,
+    total_bounced: totalBounced,
+    total_unsubscribed: totalUnsubscribed,
+    open_rate: (totalOpened / denominator) * 100,
+    click_rate: (totalClicked / denominator) * 100,
+    reply_rate: (totalReplied / denominator) * 100,
+    bounce_rate: totalSent > 0 ? (totalBounced / totalSent) * 100 : 0,
+    unsubscribe_rate: (totalUnsubscribed / denominator) * 100,
+  };
+}
+
+export async function getRecipientTimeline(recipientId: string) {
+  const orgId = await getInternalOrgId();
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from("tracking_events")
+    .select("*")
+    .eq("recipient_id", recipientId)
+    .eq("org_id", orgId)
+    .order("created_at", { ascending: true });
+
+  if (error) throw error;
+  return data;
+}
+
+export async function getDailySendVolume(
+  campaignId: string,
+  days: number = 30
+) {
+  const orgId = await getInternalOrgId();
+  const supabase = await createAdminClient();
+
+  const sinceDate = new Date();
+  sinceDate.setDate(sinceDate.getDate() - days);
+
+  // Get send logs grouped by date
+  const { data: sendLogs, error: sendErr } = await supabase
+    .from("email_send_log")
+    .select("sent_at")
+    .eq("campaign_id", campaignId)
+    .eq("org_id", orgId)
+    .eq("status", "sent")
+    .gte("sent_at", sinceDate.toISOString())
+    .order("sent_at", { ascending: true });
+
+  if (sendErr) throw sendErr;
+
+  // Get tracking events grouped by date
+  const { data: trackingEvents, error: trackErr } = await supabase
+    .from("tracking_events")
+    .select("event_type, created_at")
+    .eq("campaign_id", campaignId)
+    .eq("org_id", orgId)
+    .gte("created_at", sinceDate.toISOString())
+    .order("created_at", { ascending: true });
+
+  if (trackErr) throw trackErr;
+
+  // Group by date
+  const dailyMap = new Map<
+    string,
+    { sent: number; opened: number; clicked: number }
+  >();
+
+  for (const log of sendLogs || []) {
+    if (!log.sent_at) continue;
+    const day = log.sent_at.substring(0, 10);
+    const entry = dailyMap.get(day) || { sent: 0, opened: 0, clicked: 0 };
+    entry.sent++;
+    dailyMap.set(day, entry);
+  }
+
+  for (const event of trackingEvents || []) {
+    const day = event.created_at.substring(0, 10);
+    const entry = dailyMap.get(day) || { sent: 0, opened: 0, clicked: 0 };
+    if (event.event_type === "open") entry.opened++;
+    else if (event.event_type === "click") entry.clicked++;
+    dailyMap.set(day, entry);
+  }
+
+  // Convert to sorted array
+  return Array.from(dailyMap.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, counts]) => ({ date, ...counts }));
+}
+
+export async function getCampaignRecipientsForAnalytics(
+  campaignId: string,
+  page: number = 1,
+  perPage: number = 50
+) {
+  const orgId = await getInternalOrgId();
+  const supabase = await createAdminClient();
+
+  const { data, error, count } = await supabase
+    .from("campaign_recipients")
+    .select("id, email, status, sent_at, opened_at, clicked_at, replied_at, bounced_at, bounce_type", {
+      count: "exact",
+    })
+    .eq("campaign_id", campaignId)
+    .eq("org_id", orgId)
+    .order("created_at", { ascending: true })
+    .range((page - 1) * perPage, page * perPage - 1);
+
+  if (error) throw error;
+  return { data, count };
+}
