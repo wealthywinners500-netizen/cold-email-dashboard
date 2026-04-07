@@ -4,6 +4,8 @@ import { handleProcessSequenceStep } from "./handlers/process-sequence-step";
 import { handleCheckNoReply } from "./handlers/check-no-reply";
 import { handleSyncAllAccounts, handleClassifyReply, handleClassifyBatch } from "./handlers/sync-inbox";
 import { handleProcessBounce } from "./handlers/process-bounce";
+import { handleProvisionPair } from "./handlers/provision-pair";
+import { handleRollbackProvision } from "./handlers/rollback-provision";
 import { closeAll } from "../lib/email/smtp-manager";
 import { createClient } from "@supabase/supabase-js";
 import { handleWorkerError, updateWorkerHeartbeat, resetDailyCounters } from "../lib/email/error-handler";
@@ -190,6 +192,56 @@ async function main() {
       }
     }
   });
+
+  // Register provision-server-pair handler (B15-3)
+  interface ProvisionPairPayload {
+    jobId: string;
+  }
+
+  await boss.work<ProvisionPairPayload>(
+    "provision-server-pair",
+    {
+      batchSize: 1,
+      pollingIntervalSeconds: 5,
+    },
+    async (jobs) => {
+      for (const job of jobs) {
+        console.log(`[Worker] Starting provision-server-pair job ${job.id}`);
+        try {
+          await handleProvisionPair(job.data);
+          console.log(`[Worker] Provision job ${job.id} completed successfully`);
+        } catch (err) {
+          console.error(`[Worker] Provision job ${job.id} failed:`, err);
+          throw err;
+        }
+      }
+    }
+  );
+
+  // Register rollback-provision handler (B15-3)
+  interface RollbackProvisionPayload {
+    jobId: string;
+  }
+
+  await boss.work<RollbackProvisionPayload>(
+    "rollback-provision",
+    {
+      batchSize: 1,
+      pollingIntervalSeconds: 5,
+    },
+    async (jobs) => {
+      for (const job of jobs) {
+        console.log(`[Worker] Starting rollback-provision job ${job.id}`);
+        try {
+          await handleRollbackProvision(job.data);
+          console.log(`[Worker] Rollback job ${job.id} completed successfully`);
+        } catch (err) {
+          console.error(`[Worker] Rollback job ${job.id} failed:`, err);
+          throw err;
+        }
+      }
+    }
+  );
 
   console.log("[Worker] Email worker is running. Waiting for jobs...");
 
