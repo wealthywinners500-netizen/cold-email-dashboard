@@ -3,6 +3,7 @@ import { sendEmail } from "../../lib/email/smtp-manager";
 import { renderTemplate, renderSubjectLine } from "../../lib/email/template-renderer";
 import { prepareEmail } from "../../lib/email/email-preparer";
 import { randomUUID } from "crypto";
+import { handleSmtpError } from "../../lib/email/error-handler";
 
 function getSupabase() {
   return createClient(
@@ -34,8 +35,13 @@ export async function handleSendEmail(payload: SendEmailPayload): Promise<void> 
     throw new Error(`Email account not found: ${accountId}`);
   }
 
+  if (account.status === "disabled") {
+    console.log(`[SendEmail] Skipping disabled account ${account.email}`);
+    return;
+  }
+
   if (account.status !== "active") {
-    throw new Error(`Email account ${account.email} is not active`);
+    throw new Error(`Email account ${account.email} is not active (status: ${account.status})`);
   }
 
   // Check daily limit
@@ -147,6 +153,9 @@ export async function handleSendEmail(payload: SendEmailPayload): Promise<void> 
         last_error: null,
       })
       .eq("id", accountId);
+
+    // Log SMTP success
+    await handleSmtpError(null, accountId, orgId);
   } catch (sendErr) {
     // 8b. Failure: log error
     const errorMessage = sendErr instanceof Error ? sendErr.message : "Unknown send error";
@@ -172,6 +181,9 @@ export async function handleSendEmail(payload: SendEmailPayload): Promise<void> 
       .from("email_accounts")
       .update({ last_error: errorMessage })
       .eq("id", accountId);
+
+    // Log SMTP error
+    await handleSmtpError(sendErr instanceof Error ? sendErr : new Error(String(sendErr)), accountId, orgId);
 
     throw sendErr; // Re-throw for pg-boss retry
   }

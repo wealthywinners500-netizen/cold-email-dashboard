@@ -1,7 +1,7 @@
 export const dynamic = 'force-dynamic';
 
 import { auth } from "@clerk/nextjs/server";
-import { getDashboardOverview, getTableCounts } from "@/lib/supabase/queries";
+import { getDashboardOverview, getTableCounts, getDashboardMetrics } from "@/lib/supabase/queries";
 import OverviewClient from "./overview-client";
 import OnboardingWizard from "@/components/onboarding/onboarding-wizard";
 
@@ -22,8 +22,11 @@ export default async function DashboardOverview() {
 
     // If has data, show dashboard
     if (hasData) {
-      const data = await getDashboardOverview();
-      return <OverviewClient data={data} />;
+      const [data, metrics] = await Promise.all([
+        getDashboardOverview(),
+        getDashboardMetrics(counts._orgId).catch(() => null),
+      ]);
+      return <OverviewClient data={data} metrics={metrics} />;
     }
 
     // No data, show onboarding wizard

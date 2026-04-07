@@ -4,6 +4,7 @@ import { getOrganization, getTableCounts, getServerPairs, getCampaigns } from "@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Shield, Database, Activity, Server } from "lucide-react";
+import AdminTabs from "./admin-tabs";
 
 export default async function AdminPage() {
   const [organization, tableCounts, serverPairs, campaigns] = await Promise.all([
@@ -19,16 +20,8 @@ export default async function AdminPage() {
   // Count active campaigns
   const activeCampaigns = campaigns.filter((c: any) => c.status === "active").length;
 
-  return (
+  const overviewContent = (
     <div className="space-y-8">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold text-white">Admin Dashboard</h1>
-          <p className="text-gray-400 mt-2">System overview and configuration</p>
-        </div>
-        <Badge className="bg-blue-600">Admin</Badge>
-      </div>
-
       {/* Organization Details */}
       <Card className="bg-gray-900 border-gray-800">
         <CardHeader>
@@ -126,7 +119,7 @@ export default async function AdminPage() {
         <CardHeader>
           <CardTitle className="text-white flex items-center gap-2">
             <Activity className="w-5 h-5 text-green-400" />
-            System Health
+            Connection Status
           </CardTitle>
         </CardHeader>
         <CardContent>
@@ -205,6 +198,20 @@ export default async function AdminPage() {
           </p>
         </CardContent>
       </Card>
+    </div>
+  );
+
+  return (
+    <div className="space-y-8">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-3xl font-bold text-white">Admin Dashboard</h1>
+          <p className="text-gray-400 mt-2">System overview and configuration</p>
+        </div>
+        <Badge className="bg-blue-600">Admin</Badge>
+      </div>
+
+      <AdminTabs overviewContent={overviewContent} />
     </div>
   );
 }

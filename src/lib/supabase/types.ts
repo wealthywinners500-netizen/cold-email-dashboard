@@ -1296,3 +1296,53 @@ export interface VerificationResult {
   invalid: number;
   risky: number;
 }
+
+export interface SystemAlert {
+  id: string;
+  org_id: string;
+  alert_type: 'smtp_auth_failure' | 'imap_error' | 'high_bounce_rate' | 'worker_down' | 'queue_backup';
+  severity: 'info' | 'warning' | 'critical';
+  title: string;
+  details: Record<string, any>;
+  account_id: string | null;
+  acknowledged: boolean;
+  acknowledged_at: string | null;
+  created_at: string;
+}
+
+export interface SystemHealth {
+  worker: {
+    last_heartbeat: string | null;
+    jobs_today: number;
+    errors_today: number;
+    is_healthy: boolean;
+  };
+  email_accounts: {
+    total: number;
+    syncing: number;
+    errored: number;
+    disabled: number;
+  };
+  delivery: {
+    sent_today: number;
+    bounced_today: number;
+    bounce_rate: number;
+    suppressed_total: number;
+  };
+  queue: {
+    pending: number;
+    failed: number;
+  };
+  alerts: {
+    unacknowledged: number;
+    recent: SystemAlert[];
+  };
+  overall: 'green' | 'yellow' | 'red';
+}
+
+export interface DashboardMetrics {
+  active_campaigns: { count: number; total_recipients: number; percent_sent: number };
+  inbox: { unread: number; today_replies: number; classification_breakdown: Record<string, number> };
+  leads: { total_contacts: number; verified_percent: number; top_cities: { city: string; count: number }[] };
+  health: 'green' | 'yellow' | 'red';
+}
