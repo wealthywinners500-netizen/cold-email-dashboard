@@ -85,8 +85,9 @@ export interface ProvisioningJobRow {
   status: ProvisioningStatus;
   ns_domain: string;
   sending_domains: string[];
-  mail_account_pattern: string[];
-  admin_email: string;
+  mail_accounts_per_domain: number;
+  mail_account_style: 'random_names' | 'custom';
+  admin_email: string | null;
   server1_ip: string | null;
   server2_ip: string | null;
   server1_provider_id: string | null;

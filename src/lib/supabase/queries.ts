@@ -1266,3 +1266,95 @@ export async function getSSHCredentials(orgId: string, serverIp?: string) {
   if (error) throw error;
   return data;
 }
+
+// --- Provisioning Steps ---
+
+export async function getProvisioningSteps(jobId: string) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('provisioning_steps')
+    .select('*')
+    .eq('job_id', jobId)
+    .order('step_order', { ascending: true });
+
+  if (error) throw error;
+  return data;
+}
+
+export async function createProvisioningStep(step: {
+  job_id: string;
+  step_type: string;
+  step_order: number;
+  status?: string;
+  metadata?: Record<string, unknown>;
+}) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('provisioning_steps')
+    .insert(step)
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+export async function updateProvisioningStep(stepId: string, updates: {
+  status?: string;
+  started_at?: string;
+  completed_at?: string;
+  duration_ms?: number;
+  output?: string;
+  error_message?: string;
+  metadata?: Record<string, unknown>;
+}) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('provisioning_steps')
+    .update(updates)
+    .eq('id', stepId)
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+// --- SSH Credentials CRUD ---
+
+export async function createSSHCredentials(orgId: string, creds: {
+  server_ip: string;
+  hostname?: string;
+  username?: string;
+  password_encrypted?: string;
+  private_key_encrypted?: string;
+  port?: number;
+  provisioning_job_id?: string;
+}) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('ssh_credentials')
+    .insert({ ...creds, org_id: orgId })
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+export async function updateSSHCredentials(credId: string, updates: {
+  hostname?: string;
+  password_encrypted?: string;
+  private_key_encrypted?: string;
+}) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('ssh_credentials')
+    .update(updates)
+    .eq('id', credId)
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
