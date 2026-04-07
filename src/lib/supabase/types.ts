@@ -300,6 +300,112 @@ export type Database = {
           created_at?: string;
         };
       };
+      campaign_sequences: {
+        Row: {
+          id: string;
+          org_id: string;
+          campaign_id: string;
+          name: string;
+          sequence_type: string;
+          sort_order: number;
+          trigger_event: string | null;
+          trigger_condition: Record<string, unknown> | null;
+          trigger_priority: number;
+          persona: string | null;
+          steps: Record<string, unknown>[];
+          status: string;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          org_id: string;
+          campaign_id: string;
+          name: string;
+          sequence_type?: string;
+          sort_order?: number;
+          trigger_event?: string | null;
+          trigger_condition?: Record<string, unknown> | null;
+          trigger_priority?: number;
+          persona?: string | null;
+          steps?: Record<string, unknown>[];
+          status?: string;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: {
+          id?: string;
+          org_id?: string;
+          campaign_id?: string;
+          name?: string;
+          sequence_type?: string;
+          sort_order?: number;
+          trigger_event?: string | null;
+          trigger_condition?: Record<string, unknown> | null;
+          trigger_priority?: number;
+          persona?: string | null;
+          steps?: Record<string, unknown>[];
+          status?: string;
+          created_at?: string;
+          updated_at?: string;
+        };
+      };
+      lead_sequence_state: {
+        Row: {
+          id: string;
+          org_id: string;
+          recipient_id: string;
+          campaign_id: string;
+          sequence_id: string;
+          current_step: number;
+          total_steps: number;
+          status: string;
+          next_send_at: string | null;
+          last_sent_at: string | null;
+          assigned_variant: string | null;
+          assigned_account_id: string | null;
+          last_message_id: string | null;
+          history: Record<string, unknown>[];
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          org_id: string;
+          recipient_id: string;
+          campaign_id: string;
+          sequence_id: string;
+          current_step?: number;
+          total_steps: number;
+          status?: string;
+          next_send_at?: string | null;
+          last_sent_at?: string | null;
+          assigned_variant?: string | null;
+          assigned_account_id?: string | null;
+          last_message_id?: string | null;
+          history?: Record<string, unknown>[];
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: {
+          id?: string;
+          org_id?: string;
+          recipient_id?: string;
+          campaign_id?: string;
+          sequence_id?: string;
+          current_step?: number;
+          total_steps?: number;
+          status?: string;
+          next_send_at?: string | null;
+          last_sent_at?: string | null;
+          assigned_variant?: string | null;
+          assigned_account_id?: string | null;
+          last_message_id?: string | null;
+          history?: Record<string, unknown>[];
+          created_at?: string;
+          updated_at?: string;
+        };
+      };
       email_accounts: {
         Row: {
           id: string;
@@ -605,4 +711,70 @@ export interface CampaignStats {
   clicked: number;
   replied: number;
   bounced: number;
+}
+
+// B8: Sequences + Subsequences
+
+export interface ABVariant {
+  variant: string; // "A", "B", "C", "D"
+  subject: string;
+  body_html: string;
+  body_text: string;
+}
+
+export interface SequenceStep {
+  step_number: number;
+  delay_days: number;
+  delay_hours: number;
+  subject: string;
+  body_html: string;
+  body_text: string;
+  send_in_same_thread: boolean;
+  ab_variants: ABVariant[];
+}
+
+export interface CampaignSequence {
+  id: string;
+  org_id: string;
+  campaign_id: string;
+  name: string;
+  sequence_type: string; // 'primary' | 'subsequence'
+  sort_order: number;
+  trigger_event: string | null;
+  trigger_condition: Record<string, unknown> | null;
+  trigger_priority: number;
+  persona: string | null;
+  steps: SequenceStep[];
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface LeadSequenceHistoryEvent {
+  event: string; // 'sent' | 'replied' | 'moved' | 'bounced' | 'opted_out'
+  step?: number;
+  at: string;
+  message_id?: string;
+  classification?: string;
+  from_sequence?: string;
+  to_sequence?: string;
+}
+
+export interface LeadSequenceState {
+  id: string;
+  org_id: string;
+  recipient_id: string;
+  campaign_id: string;
+  sequence_id: string;
+  current_step: number;
+  total_steps: number;
+  status: string; // 'active' | 'paused' | 'completed' | 'replied' | 'bounced' | 'opted_out' | 'moved_to_subsequence'
+  next_send_at: string | null;
+  last_sent_at: string | null;
+  assigned_variant: string | null;
+  assigned_account_id: string | null;
+  last_message_id: string | null;
+  history: LeadSequenceHistoryEvent[];
+  created_at: string;
+  updated_at: string;
 }

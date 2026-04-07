@@ -1,5 +1,7 @@
 import { initBoss, stopBoss } from "../lib/email/campaign-queue";
 import { handleSendEmail } from "./handlers/send-email";
+import { handleProcessSequenceStep } from "./handlers/process-sequence-step";
+import { handleCheckNoReply } from "./handlers/check-no-reply";
 import { closeAll } from "../lib/email/smtp-manager";
 import { createClient } from "@supabase/supabase-js";
 
@@ -38,6 +40,31 @@ async function main() {
     }
   });
 
+  // Register process-sequence-step handler
+  interface ProcessSequenceStepPayload {
+    stateId: string;
+    recipientId: string;
+    sequenceId: string;
+    stepNumber: number;
+    campaignId: string;
+    orgId: string;
+  }
+
+  await boss.work<ProcessSequenceStepPayload>("process-sequence-step", async (jobs) => {
+    for (const job of jobs) {
+      console.log(
+        `[Worker] Processing sequence job ${job.id} for state ${job.data.stateId}`
+      );
+      try {
+        await handleProcessSequenceStep(job.data);
+        console.log(`[Worker] Sequence job ${job.id} completed successfully`);
+      } catch (err) {
+        console.error(`[Worker] Sequence job ${job.id} failed:`, err);
+        throw err;
+      }
+    }
+  });
+
   // Register daily cron to reset sends_today
   await boss.schedule("reset-daily-counts", "0 0 * * *");
   await boss.work("reset-daily-counts", async () => {
@@ -53,6 +80,18 @@ async function main() {
       throw error;
     }
     console.log("[Worker] Daily send counts reset successfully");
+  });
+
+  // Register check-no-reply cron (every hour)
+  await boss.schedule("check-no-reply", "0 * * * *");
+  await boss.work("check-no-reply", async () => {
+    console.log("[Worker] Running no-reply trigger check...");
+    try {
+      await handleCheckNoReply();
+    } catch (err) {
+      console.error("[Worker] No-reply trigger check failed:", err);
+      throw err;
+    }
   });
 
   console.log("[Worker] Email worker is running. Waiting for jobs...");

@@ -268,3 +268,76 @@ export async function getCampaignStats(campaignId: string) {
 
   return stats;
 }
+
+export async function getSequences(campaignId: string) {
+  const orgId = await getInternalOrgId();
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from("campaign_sequences")
+    .select("*")
+    .eq("campaign_id", campaignId)
+    .eq("org_id", orgId)
+    .order("sort_order", { ascending: true });
+
+  if (error) throw error;
+  return data;
+}
+
+export async function getSequence(sequenceId: string) {
+  const orgId = await getInternalOrgId();
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from("campaign_sequences")
+    .select("*")
+    .eq("id", sequenceId)
+    .eq("org_id", orgId)
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+export async function getLeadSequenceStates(
+  campaignId: string,
+  opts?: { status?: string; page?: number; limit?: number }
+) {
+  const orgId = await getInternalOrgId();
+  const supabase = await createAdminClient();
+
+  const page = opts?.page || 1;
+  const limit = opts?.limit || 50;
+
+  let query = supabase
+    .from("lead_sequence_state")
+    .select("*", { count: "exact" })
+    .eq("campaign_id", campaignId)
+    .eq("org_id", orgId);
+
+  if (opts?.status) {
+    query = query.eq("status", opts.status);
+  }
+
+  const { data, error, count } = await query
+    .order("created_at", { ascending: true })
+    .range((page - 1) * limit, page * limit - 1);
+
+  if (error) throw error;
+  return { data, count };
+}
+
+export async function getLeadSequenceState(
+  recipientId: string,
+  campaignId: string
+) {
+  const orgId = await getInternalOrgId();
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from("lead_sequence_state")
+    .select("*")
+    .eq("recipient_id", recipientId)
+    .eq("campaign_id", campaignId)
+    .eq("org_id", orgId);
+
+  if (error) throw error;
+  return data;
+}
