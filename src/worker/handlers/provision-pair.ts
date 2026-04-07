@@ -190,6 +190,26 @@ export async function handleProvisionPair(
             }
           }
 
+          // Insert sending domains
+          const sendingDomainRows = provJob.sending_domains.map(
+            (domain: string) => ({
+              org_id: provJob.org_id,
+              domain,
+              server_pair_id: serverPair.id,
+              spf_status: 'valid',
+              dkim_status: 'valid',
+              dmarc_status: 'valid',
+              blacklist_status: 'clean',
+            })
+          );
+
+          if (sendingDomainRows.length > 0) {
+            await supabase.from('sending_domains').insert(sendingDomainRows);
+            console.log(
+              `[Provision] Inserted ${sendingDomainRows.length} sending domains`
+            );
+          }
+
           // Store SSH credentials
           const password = (ctx.serverPassword as string) || 'changeme123';
           await createSSHCredentials(provJob.org_id, {

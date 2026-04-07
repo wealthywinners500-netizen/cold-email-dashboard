@@ -6,6 +6,7 @@ import { handleSyncAllAccounts, handleClassifyReply, handleClassifyBatch } from 
 import { handleProcessBounce } from "./handlers/process-bounce";
 import { handleProvisionPair } from "./handlers/provision-pair";
 import { handleRollbackProvision } from "./handlers/rollback-provision";
+import { handleHealthCheck } from "./handlers/health-check";
 import { closeAll } from "../lib/email/smtp-manager";
 import { createClient } from "@supabase/supabase-js";
 import { handleWorkerError, updateWorkerHeartbeat, resetDailyCounters } from "../lib/email/error-handler";
@@ -237,6 +238,54 @@ async function main() {
           console.log(`[Worker] Rollback job ${job.id} completed successfully`);
         } catch (err) {
           console.error(`[Worker] Rollback job ${job.id} failed:`, err);
+          throw err;
+        }
+      }
+    }
+  );
+
+  // Register server-health-check cron (every 6 hours)
+  await boss.schedule("server-health-check-cron", "0 */6 * * *");
+  await boss.work("server-health-check-cron", async () => {
+    console.log("[Worker] Running scheduled server health checks...");
+    try {
+      const supabase = getSupabase();
+      const { data: pairs } = await supabase
+        .from("server_pairs")
+        .select("id")
+        .eq("status", "active");
+
+      if (pairs && pairs.length > 0) {
+        for (const pair of pairs) {
+          await boss.send("server-health-check", { serverPairId: pair.id });
+        }
+        console.log(`[Worker] Queued health checks for ${pairs.length} active server pairs`);
+      }
+    } catch (err) {
+      console.error("[Worker] Health check cron failed:", err);
+      throw err;
+    }
+  });
+
+  // Register server-health-check handler
+  interface HealthCheckPayload {
+    serverPairId: string;
+  }
+
+  await boss.work<HealthCheckPayload>(
+    "server-health-check",
+    {
+      batchSize: 1,
+      pollingIntervalSeconds: 10,
+    },
+    async (jobs) => {
+      for (const job of jobs) {
+        console.log(`[Worker] Starting health check for pair ${job.data.serverPairId}`);
+        try {
+          await handleHealthCheck(job.data);
+          console.log(`[Worker] Health check job ${job.id} completed successfully`);
+        } catch (err) {
+          console.error(`[Worker] Health check job ${job.id} failed:`, err);
           throw err;
         }
       }
