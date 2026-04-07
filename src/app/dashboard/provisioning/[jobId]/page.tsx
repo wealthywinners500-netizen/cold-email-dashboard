@@ -1,0 +1,506 @@
+"use client";
+
+export const dynamic = "force-dynamic";
+
+import { useEffect, useState, useRef, useCallback } from "react";
+import { useParams, useRouter } from "next/navigation";
+import { Card, CardContent } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
+import {
+  ArrowLeft,
+  Loader2,
+  XCircle,
+  CheckCircle2,
+  Download,
+  Server,
+  RotateCcw,
+  ExternalLink,
+  AlertTriangle,
+} from "lucide-react";
+import { StepTimeline } from "@/components/provisioning/step-timeline";
+import { SSHLogViewer } from "@/components/provisioning/ssh-log-viewer";
+import type { ProvisioningJobRow, StepType, StepStatus } from "@/lib/provisioning/types";
+
+interface StepData {
+  step_type: StepType;
+  status: StepStatus;
+  duration_ms?: number | null;
+  output?: string | null;
+  error_message?: string | null;
+}
+
+interface LogLine {
+  timestamp?: string;
+  text: string;
+  type: "stdout" | "stderr" | "progress";
+}
+
+const STEP_NAMES: Record<StepType, string> = {
+  create_vps: "Create VPS Pair",
+  set_ptr: "Set PTR Records",
+  configure_registrar: "Configure DNS Registrar",
+  install_hestiacp: "Install HestiaCP",
+  setup_dns_zones: "Setup DNS Zones",
+  setup_mail_domains: "Setup Mail Domains",
+  security_hardening: "Security Hardening",
+  verification_gate: "Verification Gate",
+};
+
+function estimateTimeRemaining(progressPct: number, startedAt: string | null): string {
+  if (!startedAt || progressPct <= 0) return "Calculating...";
+  const elapsed = Date.now() - new Date(startedAt).getTime();
+  if (progressPct >= 100) return "Done";
+  const estimated = (elapsed / progressPct) * (100 - progressPct);
+  const minutes = Math.ceil(estimated / 60_000);
+  if (minutes <= 1) return "Less than a minute";
+  return `~${minutes} minutes remaining`;
+}
+
+export default function JobDetailPage() {
+  const params = useParams();
+  const router = useRouter();
+  const jobId = params.jobId as string;
+
+  const [job, setJob] = useState<ProvisioningJobRow | null>(null);
+  const [steps, setSteps] = useState<StepData[]>([]);
+  const [logLines, setLogLines] = useState<LogLine[]>([]);
+  const [selectedStep, setSelectedStep] = useState<StepType | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const [sseConnected, setSseConnected] = useState(false);
+
+  const eventSourceRef = useRef<EventSource | null>(null);
+  const retryCountRef = useRef(0);
+  const maxRetries = 5;
+
+  // Fetch initial job data
+  useEffect(() => {
+    async function fetchJob() {
+      try {
+        const res = await fetch(`/api/provisioning/${jobId}`);
+        if (!res.ok) {
+          setError("Job not found");
+          return;
+        }
+        const data = await res.json();
+        setJob(data.job);
+        setSteps(data.steps);
+      } catch {
+        setError("Failed to load job");
+      } finally {
+        setLoading(false);
+      }
+    }
+    fetchJob();
+  }, [jobId]);
+
+  // SSE connection
+  const connectSSE = useCallback(() => {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+    }
+
+    const es = new EventSource(`/api/provisioning/${jobId}/progress`);
+    eventSourceRef.current = es;
+
+    es.onopen = () => {
+      setSseConnected(true);
+      retryCountRef.current = 0;
+    };
+
+    es.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+
+        switch (data.type) {
+          case "init":
+            setJob((prev) => prev ? { ...prev, ...data.job } : prev);
+            if (data.steps) {
+              setSteps(data.steps);
+            }
+            break;
+
+          case "progress":
+            setJob((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    progress_pct: data.pct,
+                    current_step: data.step,
+                    status: "in_progress",
+                  }
+                : prev
+            );
+            if (data.message) {
+              setLogLines((prev) => [
+                ...prev,
+                {
+                  timestamp: new Date().toLocaleTimeString(),
+                  text: data.message,
+                  type: "progress",
+                },
+              ]);
+            }
+            break;
+
+          case "step_complete":
+            setSteps((prev) =>
+              prev.map((s) =>
+                s.step_type === data.step
+                  ? { ...s, status: "completed" as StepStatus, duration_ms: data.duration_ms }
+                  : s
+              )
+            );
+            setLogLines((prev) => [
+              ...prev,
+              {
+                timestamp: new Date().toLocaleTimeString(),
+                text: `✓ ${STEP_NAMES[data.step as StepType] || data.step} completed (${data.duration_ms}ms)`,
+                type: "stdout",
+              },
+            ]);
+            break;
+
+          case "complete":
+            setJob((prev) =>
+              prev
+                ? { ...prev, status: "completed", progress_pct: 100, server_pair_id: data.server_pair_id }
+                : prev
+            );
+            setLogLines((prev) => [
+              ...prev,
+              {
+                timestamp: new Date().toLocaleTimeString(),
+                text: "🎉 Provisioning complete! Server pair is ready.",
+                type: "stdout",
+              },
+            ]);
+            es.close();
+            break;
+
+          case "error":
+            setJob((prev) =>
+              prev ? { ...prev, status: "failed", error_message: data.message } : prev
+            );
+            if (data.step) {
+              setSteps((prev) =>
+                prev.map((s) =>
+                  s.step_type === data.step
+                    ? { ...s, status: "failed" as StepStatus, error_message: data.message }
+                    : s
+                )
+              );
+            }
+            setLogLines((prev) => [
+              ...prev,
+              {
+                timestamp: new Date().toLocaleTimeString(),
+                text: `ERROR: ${data.message}`,
+                type: "stderr",
+              },
+            ]);
+            es.close();
+            break;
+
+          case "timeout":
+            setLogLines((prev) => [
+              ...prev,
+              {
+                timestamp: new Date().toLocaleTimeString(),
+                text: `TIMEOUT: ${data.message}`,
+                type: "stderr",
+              },
+            ]);
+            es.close();
+            break;
+        }
+      } catch {
+        // Parse error — skip
+      }
+    };
+
+    es.onerror = () => {
+      setSseConnected(false);
+      es.close();
+
+      // Auto-reconnect with exponential backoff
+      if (retryCountRef.current < maxRetries) {
+        const delay = Math.pow(2, retryCountRef.current) * 1000;
+        retryCountRef.current++;
+        setTimeout(connectSSE, delay);
+      }
+    };
+  }, [jobId]);
+
+  useEffect(() => {
+    if (job && (job.status === "pending" || job.status === "in_progress")) {
+      connectSSE();
+    }
+
+    return () => {
+      eventSourceRef.current?.close();
+    };
+  }, [job?.status, connectSSE]);
+
+  const handleCancel = async () => {
+    if (!confirm("Cancel this provisioning job? Any created resources will be rolled back.")) return;
+    setCancelling(true);
+    try {
+      const res = await fetch(`/api/provisioning/${jobId}`, { method: "DELETE" });
+      if (res.ok) {
+        setJob((prev) => (prev ? { ...prev, status: "cancelled" } : prev));
+        eventSourceRef.current?.close();
+      }
+    } catch {
+      // silently fail
+    } finally {
+      setCancelling(false);
+    }
+  };
+
+  const handleRetry = async () => {
+    // Re-enqueue by posting a new job with same params
+    // For now, redirect to the wizard
+    router.push("/dashboard/provisioning/new");
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-20">
+        <Loader2 className="w-8 h-8 text-blue-400 animate-spin" />
+      </div>
+    );
+  }
+
+  if (error || !job) {
+    return (
+      <div className="text-center py-20">
+        <XCircle className="w-12 h-12 text-red-400 mx-auto mb-4" />
+        <h2 className="text-xl text-white font-medium mb-2">{error || "Job not found"}</h2>
+        <button
+          onClick={() => router.push("/dashboard/provisioning")}
+          className="text-blue-400 hover:text-blue-300 text-sm"
+        >
+          ← Back to Provisioning
+        </button>
+      </div>
+    );
+  }
+
+  const isTerminal = ["completed", "failed", "rolled_back", "cancelled"].includes(job.status);
+  const isActive = job.status === "pending" || job.status === "in_progress";
+
+  return (
+    <div className="max-w-4xl mx-auto space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-4">
+          <button
+            onClick={() => router.push("/dashboard/provisioning")}
+            className="text-gray-400 hover:text-white"
+          >
+            <ArrowLeft className="w-5 h-5" />
+          </button>
+          <div>
+            <h1 className="text-2xl font-bold text-white">{job.ns_domain}</h1>
+            <div className="flex items-center gap-3 mt-1">
+              <span className="text-gray-400 text-sm">
+                {job.sending_domains?.length || 0} sending domains
+              </span>
+              {sseConnected && isActive && (
+                <span className="flex items-center gap-1 text-green-400 text-xs">
+                  <span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse" />
+                  Live
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Status badge */}
+        {job.status === "completed" && (
+          <Badge className="bg-green-900/60 text-green-300 text-sm px-3 py-1">
+            <CheckCircle2 className="w-4 h-4 mr-1" /> Completed
+          </Badge>
+        )}
+        {job.status === "failed" && (
+          <Badge className="bg-red-900/60 text-red-300 text-sm px-3 py-1">
+            <XCircle className="w-4 h-4 mr-1" /> Failed
+          </Badge>
+        )}
+        {job.status === "cancelled" && (
+          <Badge className="bg-gray-700 text-gray-400 text-sm px-3 py-1">Cancelled</Badge>
+        )}
+        {job.status === "rolled_back" && (
+          <Badge className="bg-orange-900/60 text-orange-300 text-sm px-3 py-1">Rolled Back</Badge>
+        )}
+      </div>
+
+      {/* Overall progress */}
+      <Card className="bg-gray-900 border-gray-800">
+        <CardContent className="p-5">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-3">
+              <span className="text-white font-medium">Overall Progress</span>
+              {isActive && (
+                <span className="text-gray-500 text-xs">
+                  {estimateTimeRemaining(job.progress_pct, job.started_at)}
+                </span>
+              )}
+            </div>
+            <span className="text-white font-bold text-lg">{job.progress_pct}%</span>
+          </div>
+          <Progress value={job.progress_pct} className="h-3 bg-gray-800" />
+          {job.current_step && isActive && (
+            <p className="text-gray-400 text-xs mt-2">
+              Current: {STEP_NAMES[job.current_step] || job.current_step}
+            </p>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Step Timeline */}
+      <Card className="bg-gray-900 border-gray-800">
+        <CardContent className="p-5">
+          <h3 className="text-white font-medium mb-4">Deployment Steps</h3>
+          <StepTimeline
+            steps={steps}
+            onStepSelect={setSelectedStep}
+            selectedStep={selectedStep}
+          />
+        </CardContent>
+      </Card>
+
+      {/* SSH Output Viewer */}
+      <div className="relative">
+        <SSHLogViewer lines={logLines} className="min-h-[250px]" />
+      </div>
+
+      {/* Error message */}
+      {job.error_message && (
+        <Card className="bg-red-900/10 border-red-900/50">
+          <CardContent className="p-4 flex items-start gap-3">
+            <XCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
+            <div>
+              <p className="text-red-300 text-sm font-medium">Error</p>
+              <p className="text-red-400 text-sm mt-1">{job.error_message}</p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Action buttons */}
+      <div className="flex items-center gap-3">
+        {isActive && (
+          <button
+            onClick={handleCancel}
+            disabled={cancelling}
+            className="flex items-center gap-2 px-4 py-2 bg-red-600/20 hover:bg-red-600/30 border border-red-600/40 text-red-300 text-sm rounded-lg transition-colors"
+          >
+            {cancelling ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <XCircle className="w-4 h-4" />
+            )}
+            Cancel & Rollback
+          </button>
+        )}
+
+        {job.status === "failed" && (
+          <button
+            onClick={handleRetry}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg transition-colors"
+          >
+            <RotateCcw className="w-4 h-4" />
+            Retry
+          </button>
+        )}
+      </div>
+
+      {/* Completion state */}
+      {job.status === "completed" && (
+        <Card className="bg-green-900/10 border-green-900/50">
+          <CardContent className="p-6 space-y-4">
+            <div className="flex items-center gap-3">
+              <CheckCircle2 className="w-8 h-8 text-green-400" />
+              <div>
+                <h3 className="text-white font-medium text-lg">Deployment Complete!</h3>
+                <p className="text-gray-400 text-sm">
+                  Your server pair is ready and verified.
+                </p>
+              </div>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-3 text-sm">
+              <div className="bg-gray-800/50 rounded-lg p-3 text-center">
+                <Server className="w-5 h-5 text-blue-400 mx-auto mb-1" />
+                <span className="text-white font-medium block">2 Servers</span>
+                <span className="text-gray-500 text-xs">
+                  {job.server1_ip && job.server2_ip
+                    ? `${job.server1_ip} / ${job.server2_ip}`
+                    : "IPs assigned"}
+                </span>
+              </div>
+              <div className="bg-gray-800/50 rounded-lg p-3 text-center">
+                <span className="text-2xl block mb-1">🌐</span>
+                <span className="text-white font-medium block">{job.sending_domains?.length || 0} Domains</span>
+                <span className="text-gray-500 text-xs">Configured</span>
+              </div>
+              <div className="bg-gray-800/50 rounded-lg p-3 text-center">
+                <span className="text-2xl block mb-1">📧</span>
+                <span className="text-white font-medium block">
+                  {(job.sending_domains?.length || 0) * job.mail_accounts_per_domain} Accounts
+                </span>
+                <span className="text-gray-500 text-xs">Created</span>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap gap-3">
+              {job.server_pair_id && (
+                <button
+                  onClick={() => router.push("/dashboard/servers")}
+                  className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg transition-colors"
+                >
+                  <ExternalLink className="w-4 h-4" />
+                  View Server Pair
+                </button>
+              )}
+              <button
+                onClick={() => {
+                  // Generate CSV for Snov.io import
+                  const csvRows = ["Email,First Name,Last Name"];
+                  for (const domain of job.sending_domains || []) {
+                    for (let i = 0; i < job.mail_accounts_per_domain; i++) {
+                      csvRows.push(`account${i + 1}@${domain},Account,${i + 1}`);
+                    }
+                  }
+                  const blob = new Blob([csvRows.join("\n")], { type: "text/csv" });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement("a");
+                  a.href = url;
+                  a.download = `snovio-import-${job.ns_domain}.csv`;
+                  a.click();
+                  URL.revokeObjectURL(url);
+                }}
+                className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded-lg transition-colors"
+              >
+                <Download className="w-4 h-4" />
+                Download Snov.io CSV
+              </button>
+            </div>
+
+            {/* Port 25 reminder */}
+            {job.config && typeof job.config === "object" && (
+              <div className="flex items-center gap-2 text-yellow-400 text-xs bg-yellow-900/10 rounded-lg p-3">
+                <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                Remember to unblock port 25 on your VPS provider if required.
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
+}
