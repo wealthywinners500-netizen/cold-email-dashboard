@@ -46,8 +46,8 @@ export async function GET(request: NextRequest) {
   }
 
   // Rate limit: 100 requests per IP per minute
-  const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
-  if (!rateLimit(`track:open:${ip}`, 100)) {
+  const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null;
+  if (!rateLimit(`track:open:${ip ?? "unknown"}`, 100)) {
     return pixelResponse();
   }
 
@@ -65,7 +65,6 @@ export async function GET(request: NextRequest) {
       return pixelResponse();
     }
 
-    const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null;
     const userAgent = request.headers.get("user-agent") || null;
 
     // Insert tracking event

@@ -17,6 +17,14 @@ async function getInternalOrgId(): Promise<string | null> {
 
 export async function GET() {
   try {
+    const { orgRole } = await auth();
+    if (orgRole !== 'org:admin') {
+      return NextResponse.json(
+        { error: "Admin access required" },
+        { status: 403, headers: { "Cache-Control": "no-store" } }
+      );
+    }
+
     const orgId = await getInternalOrgId();
     if (!orgId) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });

@@ -107,19 +107,11 @@ export async function handleProcessBounce(payload: BouncePayload): Promise<void>
       // Call sequence engine
       await handleBounce(recipient.id);
 
-      // Increment campaigns.total_bounced
-      const { data: campaign } = await supabase
-        .from("campaigns")
-        .select("total_bounced")
-        .eq("id", recipient.campaign_id)
-        .single();
-
-      if (campaign) {
-        await supabase
-          .from("campaigns")
-          .update({ total_bounced: (campaign.total_bounced ?? 0) + 1 })
-          .eq("id", recipient.campaign_id);
-      }
+      // Atomically increment campaigns.total_bounced (no race condition)
+      await supabase.rpc('increment_campaign_counter', {
+        p_campaign_id: recipient.campaign_id,
+        p_counter_name: 'total_bounced',
+      });
     }
   } else {
     // Soft bounce: log but don't suppress
