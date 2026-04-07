@@ -341,3 +341,99 @@ export async function getLeadSequenceState(
   if (error) throw error;
   return data;
 }
+
+export async function getInboxThreads(
+  filters?: {
+    classification?: string;
+    campaign_id?: string;
+    unread?: boolean;
+    search?: string;
+    page?: number;
+    per_page?: number;
+  }
+) {
+  const orgId = await getInternalOrgId();
+  const supabase = await createAdminClient();
+  const page = filters?.page || 1;
+  const perPage = filters?.per_page || 50;
+
+  let query = supabase
+    .from("inbox_threads")
+    .select("*", { count: "exact" })
+    .eq("org_id", orgId)
+    .eq("is_archived", false)
+    .order("latest_message_date", { ascending: false });
+
+  if (filters?.classification) {
+    query = query.eq("latest_classification", filters.classification);
+  }
+  if (filters?.campaign_id) {
+    query = query.eq("campaign_id", filters.campaign_id);
+  }
+  if (filters?.unread) {
+    query = query.eq("has_unread", true);
+  }
+
+  query = query.range((page - 1) * perPage, page * perPage - 1);
+
+  const { data, error, count } = await query;
+  if (error) throw error;
+  return { data, count };
+}
+
+export async function getThreadMessages(orgId: string, threadId: number) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from("inbox_messages")
+    .select("*")
+    .eq("thread_id", threadId)
+    .eq("org_id", orgId)
+    .order("received_date", { ascending: true });
+
+  if (error) throw error;
+  return data;
+}
+
+export async function getUnreadCount(orgId: string): Promise<number> {
+  const supabase = await createAdminClient();
+  const { count, error } = await supabase
+    .from("inbox_threads")
+    .select("id", { count: "exact", head: true })
+    .eq("org_id", orgId)
+    .eq("has_unread", true)
+    .eq("is_archived", false);
+
+  if (error) throw error;
+  return count || 0;
+}
+
+export async function getSuppressionList(
+  orgId: string,
+  page: number = 1,
+  perPage: number = 50
+) {
+  const supabase = await createAdminClient();
+  const { data, error, count } = await supabase
+    .from("suppression_list")
+    .select("*", { count: "exact" })
+    .eq("org_id", orgId)
+    .order("created_at", { ascending: false })
+    .range((page - 1) * perPage, page * perPage - 1);
+
+  if (error) throw error;
+  return { data, count };
+}
+
+export async function searchInboxMessages(orgId: string, query: string) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from("inbox_messages")
+    .select("id, thread_id, subject, from_email, from_name, body_preview, received_date, classification")
+    .eq("org_id", orgId)
+    .textSearch("search_vector", query)
+    .order("received_date", { ascending: false })
+    .limit(50);
+
+  if (error) throw error;
+  return data;
+}

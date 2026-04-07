@@ -10,6 +10,7 @@
     "seed": "npx tsx src/seed/seed-dean-org.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.82.0",
     "@clerk/nextjs": "^6.12.0",
     "@clerk/themes": "^2.2.0",
     "@radix-ui/react-avatar": "^1.1.0",
@@ -25,11 +26,15 @@
     "@tremor/react": "^3.18.7",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.0",
+    "email-reply-parser": "^2.3.5",
+    "imapflow": "^1.2.18",
+    "isomorphic-dompurify": "^3.7.1",
     "lucide-react": "^0.460.0",
     "next": "15.5.14",
     "nodemailer": "^8.0.4",
     "papaparse": "^5.5.3",
     "pg-boss": "^12.15.0",
+    "postal-mime": "^2.7.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "recharts": "^2.15.0",
@@ -40,6 +45,7 @@
     "tailwindcss-animate": "^1.0.7"
   },
   "devDependencies": {
+    "@types/dompurify": "^3.0.5",
     "@types/node": "^22.0.0",
     "@types/nodemailer": "^8.0.0",
     "@types/papaparse": "^5.5.2",

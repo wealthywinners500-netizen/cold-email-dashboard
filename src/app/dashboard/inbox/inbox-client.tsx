@@ -1,0 +1,574 @@
+"use client";
+
+import { useState, useEffect, useCallback } from "react";
+import {
+  Search,
+  Star,
+  Archive,
+  Send,
+  ChevronDown,
+  Loader2,
+  Inbox as InboxIcon,
+} from "lucide-react";
+import { createClient } from "@supabase/supabase-js";
+import DOMPurify from "isomorphic-dompurify";
+
+// Lazy Supabase client for realtime only
+function getRealtimeClient() {
+  return createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  );
+}
+
+interface Thread {
+  id: number;
+  subject: string | null;
+  snippet: string | null;
+  message_count: number;
+  participants: string[];
+  has_unread: boolean;
+  is_starred: boolean;
+  latest_classification: string | null;
+  campaign_id: string | null;
+  campaign_name: string | null;
+  latest_message_date: string;
+}
+
+interface Message {
+  id: number;
+  direction: string;
+  from_email: string;
+  from_name: string | null;
+  to_emails: string[];
+  subject: string | null;
+  body_html: string | null;
+  body_text: string | null;
+  classification: string | null;
+  classification_confidence: number | null;
+  is_read: boolean;
+  received_date: string;
+  campaign_id: string | null;
+}
+
+interface Account {
+  id: string;
+  email: string;
+  display_name: string | null;
+}
+
+const CLASSIFICATION_COLORS: Record<string, string> = {
+  INTERESTED: "bg-green-500/20 text-green-400 border-green-500/30",
+  NOT_INTERESTED: "bg-gray-500/20 text-gray-400 border-gray-500/30",
+  OBJECTION: "bg-yellow-500/20 text-yellow-400 border-yellow-500/30",
+  AUTO_REPLY: "bg-blue-500/20 text-blue-400 border-blue-500/30",
+  BOUNCE: "bg-red-500/20 text-red-400 border-red-500/30",
+  STOP: "bg-red-500/20 text-red-400 border-red-500/30",
+  SPAM: "bg-gray-500/20 text-gray-400 border-gray-500/30",
+};
+
+const FILTER_TABS = [
+  { key: "all", label: "All" },
+  { key: "unread", label: "Unread" },
+  { key: "INTERESTED", label: "Interested" },
+  { key: "OBJECTION", label: "Objections" },
+  { key: "BOUNCE", label: "Bounces" },
+];
+
+function timeAgo(dateStr: string): string {
+  const now = new Date();
+  const date = new Date(dateStr);
+  const diffMs = now.getTime() - date.getTime();
+  const diffMin = Math.floor(diffMs / 60000);
+  if (diffMin < 1) return "now";
+  if (diffMin < 60) return `${diffMin}m`;
+  const diffHrs = Math.floor(diffMin / 60);
+  if (diffHrs < 24) return `${diffHrs}h`;
+  const diffDays = Math.floor(diffHrs / 24);
+  if (diffDays < 7) return `${diffDays}d`;
+  return date.toLocaleDateString();
+}
+
+function ClassificationBadge({ classification }: { classification: string | null }) {
+  if (!classification) return null;
+  const colors = CLASSIFICATION_COLORS[classification] || CLASSIFICATION_COLORS.NOT_INTERESTED;
+  return (
+    <span className={`text-xs px-2 py-0.5 rounded-full border ${colors}`}>
+      {classification.replace("_", " ")}
+    </span>
+  );
+}
+
+export default function InboxClient() {
+  const [threads, setThreads] = useState<Thread[]>([]);
+  const [selectedThread, setSelectedThread] = useState<Thread | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [messagesLoading, setMessagesLoading] = useState(false);
+  const [activeFilter, setActiveFilter] = useState("all");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [replyText, setReplyText] = useState("");
+  const [replyAccountId, setReplyAccountId] = useState("");
+  const [sending, setSending] = useState(false);
+
+  // Fetch threads
+  const fetchThreads = useCallback(async () => {
+    try {
+      const params = new URLSearchParams();
+      if (activeFilter === "unread") {
+        params.set("unread", "true");
+      } else if (activeFilter !== "all") {
+        params.set("classification", activeFilter);
+      }
+      if (searchQuery) {
+        params.set("search", searchQuery);
+      }
+
+      const res = await fetch(`/api/inbox/threads?${params.toString()}`);
+      if (res.ok) {
+        const data = await res.json();
+        setThreads(data.threads || []);
+      }
+    } catch (err) {
+      console.error("Failed to fetch threads:", err);
+    } finally {
+      setLoading(false);
+    }
+  }, [activeFilter, searchQuery]);
+
+  // Fetch accounts
+  const fetchAccounts = useCallback(async () => {
+    try {
+      const res = await fetch("/api/email-accounts");
+      if (res.ok) {
+        const data = await res.json();
+        setAccounts(Array.isArray(data) ? data : data.accounts || []);
+        if (data.length > 0 || data.accounts?.length > 0) {
+          const accts = Array.isArray(data) ? data : data.accounts;
+          setReplyAccountId(accts[0]?.id || "");
+        }
+      }
+    } catch (err) {
+      console.error("Failed to fetch accounts:", err);
+    }
+  }, []);
+
+  // Fetch messages for a thread
+  const fetchMessages = useCallback(async (threadId: number) => {
+    setMessagesLoading(true);
+    try {
+      const res = await fetch(`/api/inbox/threads/${threadId}`);
+      if (res.ok) {
+        const data = await res.json();
+        setMessages(data.messages || []);
+      }
+    } catch (err) {
+      console.error("Failed to fetch messages:", err);
+    } finally {
+      setMessagesLoading(false);
+    }
+  }, []);
+
+  // Select thread
+  const selectThread = useCallback(
+    async (thread: Thread) => {
+      setSelectedThread(thread);
+      await fetchMessages(thread.id);
+
+      // Mark as read
+      if (thread.has_unread) {
+        await fetch(`/api/inbox/threads/${thread.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ is_read: true }),
+        });
+        setThreads((prev) =>
+          prev.map((t) => (t.id === thread.id ? { ...t, has_unread: false } : t))
+        );
+      }
+    },
+    [fetchMessages]
+  );
+
+  // Send reply
+  const handleSendReply = async () => {
+    if (!selectedThread || !replyText.trim() || !replyAccountId) return;
+
+    setSending(true);
+    try {
+      const res = await fetch(
+        `/api/inbox/threads/${selectedThread.id}/reply`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            account_id: replyAccountId,
+            body_html: `<p>${replyText.replace(/\n/g, "<br/>")}</p>`,
+            body_text: replyText,
+          }),
+        }
+      );
+
+      if (res.ok) {
+        setReplyText("");
+        await fetchMessages(selectedThread.id);
+      }
+    } catch (err) {
+      console.error("Failed to send reply:", err);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  // Toggle star
+  const toggleStar = async (thread: Thread, e: React.MouseEvent) => {
+    e.stopPropagation();
+    await fetch(`/api/inbox/threads/${thread.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ is_starred: !thread.is_starred }),
+    });
+    setThreads((prev) =>
+      prev.map((t) =>
+        t.id === thread.id ? { ...t, is_starred: !t.is_starred } : t
+      )
+    );
+  };
+
+  // Archive thread
+  const archiveThread = async (thread: Thread, e: React.MouseEvent) => {
+    e.stopPropagation();
+    await fetch(`/api/inbox/threads/${thread.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ is_archived: true }),
+    });
+    setThreads((prev) => prev.filter((t) => t.id !== thread.id));
+    if (selectedThread?.id === thread.id) {
+      setSelectedThread(null);
+      setMessages([]);
+    }
+  };
+
+  useEffect(() => {
+    fetchThreads();
+    fetchAccounts();
+  }, [fetchThreads, fetchAccounts]);
+
+  // Realtime subscription
+  useEffect(() => {
+    const supabase = getRealtimeClient();
+    const channel = supabase
+      .channel("inbox-threads-changes")
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "inbox_threads",
+        },
+        () => {
+          fetchThreads();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [fetchThreads]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-96">
+        <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col h-[calc(100vh-120px)]">
+      <h1 className="text-2xl font-bold text-white mb-4">Inbox</h1>
+
+      <div className="flex flex-1 rounded-lg border border-gray-800 overflow-hidden">
+        {/* Left panel — Thread list */}
+        <div className="w-2/5 border-r border-gray-800 flex flex-col bg-gray-900">
+          {/* Filter tabs */}
+          <div className="flex border-b border-gray-800 px-2">
+            {FILTER_TABS.map((tab) => (
+              <button
+                key={tab.key}
+                onClick={() => setActiveFilter(tab.key)}
+                className={`px-3 py-2.5 text-xs font-medium transition-colors ${
+                  activeFilter === tab.key
+                    ? "text-blue-400 border-b-2 border-blue-400"
+                    : "text-gray-500 hover:text-gray-300"
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Search */}
+          <div className="p-2 border-b border-gray-800">
+            <div className="relative">
+              <Search className="absolute left-3 top-2.5 w-4 h-4 text-gray-500" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && fetchThreads()}
+                placeholder="Search inbox..."
+                className="w-full pl-9 pr-3 py-2 bg-gray-800 border border-gray-700 rounded-md text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              />
+            </div>
+          </div>
+
+          {/* Thread list */}
+          <div className="flex-1 overflow-y-auto">
+            {threads.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-full text-gray-500">
+                <InboxIcon className="w-12 h-12 mb-3" />
+                <p className="text-sm">No threads found</p>
+              </div>
+            ) : (
+              threads.map((thread) => (
+                <div
+                  key={thread.id}
+                  onClick={() => selectThread(thread)}
+                  className={`px-4 py-3 border-b border-gray-800 cursor-pointer hover:bg-gray-800/50 transition-colors ${
+                    selectedThread?.id === thread.id
+                      ? "bg-gray-800"
+                      : ""
+                  }`}
+                >
+                  <div className="flex items-start gap-3">
+                    {/* Avatar */}
+                    <div className="flex-shrink-0 w-9 h-9 rounded-full bg-blue-600 flex items-center justify-center">
+                      <span className="text-sm font-medium text-white">
+                        {(thread.participants?.[0] || "?")[0].toUpperCase()}
+                      </span>
+                    </div>
+
+                    <div className="flex-1 min-w-0">
+                      {/* Top row: sender + time */}
+                      <div className="flex items-center justify-between gap-2">
+                        <span
+                          className={`text-sm truncate ${
+                            thread.has_unread
+                              ? "font-semibold text-white"
+                              : "text-gray-300"
+                          }`}
+                        >
+                          {thread.participants?.[0] || "Unknown"}
+                        </span>
+                        <div className="flex items-center gap-1.5 flex-shrink-0">
+                          {thread.has_unread && (
+                            <div className="w-2 h-2 rounded-full bg-blue-500" />
+                          )}
+                          <span className="text-xs text-gray-500">
+                            {timeAgo(thread.latest_message_date)}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Subject */}
+                      <p
+                        className={`text-sm truncate mt-0.5 ${
+                          thread.has_unread ? "text-gray-200" : "text-gray-400"
+                        }`}
+                      >
+                        {thread.subject || "(no subject)"}
+                      </p>
+
+                      {/* Snippet + badges */}
+                      <div className="flex items-center gap-2 mt-1">
+                        <p className="text-xs text-gray-500 truncate flex-1">
+                          {thread.snippet || ""}
+                        </p>
+                        <ClassificationBadge
+                          classification={thread.latest_classification}
+                        />
+                      </div>
+
+                      {/* Campaign name */}
+                      {thread.campaign_name && (
+                        <p className="text-xs text-blue-400/60 mt-1 truncate">
+                          {thread.campaign_name}
+                        </p>
+                      )}
+                    </div>
+
+                    {/* Actions */}
+                    <div className="flex flex-col gap-1 flex-shrink-0 opacity-0 group-hover:opacity-100">
+                      <button
+                        onClick={(e) => toggleStar(thread, e)}
+                        className="p-1 hover:bg-gray-700 rounded"
+                      >
+                        <Star
+                          className={`w-3.5 h-3.5 ${
+                            thread.is_starred
+                              ? "fill-yellow-400 text-yellow-400"
+                              : "text-gray-600"
+                          }`}
+                        />
+                      </button>
+                      <button
+                        onClick={(e) => archiveThread(thread, e)}
+                        className="p-1 hover:bg-gray-700 rounded"
+                      >
+                        <Archive className="w-3.5 h-3.5 text-gray-600" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        {/* Right panel — Message view */}
+        <div className="flex-1 flex flex-col bg-gray-950">
+          {!selectedThread ? (
+            <div className="flex flex-col items-center justify-center h-full text-gray-500">
+              <InboxIcon className="w-16 h-16 mb-4" />
+              <p className="text-lg">Select a thread to view messages</p>
+            </div>
+          ) : (
+            <>
+              {/* Thread header */}
+              <div className="px-6 py-4 border-b border-gray-800">
+                <h2 className="text-lg font-semibold text-white truncate">
+                  {selectedThread.subject || "(no subject)"}
+                </h2>
+                <div className="flex items-center gap-3 mt-1">
+                  <span className="text-sm text-gray-400">
+                    {selectedThread.message_count} message
+                    {selectedThread.message_count !== 1 ? "s" : ""}
+                  </span>
+                  <ClassificationBadge
+                    classification={selectedThread.latest_classification}
+                  />
+                </div>
+                {selectedThread.campaign_name && (
+                  <div className="mt-2 px-3 py-1.5 bg-blue-500/10 border border-blue-500/20 rounded-md">
+                    <span className="text-xs text-blue-400">
+                      Campaign: {selectedThread.campaign_name}
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              {/* Messages */}
+              <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+                {messagesLoading ? (
+                  <div className="flex justify-center py-8">
+                    <Loader2 className="w-6 h-6 animate-spin text-blue-500" />
+                  </div>
+                ) : (
+                  messages.map((msg) => (
+                    <div
+                      key={msg.id}
+                      className={`rounded-lg border ${
+                        msg.direction === "sent"
+                          ? "border-blue-500/20 bg-blue-500/5 ml-12"
+                          : "border-gray-800 bg-gray-900"
+                      } p-4`}
+                    >
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-medium text-white">
+                            {msg.direction === "sent"
+                              ? "You"
+                              : msg.from_name || msg.from_email}
+                          </span>
+                          {msg.direction === "sent" && (
+                            <span className="text-xs text-blue-400">
+                              ({msg.from_email})
+                            </span>
+                          )}
+                          <ClassificationBadge
+                            classification={msg.classification}
+                          />
+                        </div>
+                        <span className="text-xs text-gray-500">
+                          {new Date(msg.received_date).toLocaleString()}
+                        </span>
+                      </div>
+
+                      {/* Email body — sanitized with DOMPurify */}
+                      {msg.body_html ? (
+                        <div
+                          className="text-sm text-gray-300 prose prose-invert prose-sm max-w-none"
+                          dangerouslySetInnerHTML={{
+                            __html: DOMPurify.sanitize(msg.body_html, {
+                              ALLOWED_TAGS: [
+                                "p","br","div","span","a","b","i","u","strong","em",
+                                "h1","h2","h3","h4","ul","ol","li","table","thead",
+                                "tbody","tr","td","th","img","blockquote","pre","code","hr",
+                              ],
+                              ALLOWED_ATTR: [
+                                "href","src","alt","style","class","target","width","height",
+                              ],
+                            }),
+                          }}
+                        />
+                      ) : (
+                        <p className="text-sm text-gray-300 whitespace-pre-wrap">
+                          {msg.body_text || "(no content)"}
+                        </p>
+                      )}
+                    </div>
+                  ))
+                )}
+              </div>
+
+              {/* Reply composer */}
+              <div className="border-t border-gray-800 px-6 py-4">
+                <div className="flex items-center gap-3 mb-3">
+                  <label className="text-xs text-gray-500">From:</label>
+                  <select
+                    value={replyAccountId}
+                    onChange={(e) => setReplyAccountId(e.target.value)}
+                    className="bg-gray-800 border border-gray-700 rounded-md px-3 py-1.5 text-sm text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  >
+                    {accounts.map((acc) => (
+                      <option key={acc.id} value={acc.id}>
+                        {acc.display_name
+                          ? `${acc.display_name} (${acc.email})`
+                          : acc.email}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <textarea
+                  value={replyText}
+                  onChange={(e) => setReplyText(e.target.value)}
+                  placeholder="Type your reply..."
+                  rows={3}
+                  className="w-full bg-gray-800 border border-gray-700 rounded-md px-4 py-3 text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-blue-500 resize-none"
+                />
+                <div className="flex justify-end mt-2">
+                  <button
+                    onClick={handleSendReply}
+                    disabled={sending || !replyText.trim()}
+                    className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-md text-sm font-medium text-white transition-colors"
+                  >
+                    {sending ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Send className="w-4 h-4" />
+                    )}
+                    Send Reply
+                  </button>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

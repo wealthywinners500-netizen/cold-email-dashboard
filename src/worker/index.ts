@@ -2,6 +2,7 @@ import { initBoss, stopBoss } from "../lib/email/campaign-queue";
 import { handleSendEmail } from "./handlers/send-email";
 import { handleProcessSequenceStep } from "./handlers/process-sequence-step";
 import { handleCheckNoReply } from "./handlers/check-no-reply";
+import { handleSyncAllAccounts, handleClassifyReply, handleClassifyBatch } from "./handlers/sync-inbox";
 import { closeAll } from "../lib/email/smtp-manager";
 import { createClient } from "@supabase/supabase-js";
 
@@ -65,6 +66,30 @@ async function main() {
     }
   });
 
+  // Register sync-all-accounts cron (every 5 minutes)
+  await boss.schedule("sync-all-accounts", "*/5 * * * *");
+  await boss.work("sync-all-accounts", async () => {
+    console.log("[Worker] Syncing all email accounts...");
+    try {
+      await handleSyncAllAccounts();
+    } catch (err) {
+      console.error("[Worker] Account sync failed:", err);
+      throw err;
+    }
+  });
+
+  // Register classify-batch cron (every hour)
+  await boss.schedule("classify-batch", "0 * * * *");
+  await boss.work("classify-batch", async () => {
+    console.log("[Worker] Running batch classification...");
+    try {
+      await handleClassifyBatch();
+    } catch (err) {
+      console.error("[Worker] Batch classification failed:", err);
+      throw err;
+    }
+  });
+
   // Register daily cron to reset sends_today
   await boss.schedule("reset-daily-counts", "0 0 * * *");
   await boss.work("reset-daily-counts", async () => {
@@ -91,6 +116,24 @@ async function main() {
     } catch (err) {
       console.error("[Worker] No-reply trigger check failed:", err);
       throw err;
+    }
+  });
+
+  // Register classify-reply handler (called directly from sync)
+  interface ClassifyReplyPayload {
+    messageId: number;
+  }
+
+  await boss.work<ClassifyReplyPayload>("classify-reply", async (jobs) => {
+    for (const job of jobs) {
+      console.log(`[Worker] Classifying message ${job.data.messageId}`);
+      try {
+        await handleClassifyReply(job.data);
+        console.log(`[Worker] Classify job ${job.id} completed successfully`);
+      } catch (err) {
+        console.error(`[Worker] Classify job ${job.id} failed:`, err);
+        throw err;
+      }
     }
   });
 

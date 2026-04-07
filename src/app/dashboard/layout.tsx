@@ -14,6 +14,7 @@ import {
   Menu,
   X as XIcon,
   AtSign,
+  Inbox,
 } from "lucide-react";
 import { OrganizationSwitcher, UserButton } from "@clerk/nextjs";
 import Link from "next/link";
@@ -33,6 +34,11 @@ const navigationItems = [
     label: "Email Accounts",
     href: "/dashboard/email-accounts",
     icon: AtSign,
+  },
+  {
+    label: "Inbox",
+    href: "/dashboard/inbox",
+    icon: Inbox,
   },
   {
     label: "Campaigns",
