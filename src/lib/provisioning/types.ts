@@ -195,8 +195,9 @@ export interface ProvisioningContext {
   dnsRegistrar: DNSRegistrar;
   nsDomain: string;
   sendingDomains: string[];
-  mailAccountPattern: string[];
-  adminEmail: string;
+  mailAccountsPerDomain: number;
+  mailAccountStyle: 'random_names' | 'custom';
+  adminEmail: string | null;
   server1?: ServerInfo;
   server2?: ServerInfo;
   log: (message: string) => void;

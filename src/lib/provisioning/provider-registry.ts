@@ -131,7 +131,7 @@ export const PORT_25_INFO: Record<string, { status: string; note: string }> = {
   digitalocean: { status: "blocked_request", note: "Must request port 25 unblock via support ticket" },
   hetzner: { status: "open", note: "Port 25 open by default" },
   vultr: { status: "blocked_request", note: "Must request port 25 unblock after first payment" },
-  linode: { status: "blocked_request", note: "Must open support ticket to unblock port 25" },
+  linode: { status: "open", note: "Port 25 open by default on Linode (Akamai)" },
   contabo: { status: "open", note: "Port 25 open by default on Contabo" },
   ovh: { status: "open", note: "Port 25 open by default" },
   custom: { status: "unknown", note: "Check with your hosting provider" },
