@@ -765,7 +765,7 @@ function ContactCsvImportModal({ open, onClose }: { open: boolean; onClose: () =
       Papa.default.parse(f, {
         header: true,
         skipEmptyLines: true,
-        complete: (results: any) => {
+        complete: (results: { data: Record<string, string>[]; errors: { message: string }[]; meta: { fields?: string[] } }) => {
           if (results.errors.length > 0) {
             setError(`Parse error: ${results.errors[0].message}`);
             return;
@@ -956,7 +956,7 @@ function AddToCampaignModal({
     setError("");
 
     try {
-      const body: any = { campaign_id: campaignId };
+      const body: { campaign_id: string; contact_ids?: string[]; filter?: { email_status: string } } = { campaign_id: campaignId };
       if (selectedIds.length > 0) {
         body.contact_ids = selectedIds;
       }

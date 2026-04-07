@@ -54,7 +54,6 @@ export async function GET(request: NextRequest) {
       .single();
 
     if (sendLog) {
-      const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null;
       const userAgent = request.headers.get("user-agent") || null;
 
       // Insert tracking event

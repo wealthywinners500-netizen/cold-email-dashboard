@@ -42,7 +42,7 @@ export default function LeadsClient({ leads }: LeadsClientProps) {
   const [selectedStatus, setSelectedStatus] = useState<string>("all");
   const [modalOpen, setModalOpen] = useState(false);
   const [csvModalOpen, setCsvModalOpen] = useState(false);
-  const [editingLead, setEditingLead] = useState<any>(null);
+  const [editingLead, setEditingLead] = useState<Lead | null>(null);
   useRealtimeRefresh("leads");
 
   const safeLeads = useMemo(() => leads.map(l => ({
