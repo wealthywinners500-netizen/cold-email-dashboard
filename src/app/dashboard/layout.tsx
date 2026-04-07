@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { usePathname } from "next/navigation";
 import {
   LayoutDashboard,
@@ -79,6 +79,25 @@ export default function DashboardLayout({
 }) {
   const pathname = usePathname();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
+
+  // Fetch unread inbox count
+  useEffect(() => {
+    async function fetchUnread() {
+      try {
+        const res = await fetch("/api/inbox/threads?unread=true&per_page=1");
+        if (res.ok) {
+          const data = await res.json();
+          setUnreadCount(data.pagination?.total ?? 0);
+        }
+      } catch {
+        // silently fail
+      }
+    }
+    fetchUnread();
+    const interval = setInterval(fetchUnread, 60000);
+    return () => clearInterval(interval);
+  }, []);
 
   return (
     <div className="flex h-screen bg-gray-950">
@@ -114,6 +133,11 @@ export default function DashboardLayout({
               >
                 <Icon size={18} />
                 <span className="text-sm font-medium">{item.label}</span>
+                {item.label === "Inbox" && unreadCount > 0 && (
+                  <span className="ml-auto bg-red-500 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
+                    {unreadCount > 99 ? "99+" : unreadCount}
+                  </span>
+                )}
               </Link>
             );
           })}

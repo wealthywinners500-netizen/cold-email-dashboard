@@ -157,6 +157,7 @@ export async function getTableCounts() {
     ]);
 
   return {
+    _orgId: orgId,
     server_pairs: servers.count ?? 0,
     campaigns: campaigns.count ?? 0,
     leads: leads.count ?? 0,
@@ -801,6 +802,314 @@ export async function updateOrganizationIntegrations(
   const { error } = await supabase
     .from('organizations')
     .update({ integrations })
+    .eq('id', orgId);
+
+  if (error) throw error;
+}
+
+// ============================================================
+// B12: System Health + Dashboard Metrics
+// ============================================================
+
+import type { SystemHealth, SystemAlert, DashboardMetrics } from './types';
+
+export async function getSystemHealth(orgId: string): Promise<SystemHealth> {
+  const supabase = await createAdminClient();
+
+  // Parallel fetch all data
+  const [orgResult, accountsResult, sentTodayResult, bouncedTodayResult, suppressionResult, alertsResult] = await Promise.all([
+    // Worker heartbeat from organizations
+    supabase
+      .from('organizations')
+      .select('worker_last_heartbeat, worker_jobs_today, worker_errors_today')
+      .eq('id', orgId)
+      .single(),
+    // Email account statuses
+    supabase
+      .from('email_accounts')
+      .select('id, status, last_sync_at, consecutive_failures')
+      .eq('org_id', orgId),
+    // Today's sent count
+    supabase
+      .from('email_send_log')
+      .select('id', { count: 'exact', head: true })
+      .eq('org_id', orgId)
+      .eq('status', 'sent')
+      .gte('sent_at', new Date(new Date().setHours(0, 0, 0, 0)).toISOString()),
+    // Today's bounced count
+    supabase
+      .from('email_send_log')
+      .select('id', { count: 'exact', head: true })
+      .eq('org_id', orgId)
+      .eq('status', 'bounced')
+      .gte('sent_at', new Date(new Date().setHours(0, 0, 0, 0)).toISOString()),
+    // Suppression list total
+    supabase
+      .from('suppression_list')
+      .select('id', { count: 'exact', head: true })
+      .eq('org_id', orgId),
+    // Unacknowledged alerts + recent 10
+    supabase
+      .from('system_alerts')
+      .select('*')
+      .eq('org_id', orgId)
+      .order('created_at', { ascending: false })
+      .limit(10),
+  ]);
+
+  const org = orgResult.data;
+  const accounts = accountsResult.data || [];
+  const sentToday = sentTodayResult.count ?? 0;
+  const bouncedToday = bouncedTodayResult.count ?? 0;
+  const suppressedTotal = suppressionResult.count ?? 0;
+  const recentAlerts = (alertsResult.data || []) as SystemAlert[];
+
+  // Count unacknowledged
+  const { count: unackCount } = await supabase
+    .from('system_alerts')
+    .select('id', { count: 'exact', head: true })
+    .eq('org_id', orgId)
+    .eq('acknowledged', false);
+
+  // Compute email account stats
+  const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+  const totalAccounts = accounts.length;
+  const syncingAccounts = accounts.filter(a => a.last_sync_at && a.last_sync_at > fifteenMinAgo).length;
+  const erroredAccounts = accounts.filter(a => a.status === 'error').length;
+  const disabledAccounts = accounts.filter(a => a.status === 'disabled').length;
+
+  // Worker health check
+  const lastHeartbeat = org?.worker_last_heartbeat || null;
+  const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  const workerHealthy = !!lastHeartbeat && lastHeartbeat > fiveMinAgo;
+
+  // Bounce rate
+  const bounceRate = sentToday > 0 ? (bouncedToday / sentToday) * 100 : 0;
+
+  // Queue stats — count pending campaign_recipients as proxy
+  const { count: pendingCount } = await supabase
+    .from('campaign_recipients')
+    .select('id', { count: 'exact', head: true })
+    .eq('org_id', orgId)
+    .eq('status', 'queued');
+
+  const { count: failedCount } = await supabase
+    .from('campaign_recipients')
+    .select('id', { count: 'exact', head: true })
+    .eq('org_id', orgId)
+    .eq('status', 'failed');
+
+  // Determine overall status
+  let overall: 'green' | 'yellow' | 'red' = 'green';
+  if (!workerHealthy || disabledAccounts > 0 || bounceRate > 5) {
+    overall = 'red';
+  } else if (erroredAccounts > 0 || bounceRate > 2 || (unackCount ?? 0) > 0) {
+    overall = 'yellow';
+  }
+
+  return {
+    worker: {
+      last_heartbeat: lastHeartbeat,
+      jobs_today: org?.worker_jobs_today ?? 0,
+      errors_today: org?.worker_errors_today ?? 0,
+      is_healthy: workerHealthy,
+    },
+    email_accounts: {
+      total: totalAccounts,
+      syncing: syncingAccounts,
+      errored: erroredAccounts,
+      disabled: disabledAccounts,
+    },
+    delivery: {
+      sent_today: sentToday,
+      bounced_today: bouncedToday,
+      bounce_rate: Math.round(bounceRate * 100) / 100,
+      suppressed_total: suppressedTotal,
+    },
+    queue: {
+      pending: pendingCount ?? 0,
+      failed: failedCount ?? 0,
+    },
+    alerts: {
+      unacknowledged: unackCount ?? 0,
+      recent: recentAlerts,
+    },
+    overall,
+  };
+}
+
+export async function getDashboardMetrics(orgId: string): Promise<DashboardMetrics> {
+  const supabase = await createAdminClient();
+
+  const [campaignsResult, inboxUnreadResult, todayRepliesResult, classificationResult, leadsResult, leadsVerifiedResult, topCitiesResult, healthData] = await Promise.all([
+    // Active campaigns with recipient counts
+    supabase
+      .from('campaigns')
+      .select('id, total_sent, total_recipients')
+      .eq('org_id', orgId)
+      .in('status', ['sending', 'active']),
+    // Unread inbox threads
+    supabase
+      .from('inbox_threads')
+      .select('id', { count: 'exact', head: true })
+      .eq('org_id', orgId)
+      .eq('is_read', false),
+    // Today's replies
+    supabase
+      .from('inbox_messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('direction', 'received')
+      .gte('received_date', new Date(new Date().setHours(0, 0, 0, 0)).toISOString()),
+    // Classification breakdown
+    supabase
+      .from('inbox_messages')
+      .select('classification')
+      .eq('direction', 'received')
+      .not('classification', 'is', null),
+    // Total lead contacts
+    supabase
+      .from('lead_contacts')
+      .select('id', { count: 'exact', head: true })
+      .eq('org_id', orgId),
+    // Verified contacts
+    supabase
+      .from('lead_contacts')
+      .select('id', { count: 'exact', head: true })
+      .eq('org_id', orgId)
+      .eq('email_status', 'valid'),
+    // Top cities
+    supabase
+      .from('lead_contacts')
+      .select('city')
+      .eq('org_id', orgId)
+      .not('city', 'is', null),
+    // System health overall
+    getSystemHealth(orgId),
+  ]);
+
+  // Campaign metrics
+  const activeCampaigns = campaignsResult.data || [];
+  const totalRecipients = activeCampaigns.reduce((sum, c) => sum + (c.total_recipients ?? 0), 0);
+  const totalSent = activeCampaigns.reduce((sum, c) => sum + (c.total_sent ?? 0), 0);
+  const percentSent = totalRecipients > 0 ? Math.round((totalSent / totalRecipients) * 100) : 0;
+
+  // Classification breakdown
+  const classBreakdown: Record<string, number> = {};
+  for (const msg of classificationResult.data || []) {
+    const cls = msg.classification || 'UNKNOWN';
+    classBreakdown[cls] = (classBreakdown[cls] || 0) + 1;
+  }
+
+  // Top cities aggregation
+  const cityCounts: Record<string, number> = {};
+  for (const contact of topCitiesResult.data || []) {
+    if (contact.city) {
+      cityCounts[contact.city] = (cityCounts[contact.city] || 0) + 1;
+    }
+  }
+  const topCities = Object.entries(cityCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([city, count]) => ({ city, count }));
+
+  // Verified percentage
+  const totalContacts = leadsResult.count ?? 0;
+  const validContacts = leadsVerifiedResult.count ?? 0;
+  const verifiedPercent = totalContacts > 0 ? Math.round((validContacts / totalContacts) * 100) : 0;
+
+  return {
+    active_campaigns: {
+      count: activeCampaigns.length,
+      total_recipients: totalRecipients,
+      percent_sent: percentSent,
+    },
+    inbox: {
+      unread: inboxUnreadResult.count ?? 0,
+      today_replies: todayRepliesResult.count ?? 0,
+      classification_breakdown: classBreakdown,
+    },
+    leads: {
+      total_contacts: totalContacts,
+      verified_percent: verifiedPercent,
+      top_cities: topCities,
+    },
+    health: healthData.overall,
+  };
+}
+
+export async function getSystemAlerts(
+  orgId: string,
+  filters?: { severity?: string; acknowledged?: boolean; page?: number }
+): Promise<{ alerts: SystemAlert[]; total: number }> {
+  const supabase = await createAdminClient();
+  const page = filters?.page ?? 1;
+  const perPage = 20;
+  const from = (page - 1) * perPage;
+
+  let query = supabase
+    .from('system_alerts')
+    .select('*', { count: 'exact' })
+    .eq('org_id', orgId)
+    .order('created_at', { ascending: false })
+    .range(from, from + perPage - 1);
+
+  if (filters?.severity) {
+    query = query.eq('severity', filters.severity);
+  }
+  if (filters?.acknowledged !== undefined) {
+    query = query.eq('acknowledged', filters.acknowledged);
+  }
+
+  const { data, count, error } = await query;
+  if (error) throw error;
+
+  return { alerts: (data || []) as SystemAlert[], total: count ?? 0 };
+}
+
+export async function acknowledgeAlert(orgId: string, alertId: string): Promise<void> {
+  const supabase = await createAdminClient();
+  const { error } = await supabase
+    .from('system_alerts')
+    .update({ acknowledged: true, acknowledged_at: new Date().toISOString() })
+    .eq('id', alertId)
+    .eq('org_id', orgId);
+
+  if (error) throw error;
+}
+
+export async function createSystemAlert(
+  orgId: string,
+  alert: { alert_type: string; severity: string; title: string; details?: Record<string, any>; account_id?: string }
+): Promise<void> {
+  const supabase = await createAdminClient();
+  const { error } = await supabase
+    .from('system_alerts')
+    .insert({
+      org_id: orgId,
+      alert_type: alert.alert_type,
+      severity: alert.severity,
+      title: alert.title,
+      details: alert.details || {},
+      account_id: alert.account_id || null,
+    });
+
+  if (error) throw error;
+}
+
+export async function updateWorkerHeartbeatQuery(orgId: string): Promise<void> {
+  const supabase = await createAdminClient();
+  const { data: org } = await supabase
+    .from('organizations')
+    .select('worker_jobs_today')
+    .eq('id', orgId)
+    .single();
+
+  const { error } = await supabase
+    .from('organizations')
+    .update({
+      worker_last_heartbeat: new Date().toISOString(),
+      worker_jobs_today: (org?.worker_jobs_today ?? 0) + 1,
+    })
     .eq('id', orgId);
 
   if (error) throw error;

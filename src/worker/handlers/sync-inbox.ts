@@ -2,6 +2,7 @@ import { createClient } from '@supabase/supabase-js';
 import { syncAllAccounts } from '../../lib/email/imap-sync';
 import { classifyReply, classifyBatch, Classification } from '../../lib/email/reply-classifier';
 import { handleReply, handleBounce, handleOptOut } from '../../lib/email/sequence-engine';
+import { handleImapError } from '../../lib/email/error-handler';
 
 function getSupabase() {
   return createClient(
@@ -33,7 +34,7 @@ export async function handleSyncAllAccounts(): Promise<void> {
         console.log(`[SyncInbox] Synced ${result.synced} messages for org ${org.id}`);
       }
       if (result.errors.length > 0) {
-        console.warn(`[SyncInbox] ${result.errors.length} errors for org ${org.id}`);
+        console.warn(`[SyncInbox] ${result.errors.length} errors for org ${org.id}:`, result.errors);
       }
     } catch (err) {
       console.error(`[SyncInbox] Error syncing org ${org.id}:`, err);

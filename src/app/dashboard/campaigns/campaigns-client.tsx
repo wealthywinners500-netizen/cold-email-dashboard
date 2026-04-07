@@ -32,7 +32,9 @@ interface Campaign {
   open_rate: number;
   reply_rate: number;
   bounce_rate: number;
-  status: "active" | "paused" | "completed";
+  status: "active" | "paused" | "completed" | "sending";
+  total_sent?: number;
+  total_recipients?: number;
   created_at: string;
 }
 
@@ -403,9 +405,28 @@ export default function CampaignsClient({ campaigns }: CampaignsClientProps) {
                       {campaign.reply_rate.toFixed(2)}%
                     </td>
                     <td className="py-3 px-4">
-                      <Badge variant={statusBadgeVariants[campaign.status]}>
-                        {campaign.status}
-                      </Badge>
+                      {campaign.status === "sending" && (campaign.total_recipients ?? 0) > 0 ? (
+                        <div className="space-y-1">
+                          <Badge variant={statusBadgeVariants[campaign.status] || "default"}>
+                            sending
+                          </Badge>
+                          <div className="w-24 bg-gray-700 rounded-full h-1.5">
+                            <div
+                              className="bg-blue-500 h-1.5 rounded-full"
+                              style={{
+                                width: `${Math.min(100, Math.round(((campaign.total_sent ?? 0) / (campaign.total_recipients ?? 1)) * 100))}%`,
+                              }}
+                            />
+                          </div>
+                          <p className="text-xs text-gray-400">
+                            {Math.round(((campaign.total_sent ?? 0) / (campaign.total_recipients ?? 1)) * 100)}%
+                          </p>
+                        </div>
+                      ) : (
+                        <Badge variant={statusBadgeVariants[campaign.status]}>
+                          {campaign.status}
+                        </Badge>
+                      )}
                     </td>
                   </tr>
                 ))}

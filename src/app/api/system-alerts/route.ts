@@ -1,103 +1,79 @@
-/**
- * B14: System Alerts API — admin-only endpoint.
- * Returns active alerts (blacklisted domains, failed sends, bouncing campaigns).
- */
 import { auth } from "@clerk/nextjs/server";
 import { createAdminClient } from "@/lib/supabase/server";
-import { NextRequest, NextResponse } from "next/server";
+import { getSystemAlerts, acknowledgeAlert } from "@/lib/supabase/queries";
+import { NextResponse } from "next/server";
 
-export async function GET() {
-  const { orgId, orgRole } = await auth();
+async function getInternalOrgId(): Promise<string | null> {
+  const { orgId } = await auth();
+  if (!orgId) return null;
+  const supabase = await createAdminClient();
+  const { data } = await supabase
+    .from("organizations")
+    .select("id")
+    .eq("clerk_org_id", orgId)
+    .single();
+  return data?.id || null;
+}
 
-  if (orgRole !== "org:admin") {
-    return NextResponse.json(
-      { error: "Admin access required" },
-      { status: 403, headers: { "Cache-Control": "no-store" } }
-    );
-  }
-
-  if (!orgId) {
-    return NextResponse.json(
-      { error: "No organization selected" },
-      { status: 401, headers: { "Cache-Control": "no-store" } }
-    );
-  }
-
+export async function GET(req: Request) {
   try {
-    const supabase = await createAdminClient();
-
-    const { data: org } = await supabase
-      .from("organizations")
-      .select("id")
-      .eq("clerk_org_id", orgId)
-      .single();
-
-    if (!org) {
+    const { orgRole } = await auth();
+    if (orgRole !== 'org:admin') {
       return NextResponse.json(
-        { error: "Organization not found" },
-        { status: 404, headers: { "Cache-Control": "no-store" } }
+        { error: "Admin access required" },
+        { status: 403, headers: { "Cache-Control": "no-store" } }
       );
     }
 
-    // Check for campaigns with high bounce rates
-    const { data: campaigns } = await supabase
-      .from("campaigns")
-      .select("id, name, total_sent, total_bounced")
-      .eq("org_id", org.id)
-      .gt("total_sent", 0);
-
-    const alerts: Array<{ type: string; severity: string; message: string; entity_id?: string }> = [];
-
-    for (const c of campaigns || []) {
-      const bounceRate =
-        c.total_sent > 0 ? ((c.total_bounced ?? 0) / c.total_sent) * 100 : 0;
-      if (bounceRate > 5) {
-        alerts.push({
-          type: "high_bounce_rate",
-          severity: bounceRate > 10 ? "critical" : "warning",
-          message: `Campaign "${c.name}" has ${bounceRate.toFixed(1)}% bounce rate`,
-          entity_id: c.id,
-        });
-      }
+    const orgId = await getInternalOrgId();
+    if (!orgId) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    return NextResponse.json(
-      { alerts, count: alerts.length, timestamp: new Date().toISOString() },
-      { headers: { "Cache-Control": "no-store" } }
-    );
-  } catch (error) {
-    console.error("[SystemAlerts] Error:", error);
-    return NextResponse.json(
-      { error: "Failed to fetch alerts" },
-      { status: 500, headers: { "Cache-Control": "no-store" } }
-    );
+    const url = new URL(req.url);
+    const severity = url.searchParams.get("severity") || undefined;
+    const acknowledged = url.searchParams.get("acknowledged");
+    const page = parseInt(url.searchParams.get("page") || "1", 10);
+
+    const result = await getSystemAlerts(orgId, {
+      severity,
+      acknowledged: acknowledged !== null ? acknowledged === "true" : undefined,
+      page,
+    });
+
+    return NextResponse.json(result, {
+      headers: { "Cache-Control": "no-store" },
+    });
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }
 
-export async function PATCH(request: NextRequest) {
-  const { orgRole } = await auth();
-
-  if (orgRole !== "org:admin") {
-    return NextResponse.json(
-      { error: "Admin access required" },
-      { status: 403, headers: { "Cache-Control": "no-store" } }
-    );
-  }
-
+export async function POST(req: Request) {
   try {
-    const body = await request.json();
-    const { alert_id, acknowledged } = body;
+    const { orgRole } = await auth();
+    if (orgRole !== 'org:admin') {
+      return NextResponse.json(
+        { error: "Admin access required" },
+        { status: 403, headers: { "Cache-Control": "no-store" } }
+      );
+    }
 
-    // For now, acknowledge is a no-op (alerts are computed, not stored)
-    return NextResponse.json(
-      { success: true, alert_id, acknowledged },
-      { headers: { "Cache-Control": "no-store" } }
-    );
-  } catch (error) {
-    console.error("[SystemAlerts] PATCH Error:", error);
-    return NextResponse.json(
-      { error: "Failed to update alert" },
-      { status: 500, headers: { "Cache-Control": "no-store" } }
-    );
+    const orgId = await getInternalOrgId();
+    if (!orgId) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const body = await req.json();
+    if (!body.alert_id) {
+      return NextResponse.json({ error: "alert_id required" }, { status: 400 });
+    }
+
+    await acknowledgeAlert(orgId, body.alert_id);
+    return NextResponse.json({ success: true }, {
+      headers: { "Cache-Control": "no-store" },
+    });
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }

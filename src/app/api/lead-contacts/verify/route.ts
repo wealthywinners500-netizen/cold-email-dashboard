@@ -26,6 +26,7 @@ export async function POST(request: NextRequest) {
     );
   }
 
+
   const orgId = await getInternalOrgId();
   if (!orgId) {
     return NextResponse.json(

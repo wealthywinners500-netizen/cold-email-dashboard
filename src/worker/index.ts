@@ -6,6 +6,7 @@ import { handleSyncAllAccounts, handleClassifyReply, handleClassifyBatch } from 
 import { handleProcessBounce } from "./handlers/process-bounce";
 import { closeAll } from "../lib/email/smtp-manager";
 import { createClient } from "@supabase/supabase-js";
+import { handleWorkerError, updateWorkerHeartbeat, resetDailyCounters } from "../lib/email/error-handler";
 
 function getSupabase() {
   return createClient(
@@ -21,6 +22,41 @@ async function main() {
   const boss = await initBoss();
   console.log("[Worker] pg-boss started");
 
+  // --- Heartbeat: pulse every 60 seconds for all orgs ---
+  const heartbeatInterval = setInterval(async () => {
+    try {
+      const supabase = getSupabase();
+      const { data: orgs } = await supabase.from("organizations").select("id");
+      for (const org of orgs || []) {
+        await updateWorkerHeartbeat(org.id);
+      }
+    } catch (err) {
+      console.error("[Worker] Heartbeat failed:", err);
+    }
+  }, 60000);
+
+  // --- Error handling wrapper ---
+  function withErrorHandling<T extends Record<string, any>>(
+    handler: (data: T) => Promise<void>,
+    jobName: string
+  ) {
+    return async (jobs: { id: string; data: T }[]) => {
+      for (const job of jobs) {
+        try {
+          await handler(job.data);
+          console.log(`[Worker] Job ${job.id} (${jobName}) completed successfully`);
+        } catch (err) {
+          console.error(`[Worker] Job ${job.id} (${jobName}) failed:`, err);
+          const error = err instanceof Error ? err : new Error(String(err));
+          await handleWorkerError(error, jobName, job.data).catch(e =>
+            console.error("[Worker] Error handler failed:", e)
+          );
+          throw err;
+        }
+      }
+    };
+  }
+
   // Register send-email handler
   interface SendEmailPayload {
     recipientId: string;
@@ -29,18 +65,10 @@ async function main() {
     orgId: string;
   }
 
-  await boss.work<SendEmailPayload>("send-email", async (jobs) => {
-    for (const job of jobs) {
-      console.log(`[Worker] Processing job ${job.id} for recipient ${job.data.recipientId}`);
-      try {
-        await handleSendEmail(job.data);
-        console.log(`[Worker] Job ${job.id} completed successfully`);
-      } catch (err) {
-        console.error(`[Worker] Job ${job.id} failed:`, err);
-        throw err;
-      }
-    }
-  });
+  await boss.work<SendEmailPayload>(
+    "send-email",
+    withErrorHandling(handleSendEmail, "send-email")
+  );
 
   // Register process-sequence-step handler
   interface ProcessSequenceStepPayload {
@@ -52,20 +80,10 @@ async function main() {
     orgId: string;
   }
 
-  await boss.work<ProcessSequenceStepPayload>("process-sequence-step", async (jobs) => {
-    for (const job of jobs) {
-      console.log(
-        `[Worker] Processing sequence job ${job.id} for state ${job.data.stateId}`
-      );
-      try {
-        await handleProcessSequenceStep(job.data);
-        console.log(`[Worker] Sequence job ${job.id} completed successfully`);
-      } catch (err) {
-        console.error(`[Worker] Sequence job ${job.id} failed:`, err);
-        throw err;
-      }
-    }
-  });
+  await boss.work<ProcessSequenceStepPayload>(
+    "process-sequence-step",
+    withErrorHandling(handleProcessSequenceStep, "process-sequence-step")
+  );
 
   // Register sync-all-accounts cron (every 5 minutes)
   await boss.schedule("sync-all-accounts", "*/5 * * * *");
@@ -91,11 +109,13 @@ async function main() {
     }
   });
 
-  // Register daily cron to reset sends_today
+  // Register daily cron to reset sends_today + worker counters
   await boss.schedule("reset-daily-counts", "0 0 * * *");
   await boss.work("reset-daily-counts", async () => {
-    console.log("[Worker] Resetting daily send counts...");
+    console.log("[Worker] Resetting daily counts...");
     const supabase = getSupabase();
+
+    // Reset email account sends_today
     const { error } = await supabase
       .from("email_accounts")
       .update({ sends_today: 0 })
@@ -105,7 +125,14 @@ async function main() {
       console.error("[Worker] Failed to reset daily counts:", error);
       throw error;
     }
-    console.log("[Worker] Daily send counts reset successfully");
+
+    // Reset worker counters for all orgs
+    const { data: orgs } = await supabase.from("organizations").select("id");
+    for (const org of orgs || []) {
+      await resetDailyCounters(org.id);
+    }
+
+    console.log("[Worker] Daily counts reset successfully");
   });
 
   // Register check-no-reply cron (every hour)
@@ -125,18 +152,23 @@ async function main() {
     messageId: number;
   }
 
-  await boss.work<ClassifyReplyPayload>("classify-reply", async (jobs) => {
-    for (const job of jobs) {
-      console.log(`[Worker] Classifying message ${job.data.messageId}`);
-      try {
-        await handleClassifyReply(job.data);
-        console.log(`[Worker] Classify job ${job.id} completed successfully`);
-      } catch (err) {
-        console.error(`[Worker] Classify job ${job.id} failed:`, err);
-        throw err;
-      }
-    }
-  });
+  await boss.work<ClassifyReplyPayload>(
+    "classify-reply",
+    withErrorHandling(handleClassifyReply, "classify-reply")
+  );
+
+  // Register process-bounce handler (B10)
+  interface ProcessBouncePayload {
+    messageId: number;
+    bodyText: string;
+    fromEmail: string;
+    orgId: string;
+  }
+
+  await boss.work<ProcessBouncePayload>(
+    "process-bounce",
+    withErrorHandling(handleProcessBounce, "process-bounce")
+  );
 
   // Register process-bounce handler (B10)
   interface ProcessBouncePayload {
@@ -164,6 +196,7 @@ async function main() {
   // Graceful shutdown
   const shutdown = async (signal: string) => {
     console.log(`[Worker] Received ${signal}, shutting down...`);
+    clearInterval(heartbeatInterval);
     closeAll();
     await stopBoss();
     process.exit(0);

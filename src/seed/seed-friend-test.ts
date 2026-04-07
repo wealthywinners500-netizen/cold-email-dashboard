@@ -618,7 +618,7 @@ async function main() {
             body_text:
               "Hi Jennifer,\n\nI noticed Sunrise Family Medicine and wanted to reach out about a unique advertising opportunity...",
             classification: "SENT",
-            received_at: threeDaysAgo,
+            received_date: threeDaysAgo,
           },
           {
             org_id: orgId,
@@ -635,7 +635,7 @@ async function main() {
             body_text:
               "Hi Alex,\n\nYes, I'm interested in learning more about this opportunity. Could you send me some details?",
             classification: "INTERESTED",
-            received_at: now,
+            received_date: now,
           },
           // Thread 2 messages
           {
@@ -653,7 +653,7 @@ async function main() {
             body_text:
               "Hi Angela,\n\nI wanted to reach out about our wellness center advertising program...",
             classification: "SENT",
-            received_at: threeDaysAgo,
+            received_date: threeDaysAgo,
           },
           {
             org_id: orgId,
@@ -670,7 +670,7 @@ async function main() {
             body_text:
               "Thank you for your email. This is an automated reply. I will respond to your message shortly.",
             classification: "AUTO_REPLY",
-            received_at: threeDaysAgo,
+            received_date: threeDaysAgo,
           },
           // Thread 3 messages
           {
@@ -688,7 +688,7 @@ async function main() {
             body_text:
               "Hi Robert,\n\nI have a quick question about your chiropractic practice...",
             classification: "SENT",
-            received_at: sevenDaysAgo,
+            received_date: sevenDaysAgo,
           },
           {
             org_id: orgId,
@@ -705,7 +705,7 @@ async function main() {
             body_text:
               "Hi Mike,\n\nThanks for reaching out. We're not interested in advertising partnerships at this time.",
             classification: "OBJECTION",
-            received_at: now,
+            received_date: now,
           },
           {
             org_id: orgId,
@@ -722,7 +722,7 @@ async function main() {
             body_text:
               "Hi Robert,\n\nNo problem, thanks for letting me know. Feel free to reach out if circumstances change in the future.",
             classification: "SENT",
-            received_at: now,
+            received_date: now,
           },
         ]);
 
