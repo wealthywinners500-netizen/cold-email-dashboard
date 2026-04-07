@@ -13,6 +13,7 @@ import {
   Shield,
   Menu,
   X as XIcon,
+  AtSign,
 } from "lucide-react";
 import { OrganizationSwitcher, UserButton } from "@clerk/nextjs";
 import Link from "next/link";
@@ -27,6 +28,11 @@ const navigationItems = [
     label: "Servers",
     href: "/dashboard/servers",
     icon: Server,
+  },
+  {
+    label: "Email Accounts",
+    href: "/dashboard/email-accounts",
+    icon: AtSign,
   },
   {
     label: "Campaigns",

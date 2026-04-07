@@ -1,0 +1,15 @@
+[Unit]
+Description=Cold Email Dashboard Worker
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/cold-email-dashboard
+ExecStart=/usr/bin/node dist/worker/index.js
+Restart=always
+RestartSec=10
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

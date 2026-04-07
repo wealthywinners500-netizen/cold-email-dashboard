@@ -178,3 +178,93 @@ export async function getDashboardOverview() {
 
   return { serverPairs, campaigns, leads, followUps, smsWorkflows };
 }
+
+export async function getEmailAccounts() {
+  const orgId = await getInternalOrgId();
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from("email_accounts")
+    .select("*")
+    .eq("org_id", orgId)
+    .order("email", { ascending: true });
+
+  if (error) throw error;
+  return data;
+}
+
+export async function getActiveEmailAccounts() {
+  const orgId = await getInternalOrgId();
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from("email_accounts")
+    .select("*")
+    .eq("org_id", orgId)
+    .eq("status", "active")
+    .order("email", { ascending: true });
+
+  if (error) throw error;
+  // Filter client-side for sends_today < daily_send_limit
+  return (data || []).filter((a: any) => a.sends_today < a.daily_send_limit);
+}
+
+export async function getCampaignRecipients(
+  campaignId: string,
+  page: number = 1,
+  perPage: number = 50,
+  status?: string
+) {
+  const orgId = await getInternalOrgId();
+  const supabase = await createAdminClient();
+
+  let query = supabase
+    .from("campaign_recipients")
+    .select("*", { count: "exact" })
+    .eq("campaign_id", campaignId)
+    .eq("org_id", orgId)
+    .order("created_at", { ascending: true })
+    .range((page - 1) * perPage, page * perPage - 1);
+
+  if (status) {
+    query = query.eq("status", status);
+  }
+
+  const { data, error, count } = await query;
+  if (error) throw error;
+  return { data, count };
+}
+
+export async function getCampaignStats(campaignId: string) {
+  const orgId = await getInternalOrgId();
+  const supabase = await createAdminClient();
+
+  const { data, error } = await supabase
+    .from("campaign_recipients")
+    .select("status, opened_at, clicked_at, replied_at, bounced_at")
+    .eq("campaign_id", campaignId)
+    .eq("org_id", orgId);
+
+  if (error) throw error;
+
+  const stats = {
+    total_recipients: data?.length || 0,
+    sent: 0,
+    pending: 0,
+    failed: 0,
+    opened: 0,
+    clicked: 0,
+    replied: 0,
+    bounced: 0,
+  };
+
+  (data || []).forEach((r: any) => {
+    if (r.status === "sent") stats.sent++;
+    else if (r.status === "pending") stats.pending++;
+    else if (r.status === "failed") stats.failed++;
+    if (r.opened_at) stats.opened++;
+    if (r.clicked_at) stats.clicked++;
+    if (r.replied_at) stats.replied++;
+    if (r.bounced_at) stats.bounced++;
+  });
+
+  return stats;
+}
