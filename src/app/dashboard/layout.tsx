@@ -166,6 +166,8 @@ export default function DashboardLayout({
           <div className="flex items-center gap-4">
             <div className="text-sm text-gray-400">Organization</div>
             <OrganizationSwitcher
+              afterSelectOrganizationUrl="/dashboard"
+              afterCreateOrganizationUrl="/dashboard"
               appearance={{
                 elements: {
                   organizationSwitcherTrigger:

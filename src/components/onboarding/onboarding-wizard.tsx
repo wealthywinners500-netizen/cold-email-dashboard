@@ -164,7 +164,7 @@ export default function OnboardingWizard({ hasOrg }: OnboardingWizardProps) {
           </CardHeader>
           <CardContent className="space-y-6">
             <div className="bg-gray-800 rounded-lg p-4">
-              <CreateOrganization />
+              <CreateOrganization afterCreateOrganizationUrl="/dashboard" />
             </div>
 
             <Button
