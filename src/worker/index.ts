@@ -25,6 +25,27 @@ async function main() {
   const boss = await initBoss();
   console.log("[Worker] pg-boss started");
 
+  // Create all queues (required by pg-boss v12+)
+  const queueNames = [
+    "send-email",
+    "process-sequence-step",
+    "sync-all-accounts",
+    "classify-batch",
+    "reset-daily-counts",
+    "check-no-reply",
+    "classify-reply",
+    "process-bounce",
+    "provision-server-pair",
+    "rollback-provision",
+    "server-health-check-cron",
+    "server-health-check",
+    "poll-provisioning-jobs",
+  ];
+  for (const name of queueNames) {
+    await boss.createQueue(name);
+  }
+  console.log("[Worker] All queues created");
+
   // --- Heartbeat: pulse every 60 seconds for all orgs ---
   const heartbeatInterval = setInterval(async () => {
     try {
