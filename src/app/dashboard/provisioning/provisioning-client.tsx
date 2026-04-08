@@ -45,6 +45,21 @@ export default function ProvisioningClient({ hasProviders }: ProvisioningClientP
   const router = useRouter();
   const [jobs, setJobs] = useState<ProvisioningJobRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [isDryRunOnly, setIsDryRunOnly] = useState(false);
+
+  useEffect(() => {
+    async function checkProviders() {
+      try {
+        const res = await fetch("/api/vps-providers");
+        if (res.ok) {
+          const providers = await res.json();
+          const allDryRun = providers.length > 0 && providers.every((p: Record<string, unknown>) => p.provider_type === "dry_run");
+          setIsDryRunOnly(allDryRun);
+        }
+      } catch { /* ignore */ }
+    }
+    checkProviders();
+  }, []);
 
   useEffect(() => {
     async function fetchJobs() {
@@ -125,6 +140,23 @@ export default function ProvisioningClient({ hasProviders }: ProvisioningClientP
 
   return (
     <div className="space-y-8">
+      {/* Test Mode Banner */}
+      {isDryRunOnly && (
+        <div className="bg-indigo-900/20 border border-indigo-500/30 rounded-lg p-4 flex items-start gap-3">
+          <span className="text-indigo-400 text-lg flex-shrink-0">🧪</span>
+          <div>
+            <p className="text-indigo-300 text-sm font-medium">Test Mode</p>
+            <p className="text-indigo-400/80 text-xs mt-0.5">
+              Provisioning runs a full simulation. No real servers are created.{" "}
+              <a href="/dashboard/settings" className="underline hover:text-indigo-300">
+                Add a real provider in Settings
+              </a>{" "}
+              to deploy actual servers.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Active Provisions */}
       {activeJobs.length > 0 && (
         <div>

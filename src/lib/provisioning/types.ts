@@ -11,7 +11,8 @@ export type VPSProviderType =
   | "linode"
   | "contabo"
   | "ovh"
-  | "custom";
+  | "custom"
+  | "dry_run";
 
 export type DNSRegistrarType =
   | "ionos"
@@ -21,7 +22,8 @@ export type DNSRegistrarType =
   | "porkbun"
   | "namecom"
   | "dynadot"
-  | "custom";
+  | "custom"
+  | "dry_run";
 
 export type ProvisioningStatus =
   | "pending"

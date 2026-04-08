@@ -177,18 +177,27 @@ export async function POST(req: Request) {
     //
     // Alternative: use Supabase edge function or direct pg-boss send.
     // We store a 'queued_at' timestamp so the worker knows to process it.
+
+    // Look up provider_type to store in config
+    const { data: providerInfo } = await supabase
+      .from("vps_providers")
+      .select("provider_type")
+      .eq("id", vps_provider_id)
+      .single();
+
     await supabase
       .from("provisioning_jobs")
       .update({
         config: {
           ...(job.config || {}),
+          provider_type: providerInfo?.provider_type || "unknown",
           queued_at: new Date().toISOString(),
         },
       })
       .eq("id", job.id);
 
     return NextResponse.json(
-      { jobId: job.id, status: "pending" },
+      { jobId: job.id, status: "pending", provider_type: providerInfo?.provider_type || "unknown" },
       { status: 201 }
     );
   } catch {

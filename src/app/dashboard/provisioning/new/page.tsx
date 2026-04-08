@@ -123,6 +123,16 @@ export default function NewProvisioningPage() {
       setRegions([]);
       return;
     }
+
+    // For dry_run providers, skip API call and use demo region
+    const providerObj = providers.find((p) => p.id === selectedProvider);
+    if (providerObj?.provider_type === "dry_run") {
+      setRegions([{ id: "demo-dc-1", name: "Demo Datacenter", slug: "demo", available: true }]);
+      setSelectedRegion("demo-dc-1");
+      setLoadingRegions(false);
+      return;
+    }
+
     setLoadingRegions(true);
     setSelectedRegion("");
     fetch(`/api/vps-providers/${selectedProvider}/regions`)
@@ -130,7 +140,7 @@ export default function NewProvisioningPage() {
       .then((data) => setRegions(data))
       .catch(() => setRegions([]))
       .finally(() => setLoadingRegions(false));
-  }, [selectedProvider]);
+  }, [selectedProvider, providers]);
 
   const selectedProviderObj = providers.find((p) => p.id === selectedProvider);
   const selectedRegistrarObj = registrars.find((r) => r.id === selectedRegistrar);
@@ -294,6 +304,9 @@ export default function NewProvisioningPage() {
                           <div>
                             <span className="text-white font-medium">{p.name}</span>
                             <span className="text-gray-500 text-xs ml-2">({p.provider_type})</span>
+                            {p.provider_type === "dry_run" && (
+                              <span className="ml-2 text-xs bg-indigo-900/60 text-indigo-300 px-1.5 py-0.5 rounded">Simulation</span>
+                            )}
                           </div>
                           <Port25Indicator providerType={p.provider_type} />
                         </button>

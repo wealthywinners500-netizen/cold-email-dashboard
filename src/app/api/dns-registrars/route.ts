@@ -33,7 +33,26 @@ export async function GET() {
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
-    const masked = (data || []).map((r: Record<string, unknown>) => ({
+    // Auto-seed Test Mode registrar for new orgs
+    let registrars = data || [];
+    if (registrars.length === 0) {
+      const { data: seeded, error: seedError } = await supabase
+        .from("dns_registrars")
+        .insert({
+          org_id: orgId,
+          name: "Test Mode (Simulated)",
+          registrar_type: "dry_run",
+          is_default: true,
+          config: { auto_seeded: true },
+        })
+        .select()
+        .single();
+      if (!seedError && seeded) {
+        registrars = [seeded];
+      }
+    }
+
+    const masked = (registrars).map((r: Record<string, unknown>) => ({
       ...r,
       api_key_encrypted: r.api_key_encrypted ? maskSecret(String(r.api_key_encrypted)) : null,
       api_secret_encrypted: r.api_secret_encrypted ? maskSecret(String(r.api_secret_encrypted)) : null,

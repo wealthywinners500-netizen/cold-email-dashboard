@@ -70,6 +70,8 @@ export default function JobDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [sseConnected, setSseConnected] = useState(false);
+  const [dryRunExecuting, setDryRunExecuting] = useState(false);
+  const dryRunAbortRef = useRef(false);
 
   const eventSourceRef = useRef<EventSource | null>(null);
   const retryCountRef = useRef(0);
@@ -234,6 +236,104 @@ export default function JobDetailPage() {
     };
   }, [jobId]);
 
+  // Client-driven DryRun execution loop
+  const executeDryRunLoop = useCallback(async () => {
+    if (dryRunExecuting) return;
+    setDryRunExecuting(true);
+    dryRunAbortRef.current = false;
+
+    try {
+      while (!dryRunAbortRef.current) {
+        const res = await fetch(`/api/provisioning/${jobId}/execute-step`, {
+          method: "POST",
+        });
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({ error: "Request failed" }));
+          setLogLines((prev) => [
+            ...prev,
+            { timestamp: new Date().toLocaleTimeString(), text: `ERROR: ${errData.error}`, type: "stderr" as const },
+          ]);
+          break;
+        }
+
+        const data = await res.json();
+
+        // Update step status
+        if (data.step && data.status === "completed") {
+          setSteps((prev) =>
+            prev.map((s) =>
+              s.step_type === data.step
+                ? { ...s, status: "completed" as StepStatus, duration_ms: data.duration_ms }
+                : s
+            )
+          );
+          setLogLines((prev) => [
+            ...prev,
+            {
+              timestamp: new Date().toLocaleTimeString(),
+              text: `✓ ${STEP_NAMES[data.step as StepType] || data.step} completed (${data.duration_ms}ms)`,
+              type: "stdout" as const,
+            },
+          ]);
+        }
+
+        // Update job progress
+        setJob((prev) =>
+          prev ? { ...prev, progress_pct: data.progress_pct, status: "in_progress" } : prev
+        );
+
+        if (data.allComplete) {
+          setJob((prev) =>
+            prev ? { ...prev, status: "completed", progress_pct: 100 } : prev
+          );
+          setLogLines((prev) => [
+            ...prev,
+            { timestamp: new Date().toLocaleTimeString(), text: "🎉 Provisioning complete! Server pair is ready.", type: "stdout" as const },
+          ]);
+          // Refresh to get server_pair_id
+          const refreshRes = await fetch(`/api/provisioning/${jobId}`);
+          if (refreshRes.ok) {
+            const refreshData = await refreshRes.json();
+            setJob(refreshData.job);
+            setSteps(refreshData.steps);
+          }
+          break;
+        }
+
+        if (data.status === "failed") {
+          setJob((prev) =>
+            prev ? { ...prev, status: "failed", error_message: data.error } : prev
+          );
+          if (data.step) {
+            setSteps((prev) =>
+              prev.map((s) =>
+                s.step_type === data.step
+                  ? { ...s, status: "failed" as StepStatus, error_message: data.error }
+                  : s
+              )
+            );
+          }
+          setLogLines((prev) => [
+            ...prev,
+            { timestamp: new Date().toLocaleTimeString(), text: `ERROR: ${data.error}`, type: "stderr" as const },
+          ]);
+          break;
+        }
+
+        // Visual pacing
+        await new Promise((r) => setTimeout(r, 800));
+      }
+    } catch (err) {
+      setLogLines((prev) => [
+        ...prev,
+        { timestamp: new Date().toLocaleTimeString(), text: `Network error: ${err}`, type: "stderr" as const },
+      ]);
+    } finally {
+      setDryRunExecuting(false);
+    }
+  }, [jobId, dryRunExecuting]);
+
   useEffect(() => {
     if (job && (job.status === "pending" || job.status === "in_progress")) {
       connectSSE();
@@ -243,6 +343,20 @@ export default function JobDetailPage() {
       eventSourceRef.current?.close();
     };
   }, [job?.status, connectSSE]);
+
+  // Auto-start DryRun execution when job loads
+  useEffect(() => {
+    if (
+      job &&
+      !dryRunExecuting &&
+      (job.status === "pending" || job.status === "in_progress") &&
+      job.config &&
+      typeof job.config === "object" &&
+      (job.config as Record<string, unknown>).provider_type === "dry_run"
+    ) {
+      executeDryRunLoop();
+    }
+  }, [job?.id, job?.status, job?.config]);
 
   const handleCancel = async () => {
     if (!confirm("Cancel this provisioning job? Any created resources will be rolled back.")) return;
@@ -261,8 +375,18 @@ export default function JobDetailPage() {
   };
 
   const handleRetry = async () => {
-    // Re-enqueue by posting a new job with same params
-    // For now, redirect to the wizard
+    // For DryRun, retry by re-executing the loop
+    if (
+      job?.config &&
+      typeof job.config === "object" &&
+      (job.config as Record<string, unknown>).provider_type === "dry_run"
+    ) {
+      // Reset the failed step to pending so it can be re-executed
+      setJob((prev) => prev ? { ...prev, status: "in_progress", error_message: null } : prev);
+      executeDryRunLoop();
+      return;
+    }
+    // For real providers, redirect to wizard
     router.push("/dashboard/provisioning/new");
   };
 

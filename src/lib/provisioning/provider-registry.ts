@@ -45,6 +45,10 @@ export async function getVPSProvider(
       throw new Error(
         `Custom VPS provider requires manual configuration. Use SSH credentials directly.`
       );
+    case "dry_run": {
+      const { DryRunProvider } = await import("./providers/dry-run");
+      return new DryRunProvider();
+    }
     default: {
       const _exhaustive: never = type;
       throw new Error(`Unknown VPS provider type: ${_exhaustive}`);
@@ -97,6 +101,10 @@ export async function getDNSRegistrar(
       throw new Error(
         `Custom DNS registrar requires manual configuration.`
       );
+    case "dry_run": {
+      const { DryRunRegistrar } = await import("./providers/dry-run");
+      return new DryRunRegistrar();
+    }
     default: {
       const _exhaustive: never = type;
       throw new Error(`Unknown DNS registrar type: ${_exhaustive}`);
@@ -130,6 +138,7 @@ export const VPS_PROVIDER_LABELS: Record<VPSProviderType, string> = {
   contabo: "Contabo",
   ovh: "OVH",
   custom: "Custom / Self-Managed",
+  dry_run: "Test Mode (Simulated)",
 };
 
 export const DNS_REGISTRAR_LABELS: Record<DNSRegistrarType, string> = {
@@ -141,6 +150,7 @@ export const DNS_REGISTRAR_LABELS: Record<DNSRegistrarType, string> = {
   namecom: "Name.com",
   dynadot: "Dynadot",
   custom: "Custom / Self-Managed",
+  dry_run: "Test Mode (Simulated)",
 };
 
 /**

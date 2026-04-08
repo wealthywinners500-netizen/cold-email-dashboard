@@ -173,27 +173,6 @@ async function main() {
     withErrorHandling(handleProcessBounce, "process-bounce")
   );
 
-  // Register process-bounce handler (B10)
-  interface ProcessBouncePayload {
-    messageId: number;
-    bodyText: string;
-    fromEmail: string;
-    orgId: string;
-  }
-
-  await boss.work<ProcessBouncePayload>("process-bounce", async (jobs) => {
-    for (const job of jobs) {
-      console.log(`[Worker] Processing bounce for message ${job.data.messageId}`);
-      try {
-        await handleProcessBounce(job.data);
-        console.log(`[Worker] Bounce job ${job.id} completed successfully`);
-      } catch (err) {
-        console.error(`[Worker] Bounce job ${job.id} failed:`, err);
-        throw err;
-      }
-    }
-  });
-
   // Register provision-server-pair handler (B15-3)
   interface ProvisionPairPayload {
     jobId: string;
@@ -291,6 +270,45 @@ async function main() {
       }
     }
   );
+
+  // --- Provisioning job-polling cron (every 15 seconds) ---
+  // Bridges Vercel (creates jobs) → worker (executes them)
+  // DryRun jobs are excluded — those run via serverless execute-step
+  await boss.schedule("poll-provisioning-jobs", "*/1 * * * *");
+
+  const pollProvisioningJobs = async () => {
+    try {
+      const supabase = getSupabase();
+      const { data: pendingJobs } = await supabase
+        .from("provisioning_jobs")
+        .select("id, config")
+        .eq("status", "pending")
+        .order("created_at", { ascending: true })
+        .limit(1);
+
+      for (const pj of pendingJobs || []) {
+        const provType = (pj.config as Record<string, unknown>)?.provider_type;
+        if (provType === "dry_run") continue; // Skip dry_run — handled serverless
+
+        console.log(`[Worker] Found pending provisioning job ${pj.id}, queuing...`);
+        await boss.send("provision-server-pair", { jobId: pj.id });
+
+        // Mark as queued to prevent double-processing
+        await supabase
+          .from("provisioning_jobs")
+          .update({ status: "in_progress" })
+          .eq("id", pj.id)
+          .eq("status", "pending");
+      }
+    } catch (err) {
+      console.error("[Worker] Provisioning poll failed:", err);
+    }
+  };
+
+  // Poll every 15 seconds using setInterval (pg-boss cron is 1-min minimum)
+  setInterval(pollProvisioningJobs, 15000);
+  // Also run immediately on startup
+  await pollProvisioningJobs();
 
   console.log("[Worker] Email worker is running. Waiting for jobs...");
 

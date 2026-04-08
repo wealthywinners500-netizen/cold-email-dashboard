@@ -34,7 +34,7 @@ async function delay(ms: number): Promise<void> {
 // ============================================
 
 export class DryRunProvider implements VPSProvider {
-  readonly providerType: VPSProviderType = "custom";
+  readonly providerType: VPSProviderType = "dry_run";
   private onLog?: LogCallback;
   private servers: Map<string, ServerInfo> = new Map();
 
@@ -128,7 +128,7 @@ export class DryRunProvider implements VPSProvider {
 // ============================================
 
 export class DryRunRegistrar implements DNSRegistrar {
-  readonly registrarType: DNSRegistrarType = "custom";
+  readonly registrarType: DNSRegistrarType = "dry_run";
   private onLog?: LogCallback;
   private records: Map<string, { id: string; zone: string; type: string; name: string; value: string }> = new Map();
 

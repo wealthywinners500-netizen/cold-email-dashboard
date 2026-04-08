@@ -123,6 +123,10 @@ function getStaticRegions(providerType: string) {
         { id: "us-central-1", name: "St. Louis, MO, USA", slug: "us-central-1", available: true },
         { id: "us-east-1", name: "New York, USA", slug: "us-east-1", available: true },
       ];
+    case "dry_run":
+      return [
+        { id: "demo-dc-1", name: "Demo Datacenter", slug: "demo", available: true },
+      ];
     default:
       return [
         { id: "default", name: "Default Region", slug: "default", available: true },

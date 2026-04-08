@@ -33,8 +33,28 @@ export async function GET() {
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
+    // Auto-seed Test Mode provider for new orgs
+    let providers = data || [];
+    if (providers.length === 0) {
+      const { data: seeded, error: seedError } = await supabase
+        .from("vps_providers")
+        .insert({
+          org_id: orgId,
+          name: "Test Mode (Simulated)",
+          provider_type: "dry_run",
+          is_default: true,
+          port_25_status: "open",
+          config: { auto_seeded: true },
+        })
+        .select()
+        .single();
+      if (!seedError && seeded) {
+        providers = [seeded];
+      }
+    }
+
     // Mask sensitive fields before returning
-    const masked = (data || []).map((p: Record<string, unknown>) => ({
+    const masked = (providers).map((p: Record<string, unknown>) => ({
       ...p,
       api_key_encrypted: p.api_key_encrypted ? maskSecret(String(p.api_key_encrypted)) : null,
       api_secret_encrypted: p.api_secret_encrypted ? maskSecret(String(p.api_secret_encrypted)) : null,
