@@ -9,9 +9,16 @@ export async function GET() {
     const authResult = await auth();
     const { userId, orgId, orgRole, orgSlug } = authResult;
 
+    const supabase = await createAdminClient();
+
+    // List ALL orgs in the table
+    const { data: allOrgs, error: allOrgsError } = await supabase
+      .from("organizations")
+      .select("id, clerk_org_id, name, plan_tier")
+      .limit(20);
+
     let orgLookup = null;
     if (orgId) {
-      const supabase = await createAdminClient();
       const { data, error } = await supabase
         .from("organizations")
         .select("id, clerk_org_id, name, plan_tier")
@@ -26,6 +33,8 @@ export async function GET() {
       orgRole,
       orgSlug,
       orgLookup,
+      allOrgs: allOrgs || [],
+      allOrgsError: allOrgsError?.message || null,
     });
   } catch (error) {
     return NextResponse.json(
