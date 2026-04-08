@@ -426,7 +426,7 @@ export default function ProvidersSection() {
                       prev.filter((x) => x.id !== id)
                     )
                   }
-                  onTest={() => {}}
+                  onTest={() => fetchVps()}
                 />
               ))}
             </div>
@@ -469,7 +469,7 @@ export default function ProvidersSection() {
                       prev.filter((x) => x.id !== id)
                     )
                   }
-                  onTest={() => {}}
+                  onTest={() => fetchDns()}
                 />
               ))}
             </div>

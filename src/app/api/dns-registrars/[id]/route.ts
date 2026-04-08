@@ -1,6 +1,6 @@
 import { auth } from "@clerk/nextjs/server";
 import { createAdminClient } from "@/lib/supabase/server";
-import { encrypt } from "@/lib/provisioning/encryption";
+import { encrypt, decrypt } from "@/lib/provisioning/encryption";
 import { NextResponse } from "next/server";
 
 async function getInternalOrgId(): Promise<string | null> {
@@ -141,10 +141,49 @@ export async function POST(
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
 
-    return NextResponse.json({
-      ok: false,
-      message: `Registrar "${registrar.registrar_type}" test not yet implemented. Coming in B15 Phase 2.`,
-    });
+    // Decrypt credentials and test the registrar connection
+    const apiKey = registrar.api_key_encrypted
+      ? decrypt(registrar.api_key_encrypted)
+      : "";
+    const apiSecret = registrar.api_secret_encrypted
+      ? decrypt(registrar.api_secret_encrypted)
+      : null;
+
+    // dry_run registrar doesn't need real credentials
+    if (registrar.registrar_type === "dry_run") {
+      return NextResponse.json({
+        ok: true,
+        message: "Test Mode registrar is always available.",
+      });
+    }
+
+    // Require API key for real registrars
+    if (!apiKey) {
+      return NextResponse.json({
+        ok: false,
+        message: "No API key configured. Add an API key first.",
+      });
+    }
+
+    try {
+      const { getDNSRegistrar } = await import(
+        "@/lib/provisioning/provider-registry"
+      );
+      const registrarInstance = await getDNSRegistrar(
+        registrar.registrar_type,
+        { apiKey, apiSecret, ...((registrar.config as Record<string, unknown>) || {}) }
+      );
+      const result = await registrarInstance.testConnection();
+      return NextResponse.json(result);
+    } catch (testErr) {
+      return NextResponse.json({
+        ok: false,
+        message:
+          testErr instanceof Error
+            ? testErr.message
+            : "Registrar test failed with unknown error",
+      });
+    }
   } catch {
     return NextResponse.json({ error: "Internal server error" }, { status: 500 });
   }

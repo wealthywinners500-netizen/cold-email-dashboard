@@ -1,6 +1,6 @@
 import { auth } from "@clerk/nextjs/server";
 import { createAdminClient } from "@/lib/supabase/server";
-import { encrypt } from "@/lib/provisioning/encryption";
+import { encrypt, decrypt } from "@/lib/provisioning/encryption";
 import { NextResponse } from "next/server";
 
 async function getInternalOrgId(): Promise<string | null> {
@@ -145,11 +145,49 @@ export async function POST(
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
 
-    // For now, return a placeholder — actual provider implementations come in B15-2
-    return NextResponse.json({
-      ok: false,
-      message: `Provider "${provider.provider_type}" test not yet implemented. Coming in B15 Phase 2.`,
-    });
+    // Decrypt credentials and test the provider connection
+    const apiKey = provider.api_key_encrypted
+      ? decrypt(provider.api_key_encrypted)
+      : "";
+    const apiSecret = provider.api_secret_encrypted
+      ? decrypt(provider.api_secret_encrypted)
+      : null;
+
+    // dry_run provider doesn't need real credentials
+    if (provider.provider_type === "dry_run") {
+      return NextResponse.json({
+        ok: true,
+        message: "Test Mode provider is always available.",
+      });
+    }
+
+    // Require API key for real providers
+    if (!apiKey) {
+      return NextResponse.json({
+        ok: false,
+        message: "No API key configured. Add an API key first.",
+      });
+    }
+
+    try {
+      const { getVPSProvider } = await import(
+        "@/lib/provisioning/provider-registry"
+      );
+      const providerInstance = await getVPSProvider(
+        provider.provider_type,
+        { apiKey, apiSecret, ...((provider.config as Record<string, unknown>) || {}) }
+      );
+      const result = await providerInstance.testConnection();
+      return NextResponse.json(result);
+    } catch (testErr) {
+      return NextResponse.json({
+        ok: false,
+        message:
+          testErr instanceof Error
+            ? testErr.message
+            : "Provider test failed with unknown error",
+      });
+    }
   } catch {
     return NextResponse.json({ error: "Internal server error" }, { status: 500 });
   }
