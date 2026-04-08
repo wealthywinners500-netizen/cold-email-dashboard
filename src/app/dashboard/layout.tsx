@@ -17,7 +17,8 @@ import {
   Inbox,
   Rocket,
 } from "lucide-react";
-import { OrganizationSwitcher, UserButton } from "@clerk/nextjs";
+import { OrganizationSwitcher, UserButton, useOrganizationList, useOrganization } from "@clerk/nextjs";
+import { useRouter } from "next/navigation";
 import Link from "next/link";
 
 const navigationItems = [
@@ -84,8 +85,23 @@ export default function DashboardLayout({
   children: React.ReactNode;
 }) {
   const pathname = usePathname();
+  const router = useRouter();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
+  const { organization } = useOrganization();
+  const { userMemberships, setActive } = useOrganizationList({
+    userMemberships: { infinite: true },
+  });
+
+  // Auto-activate org if user has memberships but no active org
+  useEffect(() => {
+    if (!organization && userMemberships.data && userMemberships.data.length > 0 && setActive) {
+      const firstOrg = userMemberships.data[0].organization;
+      setActive({ organization: firstOrg.id }).then(() => {
+        router.refresh();
+      });
+    }
+  }, [organization, userMemberships.data, setActive, router]);
 
   // Fetch unread inbox count
   useEffect(() => {
