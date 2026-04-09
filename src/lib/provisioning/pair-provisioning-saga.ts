@@ -1,6 +1,22 @@
 // ============================================
-// B15-3: 8-Step Pair Provisioning Saga
-// Maps to the A-H pair deployment pipeline
+// B15-3 REVISED: 8-Step Pair Provisioning Saga
+// Order corrected based on deep research (April 2026):
+//   1. Create VPS        — get IPs first
+//   2. Install HestiaCP  — no DNS needed, bare server + hostname
+//   3. Configure Registrar (NS/glue) — start propagation early (12-48hr)
+//   4. Setup DNS Zones   — A records on BIND, authoritative once NS propagates
+//   5. Set PTR           — REQUIRES forward A to resolve first (Linode validates)
+//   6. Setup Mail Domains — DKIM/SPF/DMARC/accounts
+//   7. Security Hardening + SSL — SpamAssassin kill + LE certs (needs DNS)
+//   8. Verification Gate  — PTR↔A↔HELO, SPF/DKIM/DMARC, blacklists
+//
+// WHY THIS ORDER:
+// - Linode/Hetzner/Vultr PTR APIs validate forward DNS resolves BEFORE accepting rDNS
+//   (returns 400: "Unable to perform lookup" if A record doesn't exist)
+// - HestiaCP install needs NO DNS — just bare server + --hostname flag (local only)
+// - NS/glue set early to start propagation clock (registrars don't validate if NS is running)
+// - DNS zones created after HestiaCP (BIND available) but before PTR (A records needed)
+// - Let's Encrypt HTTP-01 requires A record to resolve globally
 // ============================================
 
 import type { SSHManager } from './ssh-manager';
@@ -71,7 +87,33 @@ async function checkDNSPropagation(
 }
 
 // ============================================
-// Factory: Create the 8-step saga
+// Helper: Check if forward A record resolves to expected IP
+// Used by PTR step to verify readiness before calling VPS provider API
+// ============================================
+
+async function checkForwardDNSResolves(
+  ssh: SSHManager,
+  hostname: string,
+  expectedIP: string,
+  resolvers: string[]
+): Promise<boolean> {
+  for (const resolver of resolvers) {
+    try {
+      const { stdout } = await ssh.exec(
+        `dig @${resolver} ${hostname} A +short 2>/dev/null`,
+        { timeout: 10000 }
+      );
+      const resolvedIP = stdout.trim().split('\n')[0];
+      if (resolvedIP !== expectedIP) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+// ============================================
+// Factory: Create the 8-step saga (CORRECTED ORDER)
 // ============================================
 
 export function createPairProvisioningSaga(
@@ -83,6 +125,7 @@ export function createPairProvisioningSaga(
   return [
     // ========================================
     // Step 1: CREATE_VPS_PAIR (~5 min)
+    // Get IPs first — everything else depends on them
     // ========================================
     {
       name: 'Create VPS Pair',
@@ -185,144 +228,10 @@ export function createPairProvisioningSaga(
     },
 
     // ========================================
-    // Step 2: SET_PTR_RECORDS (~30s)
-    // ========================================
-    {
-      name: 'Set PTR Records',
-      type: 'set_ptr',
-      estimatedDurationMs: 30_000,
-
-      async execute(context: ProvisioningContext): Promise<StepResult> {
-        context.log('[Step 2] Setting PTR records...');
-        const ctx = ctxMeta(context);
-        const server1IP = ctx.server1IP as string;
-        const server2IP = ctx.server2IP as string;
-
-        try {
-          await Promise.all([
-            vpsProvider.setPTR({
-              ip: server1IP,
-              hostname: `mail1.${context.nsDomain}`,
-            }),
-            vpsProvider.setPTR({
-              ip: server2IP,
-              hostname: `mail2.${context.nsDomain}`,
-            }),
-          ]);
-
-          return {
-            success: true,
-            output: `PTR records set: ${server1IP} → mail1.${context.nsDomain}, ${server2IP} → mail2.${context.nsDomain}`,
-          };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-
-          // If provider doesn't support PTR API (e.g., Clouding), mark as manual
-          if (
-            msg.includes('not yet implemented') ||
-            msg.includes('not supported')
-          ) {
-            return {
-              success: true,
-              manualRequired: true,
-              output: `PTR records require manual setup. Set: ${server1IP} → mail1.${context.nsDomain}, ${server2IP} → mail2.${context.nsDomain}`,
-            };
-          }
-
-          return { success: false, error: msg };
-        }
-      },
-
-      async compensate(_context: ProvisioningContext): Promise<void> {
-        // PTR deletion is harmless — no rollback needed
-      },
-    },
-
-    // ========================================
-    // Step 3: CONFIGURE_REGISTRAR_DNS (~1 min)
-    // ========================================
-    {
-      name: 'Configure Registrar DNS',
-      type: 'configure_registrar',
-      estimatedDurationMs: 60_000,
-
-      async execute(context: ProvisioningContext): Promise<StepResult> {
-        context.log('[Step 3] Configuring registrar DNS...');
-        const ctx = ctxMeta(context);
-        const server1IP = ctx.server1IP as string;
-        const server2IP = ctx.server2IP as string;
-
-        try {
-          // Set nameservers
-          await dnsRegistrar.setNameservers(context.nsDomain, [
-            `ns1.${context.nsDomain}`,
-            `ns2.${context.nsDomain}`,
-          ]);
-
-          // Set glue records
-          await dnsRegistrar.setGlueRecords(context.nsDomain, [
-            { hostname: `ns1.${context.nsDomain}`, ip: server1IP },
-            { hostname: `ns2.${context.nsDomain}`, ip: server2IP },
-          ]);
-
-          context.log('[Step 3] NS and glue records set. Waiting for propagation...');
-
-          // Wait for propagation (poll DNS resolvers)
-          const resolvers = ['8.8.8.8', '1.1.1.1'];
-          let propagated = false;
-
-          try {
-            await pollUntil(
-              async () => {
-                return await checkDNSPropagation(
-                  ssh1,
-                  context.nsDomain,
-                  'NS',
-                  resolvers
-                );
-              },
-              15_000,
-              600_000, // 10 min timeout
-              'NS record propagation'
-            );
-            propagated = true;
-          } catch {
-            // Timeout — mark as needs attention but don't fail
-          }
-
-          if (!propagated) {
-            return {
-              success: true,
-              manualRequired: true,
-              output: 'DNS NS/glue records set but propagation not confirmed after 10 minutes. Check manually.',
-            };
-          }
-
-          return {
-            success: true,
-            output: `DNS configured: ns1/ns2.${context.nsDomain} → ${server1IP}/${server2IP}`,
-          };
-        } catch (err) {
-          return {
-            success: false,
-            error: err instanceof Error ? err.message : String(err),
-          };
-        }
-      },
-
-      async compensate(context: ProvisioningContext): Promise<void> {
-        // Best-effort: try to revert nameservers to defaults
-        try {
-          await dnsRegistrar.setNameservers(context.nsDomain, []);
-          context.log('[Compensate] Reverted nameservers');
-        } catch (err) {
-          context.log(`[Compensate] Could not revert nameservers: ${err}`);
-        }
-      },
-    },
-
-    // ========================================
-    // Step 4: INSTALL_HESTIACP (~15 min)
+    // Step 2: INSTALL_HESTIACP (~15 min)
+    // No DNS required — bare server + hostname flag (local only)
+    // Research confirms: --hostname only sets /etc/hostname locally,
+    // does NOT validate DNS resolution
     // ========================================
     {
       name: 'Install HestiaCP',
@@ -330,7 +239,7 @@ export function createPairProvisioningSaga(
       estimatedDurationMs: 900_000,
 
       async execute(context: ProvisioningContext): Promise<StepResult> {
-        context.log('[Step 4] Installing HestiaCP on both servers...');
+        context.log('[Step 2] Installing HestiaCP on both servers...');
         const ctx = ctxMeta(context);
         const password = (ctx.serverPassword as string) || 'changeme123';
         const outputLines: string[] = [];
@@ -343,7 +252,7 @@ export function createPairProvisioningSaga(
           try {
             await ssh1.exec('v-list-sys-config 2>/dev/null', { timeout: 10000 });
             s1Installed = true;
-            context.log('[Step 4] Server 1: HestiaCP already installed');
+            context.log('[Step 2] Server 1: HestiaCP already installed');
           } catch {
             // Not installed
           }
@@ -351,7 +260,7 @@ export function createPairProvisioningSaga(
           try {
             await ssh2.exec('v-list-sys-config 2>/dev/null', { timeout: 10000 });
             s2Installed = true;
-            context.log('[Step 4] Server 2: HestiaCP already installed');
+            context.log('[Step 2] Server 2: HestiaCP already installed');
           } catch {
             // Not installed
           }
@@ -366,10 +275,10 @@ export function createPairProvisioningSaga(
                 password,
                 onProgress: (line) => {
                   outputLines.push(`[S1] ${line}`);
-                  context.log(`[Step 4][S1] ${line}`);
+                  context.log(`[Step 2][S1] ${line}`);
                 },
               }).then(() => {
-                context.log('[Step 4] Server 1: HestiaCP installed');
+                context.log('[Step 2] Server 1: HestiaCP installed');
               })
             );
           }
@@ -382,10 +291,10 @@ export function createPairProvisioningSaga(
                 password,
                 onProgress: (line) => {
                   outputLines.push(`[S2] ${line}`);
-                  context.log(`[Step 4][S2] ${line}`);
+                  context.log(`[Step 2][S2] ${line}`);
                 },
               }).then(() => {
-                context.log('[Step 4] Server 2: HestiaCP installed');
+                context.log('[Step 2] Server 2: HestiaCP installed');
               })
             );
           }
@@ -420,7 +329,92 @@ export function createPairProvisioningSaga(
     },
 
     // ========================================
-    // Step 5: SETUP_DNS_ZONES (~2 min)
+    // Step 3: CONFIGURE_REGISTRAR_DNS (~1 min + propagation)
+    // Set NS/glue EARLY to start the 12-48hr propagation clock.
+    // Research: Registrars (IONOS) don't validate if NS is running.
+    // RFC 2308: Resolvers cache SERVFAIL for max 5 min — no permanent damage.
+    // Propagation runs in parallel with steps 4-6.
+    // ========================================
+    {
+      name: 'Configure Registrar DNS',
+      type: 'configure_registrar',
+      estimatedDurationMs: 60_000,
+
+      async execute(context: ProvisioningContext): Promise<StepResult> {
+        context.log('[Step 3] Configuring registrar DNS (NS + glue records)...');
+        const ctx = ctxMeta(context);
+        const server1IP = ctx.server1IP as string;
+        const server2IP = ctx.server2IP as string;
+
+        try {
+          // Set nameservers
+          await dnsRegistrar.setNameservers(context.nsDomain, [
+            `ns1.${context.nsDomain}`,
+            `ns2.${context.nsDomain}`,
+          ]);
+
+          // Set glue records
+          await dnsRegistrar.setGlueRecords(context.nsDomain, [
+            { hostname: `ns1.${context.nsDomain}`, ip: server1IP },
+            { hostname: `ns2.${context.nsDomain}`, ip: server2IP },
+          ]);
+
+          context.log('[Step 3] NS and glue records submitted to registrar.');
+          context.log('[Step 3] Propagation started — will take 12-48 hours globally.');
+          context.log('[Step 3] Continuing setup in parallel (no need to wait for full propagation).');
+
+          // Brief propagation check — but DON'T block on it
+          // NS propagation takes hours; we just verify the registrar accepted the records
+          let earlyPropagation = false;
+          try {
+            await pollUntil(
+              async () => {
+                return await checkDNSPropagation(
+                  ssh1,
+                  context.nsDomain,
+                  'NS',
+                  ['8.8.8.8', '1.1.1.1']
+                );
+              },
+              15_000,
+              120_000, // 2 min quick check — don't block longer
+              'NS record early propagation check'
+            );
+            earlyPropagation = true;
+          } catch {
+            // Expected — propagation takes time. Not a failure.
+          }
+
+          return {
+            success: true,
+            output: earlyPropagation
+              ? `DNS configured: ns1/ns2.${context.nsDomain} → ${server1IP}/${server2IP}. Early propagation confirmed.`
+              : `DNS configured: ns1/ns2.${context.nsDomain} → ${server1IP}/${server2IP}. Propagation in progress (expected 12-48hr).`,
+          };
+        } catch (err) {
+          return {
+            success: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      },
+
+      async compensate(context: ProvisioningContext): Promise<void> {
+        // Best-effort: try to revert nameservers to defaults
+        try {
+          await dnsRegistrar.setNameservers(context.nsDomain, []);
+          context.log('[Compensate] Reverted nameservers');
+        } catch (err) {
+          context.log(`[Compensate] Could not revert nameservers: ${err}`);
+        }
+      },
+    },
+
+    // ========================================
+    // Step 4: SETUP_DNS_ZONES (~2 min)
+    // Creates A records on HestiaCP's BIND server.
+    // These become globally authoritative once NS propagation completes.
+    // Must come before PTR (Step 5) because Linode validates forward DNS.
     // ========================================
     {
       name: 'Setup DNS Zones',
@@ -428,14 +422,14 @@ export function createPairProvisioningSaga(
       estimatedDurationMs: 120_000,
 
       async execute(context: ProvisioningContext): Promise<StepResult> {
-        context.log('[Step 5] Setting up DNS zones...');
+        context.log('[Step 4] Setting up DNS zones...');
         const ctx = ctxMeta(context);
         const server1IP = ctx.server1IP as string;
         const server2IP = ctx.server2IP as string;
 
         try {
           // Create NS domain zone on Server 1
-          context.log(`[Step 5] Creating NS zone: ${context.nsDomain}`);
+          context.log(`[Step 4] Creating NS zone: ${context.nsDomain}`);
           await createDNSZone(ssh1, {
             domain: context.nsDomain,
             server1IP,
@@ -446,7 +440,7 @@ export function createPairProvisioningSaga(
 
           // Create zones for all sending domains on Server 1
           for (const domain of context.sendingDomains) {
-            context.log(`[Step 5] Creating zone: ${domain}`);
+            context.log(`[Step 4] Creating zone: ${domain}`);
             await createDNSZone(ssh1, {
               domain,
               server1IP,
@@ -457,14 +451,14 @@ export function createPairProvisioningSaga(
           }
 
           // Replicate ALL zones to Server 2
-          context.log('[Step 5] Replicating NS zone to Server 2...');
+          context.log('[Step 4] Replicating NS zone to Server 2...');
           await replicateZone(ssh1, ssh2, {
             domain: context.nsDomain,
             includeMailDomains: false,
           });
 
           for (const domain of context.sendingDomains) {
-            context.log(`[Step 5] Replicating zone ${domain} to Server 2...`);
+            context.log(`[Step 4] Replicating zone ${domain} to Server 2...`);
             await replicateZone(ssh1, ssh2, {
               domain,
               includeMailDomains: false,
@@ -507,7 +501,145 @@ export function createPairProvisioningSaga(
     },
 
     // ========================================
+    // Step 5: SET_PTR_RECORDS (~30s-30min)
+    // CRITICAL: Linode/Hetzner/Vultr validate that forward A record
+    // resolves to the IP BEFORE accepting rDNS. Must come AFTER DNS zones.
+    // Implements exponential backoff retry because DNS propagation
+    // from HestiaCP's BIND → global resolvers takes time.
+    // ========================================
+    {
+      name: 'Set PTR Records',
+      type: 'set_ptr',
+      estimatedDurationMs: 300_000, // Up to 5 min with retries
+
+      async execute(context: ProvisioningContext): Promise<StepResult> {
+        context.log('[Step 5] Setting PTR records...');
+        context.log('[Step 5] Waiting for forward DNS (A records) to propagate before setting rDNS...');
+        const ctx = ctxMeta(context);
+        const server1IP = ctx.server1IP as string;
+        const server2IP = ctx.server2IP as string;
+
+        try {
+          // Wait for forward DNS to resolve before attempting PTR
+          // Linode validates forward A → IP match before accepting rDNS
+          const resolvers = ['8.8.8.8', '1.1.1.1', '9.9.9.9'];
+
+          // Poll until A records resolve (with 10-minute timeout)
+          let forwardDNSReady = false;
+          try {
+            await pollUntil(
+              async () => {
+                const mail1Resolves = await checkForwardDNSResolves(
+                  ssh1,
+                  `mail1.${context.nsDomain}`,
+                  server1IP,
+                  ['8.8.8.8'] // Check at least one resolver
+                );
+                const mail2Resolves = await checkForwardDNSResolves(
+                  ssh1,
+                  `mail2.${context.nsDomain}`,
+                  server2IP,
+                  ['8.8.8.8']
+                );
+                return mail1Resolves && mail2Resolves;
+              },
+              30_000, // Check every 30 seconds
+              600_000, // 10 minute timeout
+              'Forward DNS A records to resolve'
+            );
+            forwardDNSReady = true;
+            context.log('[Step 5] Forward DNS confirmed — A records resolving correctly.');
+          } catch {
+            context.log('[Step 5] Forward DNS not yet propagated after 10 minutes.');
+            context.log('[Step 5] Attempting PTR anyway (provider may have internal resolution)...');
+          }
+
+          // Attempt to set PTR with exponential backoff retry
+          const retryDelays = [0, 60_000, 180_000, 300_000]; // 0s, 1min, 3min, 5min
+          let ptrSuccess = false;
+          let lastError = '';
+
+          for (let attempt = 0; attempt < retryDelays.length; attempt++) {
+            if (attempt > 0) {
+              context.log(`[Step 5] PTR retry ${attempt}/${retryDelays.length - 1} — waiting ${retryDelays[attempt] / 1000}s...`);
+              await new Promise((r) => setTimeout(r, retryDelays[attempt]));
+            }
+
+            try {
+              await Promise.all([
+                vpsProvider.setPTR({
+                  ip: server1IP,
+                  hostname: `mail1.${context.nsDomain}`,
+                }),
+                vpsProvider.setPTR({
+                  ip: server2IP,
+                  hostname: `mail2.${context.nsDomain}`,
+                }),
+              ]);
+              ptrSuccess = true;
+              context.log(`[Step 5] PTR records set successfully on attempt ${attempt + 1}.`);
+              break;
+            } catch (err) {
+              lastError = err instanceof Error ? err.message : String(err);
+
+              // If provider doesn't support PTR API (e.g., Clouding), mark as manual
+              if (
+                lastError.includes('not yet implemented') ||
+                lastError.includes('not supported')
+              ) {
+                return {
+                  success: true,
+                  manualRequired: true,
+                  output: `PTR records require manual setup. Set: ${server1IP} → mail1.${context.nsDomain}, ${server2IP} → mail2.${context.nsDomain}`,
+                };
+              }
+
+              // If it's a DNS lookup failure, retry (propagation not complete yet)
+              if (
+                lastError.includes('unable to perform a lookup') ||
+                lastError.includes('Unable to look up') ||
+                lastError.includes('400')
+              ) {
+                context.log(`[Step 5] PTR attempt ${attempt + 1} failed: forward DNS not yet visible to provider. Will retry...`);
+                continue;
+              }
+
+              // Unknown error — don't retry
+              context.log(`[Step 5] PTR attempt ${attempt + 1} failed with unexpected error: ${lastError}`);
+              break;
+            }
+          }
+
+          if (ptrSuccess) {
+            return {
+              success: true,
+              output: `PTR records set: ${server1IP} → mail1.${context.nsDomain}, ${server2IP} → mail2.${context.nsDomain}`,
+            };
+          }
+
+          // All retries exhausted — mark as manual required (don't fail the whole saga)
+          return {
+            success: true,
+            manualRequired: true,
+            output: `PTR records could not be set automatically (DNS propagation pending). Last error: ${lastError}. Manual setup required: ${server1IP} → mail1.${context.nsDomain}, ${server2IP} → mail2.${context.nsDomain}`,
+          };
+        } catch (err) {
+          return {
+            success: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      },
+
+      async compensate(_context: ProvisioningContext): Promise<void> {
+        // PTR deletion is harmless — no rollback needed
+      },
+    },
+
+    // ========================================
     // Step 6: SETUP_MAIL_DOMAINS (~3 min × 10 domains)
+    // DKIM, SPF, DMARC, mail accounts on all sending domains.
+    // Must come after DNS zones (Step 4) — needs zones to add records.
     // ========================================
     {
       name: 'Setup Mail Domains',
@@ -616,37 +748,59 @@ export function createPairProvisioningSaga(
     },
 
     // ========================================
-    // Step 7: SECURITY_HARDENING (~1 min)
+    // Step 7: SECURITY_HARDENING + SSL (~1-3 min)
+    // SpamAssassin/ClamAV/fail2ban kill + Let's Encrypt certs.
+    // LE HTTP-01 requires A record to resolve globally.
+    // If LE fails (DNS not propagated), hardening still succeeds —
+    // mail works with self-signed certs. LE can be retried later.
     // ========================================
     {
       name: 'Security Hardening',
       type: 'security_hardening',
-      estimatedDurationMs: 60_000,
+      estimatedDurationMs: 180_000,
 
       async execute(context: ProvisioningContext): Promise<StepResult> {
         context.log('[Step 7] Running security hardening...');
 
         try {
-          // Harden both servers
+          // Harden both servers (SpamAssassin, ClamAV, fail2ban)
           await Promise.all([
             hardenSecurity(ssh1),
             hardenSecurity(ssh2),
           ]);
 
-          context.log('[Step 7] Security hardening complete. Issuing SSL certs...');
+          context.log('[Step 7] Security hardening complete. Attempting SSL certs...');
 
-          // Issue hostname SSL certs
-          await issueSSLCert(ssh1, {
-            domain: `mail1.${context.nsDomain}`,
-            isHostname: true,
-          });
-          await issueSSLCert(ssh2, {
-            domain: `mail2.${context.nsDomain}`,
-            isHostname: true,
-          });
+          // Track SSL results — LE may fail if DNS hasn't propagated globally yet
+          const sslErrors: string[] = [];
+          let hostnameSSLSuccess = false;
+
+          // Issue hostname SSL certs (requires DNS to resolve)
+          try {
+            await issueSSLCert(ssh1, {
+              domain: `mail1.${context.nsDomain}`,
+              isHostname: true,
+            });
+            hostnameSSLSuccess = true;
+            context.log('[Step 7] Server 1 hostname SSL cert issued.');
+          } catch (err) {
+            sslErrors.push(`S1 hostname: ${err}`);
+            context.log(`[Step 7] Server 1 hostname SSL failed (DNS may not have propagated). Mail works with self-signed cert.`);
+          }
+
+          try {
+            await issueSSLCert(ssh2, {
+              domain: `mail2.${context.nsDomain}`,
+              isHostname: true,
+            });
+            if (hostnameSSLSuccess) hostnameSSLSuccess = true;
+            context.log('[Step 7] Server 2 hostname SSL cert issued.');
+          } catch (err) {
+            sslErrors.push(`S2 hostname: ${err}`);
+            context.log(`[Step 7] Server 2 hostname SSL failed (DNS may not have propagated). Mail works with self-signed cert.`);
+          }
 
           // Issue SSL for all sending domains on both servers
-          const sslErrors: string[] = [];
           for (const domain of context.sendingDomains) {
             try {
               await issueSSLCert(ssh1, { domain, isHostname: false });
@@ -660,11 +814,18 @@ export function createPairProvisioningSaga(
             }
           }
 
-          const output = sslErrors.length > 0
-            ? `Hardened + SSL issued. ${sslErrors.length} SSL warnings: ${sslErrors.join('; ')}`
-            : `Hardened + SSL issued for ${context.sendingDomains.length + 1} domains on both servers.`;
+          if (sslErrors.length > 0) {
+            return {
+              success: true,
+              manualRequired: true,
+              output: `Hardened successfully. ${sslErrors.length} SSL certs failed (DNS propagation likely pending — mail works with self-signed certs, retry LE later): ${sslErrors.join('; ')}`,
+            };
+          }
 
-          return { success: true, output };
+          return {
+            success: true,
+            output: `Hardened + SSL issued for ${context.sendingDomains.length + 1} domains on both servers.`,
+          };
         } catch (err) {
           return {
             success: false,
@@ -680,6 +841,8 @@ export function createPairProvisioningSaga(
 
     // ========================================
     // Step 8: VERIFICATION_GATE (~2 min)
+    // PTR↔A↔HELO alignment, SPF/DKIM/DMARC, blacklists.
+    // Issues that can't be auto-fixed are flagged as manual_required.
     // ========================================
     {
       name: 'Verification Gate',

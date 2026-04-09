@@ -145,16 +145,17 @@ export async function POST(req: Request) {
       );
     }
 
-    // Create 8 provisioning step rows
+    // Create 8 provisioning step rows (order corrected April 2026 — deep research proved
+    // PTR must come AFTER DNS zones because Linode/Hetzner/Vultr validate forward A records)
     const stepTypes = [
-      "create_vps",
-      "set_ptr",
-      "configure_registrar",
-      "install_hestiacp",
-      "setup_dns_zones",
-      "setup_mail_domains",
-      "security_hardening",
-      "verification_gate",
+      "create_vps",           // 1: Get IPs first
+      "install_hestiacp",     // 2: No DNS needed, bare server
+      "configure_registrar",  // 3: NS/glue early for propagation
+      "setup_dns_zones",      // 4: A records on BIND
+      "set_ptr",              // 5: Requires forward A to resolve
+      "setup_mail_domains",   // 6: DKIM/SPF/DMARC/accounts
+      "security_hardening",   // 7: Kill services + SSL certs
+      "verification_gate",    // 8: PTR↔A↔HELO + blacklists
     ] as const;
 
     for (let i = 0; i < stepTypes.length; i++) {

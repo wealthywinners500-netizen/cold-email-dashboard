@@ -33,15 +33,16 @@ export type ProvisioningStatus =
   | "rolled_back"
   | "cancelled";
 
+// Order matches the corrected provisioning saga (April 2026 deep research)
 export type StepType =
-  | "create_vps"
-  | "set_ptr"
-  | "configure_registrar"
-  | "install_hestiacp"
-  | "setup_dns_zones"
-  | "setup_mail_domains"
-  | "security_hardening"
-  | "verification_gate";
+  | "create_vps"           // Step 1: Get IPs first
+  | "install_hestiacp"     // Step 2: No DNS needed, bare server
+  | "configure_registrar"  // Step 3: NS/glue early for propagation
+  | "setup_dns_zones"      // Step 4: A records on BIND
+  | "set_ptr"              // Step 5: Requires forward A to resolve
+  | "setup_mail_domains"   // Step 6: DKIM/SPF/DMARC/accounts
+  | "security_hardening"   // Step 7: Kill services + SSL certs
+  | "verification_gate";   // Step 8: PTR↔A↔HELO + blacklists
 
 export type StepStatus =
   | "pending"

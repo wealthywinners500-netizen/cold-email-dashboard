@@ -8,14 +8,16 @@ import type { StepType, ProvisioningJobRow, VPSProviderType, DNSRegistrarType } 
 export const dynamic = "force-dynamic";
 
 // Steps that can run in serverless (API calls only, no SSH)
+// Order: create_vps(1), configure_registrar(3), set_ptr(5), verification_gate(8)
 const SERVERLESS_STEPS: StepType[] = [
   "create_vps",
-  "set_ptr",
   "configure_registrar",
+  "set_ptr",
   "verification_gate",
 ];
 
 // Steps that require SSH — dispatch to worker VPS
+// Order: install_hestiacp(2), setup_dns_zones(4), setup_mail_domains(6), security_hardening(7)
 const WORKER_STEPS: StepType[] = [
   "install_hestiacp",
   "setup_dns_zones",
@@ -234,6 +236,9 @@ async function executeServerlessStep(
     }
 
     case "set_ptr": {
+      // CRITICAL: Linode/Hetzner/Vultr validate forward A record resolves BEFORE accepting rDNS.
+      // This step MUST come AFTER setup_dns_zones (Step 4) so A records exist.
+      // Implements exponential backoff retry for DNS propagation delay.
       const vpsConfig: Record<string, unknown> = {
         ...vpsRow.config,
         apiKey: vpsRow.api_key_encrypted ? decrypt(vpsRow.api_key_encrypted) : undefined,
@@ -251,21 +256,46 @@ async function executeServerlessStep(
         throw new Error("Server IPs not available — create_vps step must complete first");
       }
 
-      try {
-        await provider.setPTR({ ip: server1IP, hostname: `mail1.${job.ns_domain}` });
-        await provider.setPTR({ ip: server2IP, hostname: `mail2.${job.ns_domain}` });
-        return { output: `PTR records set: mail1.${job.ns_domain} → ${server1IP}, mail2.${job.ns_domain} → ${server2IP}` };
-      } catch (err) {
-        // Some providers don't support PTR via API (e.g., Clouding)
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes("not supported") || msg.includes("not implemented")) {
-          return {
-            output: `PTR via API not supported by ${vpsRow.provider_type} — manual PTR required`,
-            metadata: { manualRequired: true },
-          };
+      // Retry with exponential backoff (DNS propagation may not be instant)
+      const retryDelays = [0, 60_000, 180_000, 300_000]; // 0s, 1min, 3min, 5min
+      let lastError = "";
+
+      for (let attempt = 0; attempt < retryDelays.length; attempt++) {
+        if (attempt > 0) {
+          await new Promise((r) => setTimeout(r, retryDelays[attempt]));
         }
-        throw err;
+
+        try {
+          await provider.setPTR({ ip: server1IP, hostname: `mail1.${job.ns_domain}` });
+          await provider.setPTR({ ip: server2IP, hostname: `mail2.${job.ns_domain}` });
+          return { output: `PTR records set: mail1.${job.ns_domain} → ${server1IP}, mail2.${job.ns_domain} → ${server2IP}` };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          lastError = msg;
+
+          // Provider doesn't support PTR via API (e.g., Clouding) — no retry
+          if (msg.includes("not supported") || msg.includes("not implemented")) {
+            return {
+              output: `PTR via API not supported by ${vpsRow.provider_type} — manual PTR required`,
+              metadata: { manualRequired: true },
+            };
+          }
+
+          // DNS lookup failure — retry (forward DNS not yet propagated)
+          if (msg.includes("unable to perform a lookup") || msg.includes("Unable to look up") || msg.includes("400")) {
+            continue;
+          }
+
+          // Unknown error — don't retry
+          throw err;
+        }
       }
+
+      // All retries exhausted — mark as manual required
+      return {
+        output: `PTR could not be set automatically after ${retryDelays.length} attempts (DNS propagation pending). Last error: ${lastError}. Manual setup: ${server1IP} → mail1.${job.ns_domain}, ${server2IP} → mail2.${job.ns_domain}`,
+        metadata: { manualRequired: true },
+      };
     }
 
     case "configure_registrar": {
@@ -363,7 +393,8 @@ async function executeServerlessStep(
 }
 
 // ============================================
-// Dispatch SSH steps (4-7) to worker via pg-boss
+// Dispatch SSH steps (2,4,6,7) to worker via pg-boss
+// install_hestiacp(2), setup_dns_zones(4), setup_mail_domains(6), security_hardening(7)
 // ============================================
 async function dispatchToWorker(
   stepType: StepType,
@@ -398,8 +429,8 @@ async function dispatchToWorker(
  * Hybrid execution:
  * - DryRun provider_type → simulate all steps inline (test/demo)
  * - Real providers:
- *   - Steps 1-3, 8 (create_vps, set_ptr, configure_registrar, verification_gate) → serverless
- *   - Steps 4-7 (install_hestiacp, setup_dns_zones, setup_mail_domains, security_hardening) → worker
+ *   - Steps 1,3,5,8 (create_vps, configure_registrar, set_ptr, verification_gate) → serverless
+ *   - Steps 2,4,6,7 (install_hestiacp, setup_dns_zones, setup_mail_domains, security_hardening) → worker
  */
 export async function POST(
   _req: Request,
