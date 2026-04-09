@@ -1,3 +1,4 @@
+export const dynamic = 'force-dynamic';
 
 import { getEmailAccounts } from "@/lib/supabase/queries";
 import EmailAccountsClient from "./email-accounts-client";

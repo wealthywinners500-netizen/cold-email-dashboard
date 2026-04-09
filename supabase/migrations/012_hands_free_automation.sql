@@ -27,4 +27,4 @@ CREATE INDEX IF NOT EXISTS idx_email_send_log_campaign_time
 
 -- Index for tracking event queries
 CREATE INDEX IF NOT EXISTS idx_tracking_events_campaign_time
-  ON tracking_events(campaign_id, timestamp DESC);
+  ON tracking_events(campaign_id, created_at DESC);
