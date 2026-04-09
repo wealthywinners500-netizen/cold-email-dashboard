@@ -23,6 +23,46 @@ const WORKER_STEPS: StepType[] = [
   "security_hardening",
 ];
 
+// ============================================
+// Plan type mapping: wizard size → provider API plan ID
+// ============================================
+const PLAN_TYPE_MAP: Record<string, Record<string, string>> = {
+  linode: {
+    small: "g6-nanode-1",     // 1 vCPU / 1GB RAM / $5/mo
+    medium: "g6-standard-1",  // 1 vCPU / 2GB RAM / $12/mo
+    large: "g6-standard-2",   // 2 vCPU / 4GB RAM / $24/mo
+  },
+  digitalocean: {
+    small: "s-1vcpu-2gb",
+    medium: "s-2vcpu-4gb",
+    large: "s-4vcpu-8gb",
+  },
+  hetzner: {
+    small: "cx22",
+    medium: "cx32",
+    large: "cx42",
+  },
+  vultr: {
+    small: "vc2-1c-2gb",
+    medium: "vc2-2c-4gb",
+    large: "vc2-4c-8gb",
+  },
+  clouding: {
+    small: "0.5C-1G",
+    medium: "1C-2G",
+    large: "2C-4G",
+  },
+};
+
+function resolveProviderPlan(providerType: string, sizeLabel: string): string {
+  const providerPlans = PLAN_TYPE_MAP[providerType];
+  if (providerPlans && providerPlans[sizeLabel]) {
+    return providerPlans[sizeLabel];
+  }
+  // If size is already a provider-specific plan ID (not a generic label), pass through
+  return sizeLabel;
+}
+
 async function getInternalOrgId(): Promise<string | null> {
   const { orgId } = await auth();
   if (!orgId) return null;
@@ -128,17 +168,23 @@ async function executeServerlessStep(
       };
       const provider = await getVPSProvider(vpsRow.provider_type as VPSProviderType, vpsConfig);
 
+      // Read region and size from JOB config (set by wizard), NOT vpsRow config
+      const jobConfig = (job.config || {}) as Record<string, string>;
+      const region = jobConfig.region || "us-east";
+      const sizeLabel = jobConfig.size || "small";
+      const providerPlan = resolveProviderPlan(vpsRow.provider_type, sizeLabel);
+
       // Create two servers
       const server1 = await provider.createServer({
         name: `mail1-${job.ns_domain.replace(/\./g, "-")}`,
-        region: (vpsRow.config as Record<string, string>)?.region || "us-east",
-        size: (vpsRow.config as Record<string, string>)?.size || "g1-small",
+        region,
+        size: providerPlan,
       });
 
       const server2 = await provider.createServer({
         name: `mail2-${job.ns_domain.replace(/\./g, "-")}`,
-        region: (vpsRow.config as Record<string, string>)?.region || "us-east",
-        size: (vpsRow.config as Record<string, string>)?.size || "g1-small",
+        region,
+        size: providerPlan,
       });
 
       // Poll until both are active (max 10 min)
