@@ -123,6 +123,7 @@ export async function installHestiaCP(
   const installCmd = [
     '/tmp/hst-install.sh',
     `--hostname '${hostname}'`,
+    '--user admin',
     `--email '${email}'`,
     `--password '${escapedPassword}'`,
     '--interactive no',
