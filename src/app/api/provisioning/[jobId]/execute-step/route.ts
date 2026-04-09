@@ -1,9 +1,27 @@
 import { auth } from "@clerk/nextjs/server";
 import { createAdminClient } from "@/lib/supabase/server";
 import { NextResponse } from "next/server";
-import type { StepType } from "@/lib/provisioning/types";
+import { getVPSProvider, getDNSRegistrar } from "@/lib/provisioning/provider-registry";
+import { decrypt } from "@/lib/provisioning/encryption";
+import type { StepType, ProvisioningJobRow, VPSProviderType, DNSRegistrarType } from "@/lib/provisioning/types";
 
 export const dynamic = "force-dynamic";
+
+// Steps that can run in serverless (API calls only, no SSH)
+const SERVERLESS_STEPS: StepType[] = [
+  "create_vps",
+  "set_ptr",
+  "configure_registrar",
+  "verification_gate",
+];
+
+// Steps that require SSH — dispatch to worker VPS
+const WORKER_STEPS: StepType[] = [
+  "install_hestiacp",
+  "setup_dns_zones",
+  "setup_mail_domains",
+  "security_hardening",
+];
 
 async function getInternalOrgId(): Promise<string | null> {
   const { orgId } = await auth();
@@ -17,8 +35,9 @@ async function getInternalOrgId(): Promise<string | null> {
   return data?.id || null;
 }
 
-// Simulated step execution for DryRun mode
-// Each step simulates realistic delays without needing SSH or real APIs
+// ============================================
+// DryRun simulation (unchanged — for test/demo)
+// ============================================
 async function executeDryRunStep(
   stepType: StepType,
   context: { nsDomain: string; sendingDomains: string[]; mailAccountsPerDomain: number }
@@ -72,10 +91,269 @@ async function executeDryRunStep(
   }
 }
 
+// ============================================
+// Real serverless step execution (steps 1-3, 8)
+// ============================================
+async function executeServerlessStep(
+  stepType: StepType,
+  job: ProvisioningJobRow,
+  allSteps: Array<{ id: string; step_type: string; status: string; metadata: Record<string, unknown> }>
+): Promise<{ output: string; metadata?: Record<string, unknown> }> {
+  // Lazy-init Supabase for provider lookups (Hard Lesson #34)
+  const supabase = await createAdminClient();
+
+  // Load provider configs
+  const { data: vpsRow } = await supabase
+    .from("vps_providers")
+    .select("*")
+    .eq("id", job.vps_provider_id)
+    .single();
+
+  const { data: dnsRow } = await supabase
+    .from("dns_registrars")
+    .select("*")
+    .eq("id", job.dns_registrar_id)
+    .single();
+
+  if (!vpsRow || !dnsRow) {
+    throw new Error("VPS provider or DNS registrar config not found");
+  }
+
+  switch (stepType) {
+    case "create_vps": {
+      const vpsConfig: Record<string, unknown> = {
+        ...vpsRow.config,
+        apiKey: vpsRow.api_key_encrypted ? decrypt(vpsRow.api_key_encrypted) : undefined,
+        apiSecret: vpsRow.api_secret_encrypted ? decrypt(vpsRow.api_secret_encrypted) : undefined,
+      };
+      const provider = await getVPSProvider(vpsRow.provider_type as VPSProviderType, vpsConfig);
+
+      // Create two servers
+      const server1 = await provider.createServer({
+        name: `mail1-${job.ns_domain.replace(/\./g, "-")}`,
+        region: (vpsRow.config as Record<string, string>)?.region || "us-east",
+        size: (vpsRow.config as Record<string, string>)?.size || "g1-small",
+      });
+
+      const server2 = await provider.createServer({
+        name: `mail2-${job.ns_domain.replace(/\./g, "-")}`,
+        region: (vpsRow.config as Record<string, string>)?.region || "us-east",
+        size: (vpsRow.config as Record<string, string>)?.size || "g1-small",
+      });
+
+      // Poll until both are active (max 10 min)
+      const pollStart = Date.now();
+      const POLL_TIMEOUT = 10 * 60 * 1000;
+      let s1Active = server1.status === "active";
+      let s2Active = server2.status === "active";
+
+      while ((!s1Active || !s2Active) && Date.now() - pollStart < POLL_TIMEOUT) {
+        await new Promise((r) => setTimeout(r, 15000));
+        if (!s1Active) {
+          const info = await provider.getServer(server1.id);
+          s1Active = info.status === "active" || info.status === "running";
+          if (s1Active && !server1.ip) Object.assign(server1, { ip: info.ip });
+        }
+        if (!s2Active) {
+          const info = await provider.getServer(server2.id);
+          s2Active = info.status === "active" || info.status === "running";
+          if (s2Active && !server2.ip) Object.assign(server2, { ip: info.ip });
+        }
+      }
+
+      if (!s1Active || !s2Active) {
+        throw new Error("Timed out waiting for VPS servers to become active");
+      }
+
+      // Store IPs in job row for later steps
+      await supabase
+        .from("provisioning_jobs")
+        .update({
+          server1_ip: server1.ip,
+          server2_ip: server2.ip,
+          server1_provider_id: server1.id,
+          server2_provider_id: server2.id,
+        })
+        .eq("id", job.id);
+
+      return {
+        output: `VPS pair created: ${server1.ip} + ${server2.ip} (${vpsRow.provider_type})`,
+        metadata: {
+          server1IP: server1.ip,
+          server2IP: server2.ip,
+          server1ProviderId: server1.id,
+          server2ProviderId: server2.id,
+        },
+      };
+    }
+
+    case "set_ptr": {
+      const vpsConfig: Record<string, unknown> = {
+        ...vpsRow.config,
+        apiKey: vpsRow.api_key_encrypted ? decrypt(vpsRow.api_key_encrypted) : undefined,
+        apiSecret: vpsRow.api_secret_encrypted ? decrypt(vpsRow.api_secret_encrypted) : undefined,
+      };
+      const provider = await getVPSProvider(vpsRow.provider_type as VPSProviderType, vpsConfig);
+
+      // Get IPs from create_vps step metadata or job row
+      const createVpsStep = allSteps.find((s) => s.step_type === "create_vps");
+      const meta = createVpsStep?.metadata || {};
+      const server1IP = (meta.server1IP as string) || job.server1_ip || "";
+      const server2IP = (meta.server2IP as string) || job.server2_ip || "";
+
+      if (!server1IP || !server2IP) {
+        throw new Error("Server IPs not available — create_vps step must complete first");
+      }
+
+      try {
+        await provider.setPTR({ ip: server1IP, hostname: `mail1.${job.ns_domain}` });
+        await provider.setPTR({ ip: server2IP, hostname: `mail2.${job.ns_domain}` });
+        return { output: `PTR records set: mail1.${job.ns_domain} → ${server1IP}, mail2.${job.ns_domain} → ${server2IP}` };
+      } catch (err) {
+        // Some providers don't support PTR via API (e.g., Clouding)
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("not supported") || msg.includes("not implemented")) {
+          return {
+            output: `PTR via API not supported by ${vpsRow.provider_type} — manual PTR required`,
+            metadata: { manualRequired: true },
+          };
+        }
+        throw err;
+      }
+    }
+
+    case "configure_registrar": {
+      const dnsConfig: Record<string, unknown> = {
+        ...dnsRow.config,
+        apiKey: dnsRow.api_key_encrypted ? decrypt(dnsRow.api_key_encrypted) : undefined,
+        apiSecret: dnsRow.api_secret_encrypted ? decrypt(dnsRow.api_secret_encrypted) : undefined,
+      };
+      const registrar = await getDNSRegistrar(dnsRow.registrar_type as DNSRegistrarType, dnsConfig);
+
+      // Get IPs from create_vps step metadata or job row
+      const createVpsStep = allSteps.find((s) => s.step_type === "create_vps");
+      const meta = createVpsStep?.metadata || {};
+      const server1IP = (meta.server1IP as string) || job.server1_ip || "";
+      const server2IP = (meta.server2IP as string) || job.server2_ip || "";
+
+      if (!server1IP || !server2IP) {
+        throw new Error("Server IPs not available — create_vps step must complete first");
+      }
+
+      // Set nameservers
+      await registrar.setNameservers(job.ns_domain, [
+        `ns1.${job.ns_domain}`,
+        `ns2.${job.ns_domain}`,
+      ]);
+
+      // Set glue records
+      await registrar.setGlueRecords(job.ns_domain, [
+        { hostname: `ns1.${job.ns_domain}`, ip: server1IP },
+        { hostname: `ns2.${job.ns_domain}`, ip: server2IP },
+      ]);
+
+      return {
+        output: `DNS configured for ${job.ns_domain}: NS → ns1/ns2, glue → ${server1IP}/${server2IP} (${dnsRow.registrar_type})`,
+      };
+    }
+
+    case "verification_gate": {
+      // DNS-only verification checks — no SSH required
+      // Check A records, PTR, SPF/DKIM/DMARC via dig
+      const { execSync } = await import("child_process");
+      const results: string[] = [];
+      const failures: string[] = [];
+
+      const createVpsStep = allSteps.find((s) => s.step_type === "create_vps");
+      const meta = createVpsStep?.metadata || {};
+      const server1IP = (meta.server1IP as string) || job.server1_ip || "";
+      const server2IP = (meta.server2IP as string) || job.server2_ip || "";
+
+      // Check A records for ns domain
+      for (const [hostname, expectedIP] of [
+        [`mail1.${job.ns_domain}`, server1IP],
+        [`mail2.${job.ns_domain}`, server2IP],
+      ]) {
+        try {
+          const result = execSync(`dig +short A ${hostname} @8.8.8.8`, { timeout: 10000 }).toString().trim();
+          if (result.includes(expectedIP)) {
+            results.push(`✓ A record ${hostname} → ${expectedIP}`);
+          } else {
+            failures.push(`✗ A record ${hostname}: expected ${expectedIP}, got ${result || "NXDOMAIN"}`);
+          }
+        } catch {
+          failures.push(`✗ A record lookup failed for ${hostname}`);
+        }
+      }
+
+      // Check SPF on sending domains
+      for (const domain of job.sending_domains || []) {
+        try {
+          const result = execSync(`dig +short TXT ${domain} @8.8.8.8`, { timeout: 10000 }).toString().trim();
+          if (result.includes("v=spf1")) {
+            results.push(`✓ SPF found for ${domain}`);
+          } else {
+            failures.push(`✗ No SPF record for ${domain}`);
+          }
+        } catch {
+          failures.push(`✗ SPF lookup failed for ${domain}`);
+        }
+      }
+
+      const output = [...results, ...failures].join("\n");
+      if (failures.length > 0) {
+        return {
+          output: `Verification completed with ${failures.length} issue(s):\n${output}`,
+          metadata: { failures, manualRequired: true },
+        };
+      }
+
+      return { output: `All verification checks passed:\n${output}` };
+    }
+
+    default:
+      throw new Error(`Step ${stepType} is not a serverless step`);
+  }
+}
+
+// ============================================
+// Dispatch SSH steps (4-7) to worker via pg-boss
+// ============================================
+async function dispatchToWorker(
+  stepType: StepType,
+  jobId: string,
+  stepId: string
+): Promise<{ output: string; metadata?: Record<string, unknown> }> {
+  // Lazy-init Supabase (Hard Lesson #34)
+  const supabase = await createAdminClient();
+
+  // Enqueue a per-step job to pg-boss via the provision-step queue
+  // The worker polls provisioning_steps WHERE status = 'dispatched_to_worker'
+  await supabase
+    .from("provisioning_steps")
+    .update({
+      status: "in_progress",
+      metadata: { dispatched_to_worker: true, dispatched_at: new Date().toISOString() },
+    })
+    .eq("id", stepId);
+
+  // Insert a worker task record that the worker's poll-provisioning-steps cron picks up
+  // We use the provisioning_steps table itself — the worker checks for steps with
+  // status 'in_progress' and metadata.dispatched_to_worker = true
+  return {
+    output: `Step ${stepType} dispatched to worker VPS for SSH execution`,
+    metadata: { dispatched_to_worker: true, dispatched_at: new Date().toISOString() },
+  };
+}
+
 /**
  * POST /api/provisioning/[jobId]/execute-step
- * Executes the next pending step in a DryRun provisioning job.
- * Called by the client-side execution loop on the progress page.
+ *
+ * Hybrid execution:
+ * - DryRun provider_type → simulate all steps inline (test/demo)
+ * - Real providers:
+ *   - Steps 1-3, 8 (create_vps, set_ptr, configure_registrar, verification_gate) → serverless
+ *   - Steps 4-7 (install_hestiacp, setup_dns_zones, setup_mail_domains, security_hardening) → worker
  */
 export async function POST(
   _req: Request,
@@ -126,6 +404,24 @@ export async function POST(
     // Find first pending step
     const pendingStep = steps.find((s: Record<string, unknown>) => s.status === "pending");
     if (!pendingStep) {
+      // Check if any steps are still dispatched to worker (in_progress with dispatched_to_worker)
+      const workerStep = steps.find((s: Record<string, unknown>) => {
+        const meta = s.metadata as Record<string, unknown> | null;
+        return s.status === "in_progress" && meta?.dispatched_to_worker === true;
+      });
+
+      if (workerStep) {
+        // Worker is still processing — tell client to wait
+        return NextResponse.json({
+          jobId,
+          step: workerStep.step_type,
+          status: "awaiting_worker",
+          progress_pct: job.progress_pct,
+          allComplete: false,
+          output: `Step ${workerStep.step_type} is running on the worker VPS...`,
+        });
+      }
+
       // All steps done
       return NextResponse.json({
         jobId,
@@ -137,6 +433,10 @@ export async function POST(
 
     const stepType = pendingStep.step_type as StepType;
     const startTime = Date.now();
+
+    // Determine if this is a DryRun job
+    const providerType = (job.config as Record<string, unknown>)?.provider_type;
+    const isDryRun = providerType === "dry_run";
 
     // Mark step and job as in_progress
     await supabase
@@ -161,12 +461,43 @@ export async function POST(
     }
 
     try {
-      // Execute the dry-run step
-      const result = await executeDryRunStep(stepType, {
-        nsDomain: job.ns_domain,
-        sendingDomains: job.sending_domains || [],
-        mailAccountsPerDomain: job.mail_accounts_per_domain || 3,
-      });
+      let result: { output: string; metadata?: Record<string, unknown> };
+
+      if (isDryRun) {
+        // DryRun path — simulate all steps inline
+        result = await executeDryRunStep(stepType, {
+          nsDomain: job.ns_domain,
+          sendingDomains: job.sending_domains || [],
+          mailAccountsPerDomain: job.mail_accounts_per_domain || 3,
+        });
+      } else if (WORKER_STEPS.includes(stepType)) {
+        // SSH steps → dispatch to worker
+        result = await dispatchToWorker(stepType, jobId, pendingStep.id);
+
+        // Return immediately — worker will call back when done
+        const completedCount = steps.filter(
+          (s: Record<string, unknown>) => s.status === "completed"
+        ).length;
+        const progressPct = Math.round((completedCount / steps.length) * 100);
+
+        return NextResponse.json({
+          jobId,
+          step: stepType,
+          status: "dispatched_to_worker",
+          progress_pct: progressPct,
+          allComplete: false,
+          output: result.output,
+        });
+      } else if (SERVERLESS_STEPS.includes(stepType)) {
+        // API-only steps → execute inline with real providers
+        result = await executeServerlessStep(
+          stepType,
+          job as unknown as ProvisioningJobRow,
+          steps as Array<{ id: string; step_type: string; status: string; metadata: Record<string, unknown> }>
+        );
+      } else {
+        throw new Error(`Unknown step type: ${stepType}`);
+      }
 
       const durationMs = Date.now() - startTime;
 

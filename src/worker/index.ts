@@ -12,6 +12,7 @@ import { handleCampaignPerformanceMonitor } from "./handlers/campaign-performanc
 import { handleDistributeCampaignSends } from "./handlers/distribute-campaign-sends";
 import { handleVerifyNewLeads } from "./handlers/verify-new-leads";
 import { handleProvisionPair } from "./handlers/provision-pair";
+import { handleProvisionStep } from "./handlers/provision-step";
 import { handleRollbackProvision } from "./handlers/rollback-provision";
 import { handleHealthCheck } from "./handlers/health-check";
 import { closeAll } from "../lib/email/smtp-manager";
@@ -50,6 +51,7 @@ async function main() {
     "distribute-campaign-sends",
     "verify-new-leads",
     "provision-server-pair",
+    "provision-step",
     "rollback-provision",
     "server-health-check-cron",
     "server-health-check",
@@ -315,6 +317,33 @@ async function main() {
     }
   );
 
+  // Register provision-step handler (per-step SSH execution via worker bridge)
+  interface ProvisionStepPayload {
+    jobId: string;
+    stepType: "install_hestiacp" | "setup_dns_zones" | "setup_mail_domains" | "security_hardening";
+    stepId: string;
+  }
+
+  await boss.work<ProvisionStepPayload>(
+    "provision-step",
+    {
+      batchSize: 1,
+      pollingIntervalSeconds: 5,
+    },
+    async (jobs) => {
+      for (const job of jobs) {
+        console.log(`[Worker] Starting provision-step job ${job.id} (${job.data.stepType})`);
+        try {
+          await handleProvisionStep(job.data);
+          console.log(`[Worker] Provision-step job ${job.id} completed successfully`);
+        } catch (err) {
+          console.error(`[Worker] Provision-step job ${job.id} failed:`, err);
+          throw err;
+        }
+      }
+    }
+  );
+
   // Register rollback-provision handler (B15-3, B16-hands-free)
   interface RollbackProvisionPayload {
     jobId: string;
@@ -426,6 +455,51 @@ async function main() {
   setInterval(pollProvisioningJobs, 15000);
   // Also run immediately on startup
   await pollProvisioningJobs();
+
+  // --- Poll for dispatched worker steps (worker bridge pattern) ---
+  // The Vercel API marks steps as in_progress with metadata.dispatched_to_worker = true.
+  // This cron picks them up and queues provision-step jobs.
+  const pollDispatchedSteps = async () => {
+    try {
+      const supabase = getSupabase();
+
+      // Find steps dispatched to worker that haven't been queued yet
+      const { data: dispatchedSteps } = await supabase
+        .from("provisioning_steps")
+        .select("id, job_id, step_type, metadata")
+        .eq("status", "in_progress")
+        .order("step_order", { ascending: true })
+        .limit(5);
+
+      for (const step of dispatchedSteps || []) {
+        const meta = step.metadata as Record<string, unknown> | null;
+        if (!meta?.dispatched_to_worker) continue;
+        if (meta.worker_queued) continue; // Already queued
+
+        console.log(`[Worker] Found dispatched step ${step.step_type} for job ${step.job_id}, queuing...`);
+
+        await boss.send("provision-step", {
+          jobId: step.job_id,
+          stepType: step.step_type,
+          stepId: step.id,
+        });
+
+        // Mark as queued to prevent double-processing
+        await supabase
+          .from("provisioning_steps")
+          .update({
+            metadata: { ...meta, worker_queued: true, worker_queued_at: new Date().toISOString() },
+          })
+          .eq("id", step.id);
+      }
+    } catch (err) {
+      console.error("[Worker] Dispatched step poll failed:", err);
+    }
+  };
+
+  // Poll every 10 seconds for dispatched steps
+  setInterval(pollDispatchedSteps, 10000);
+  await pollDispatchedSteps();
 
   console.log("[Worker] Email worker is running. Waiting for jobs...");
 

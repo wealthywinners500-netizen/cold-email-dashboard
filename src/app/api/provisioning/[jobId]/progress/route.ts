@@ -151,13 +151,23 @@ export async function GET(
             message: `Progress: ${latestJob.progress_pct}%`,
           });
 
-          // Send step completion events
+          // Send step completion events and worker dispatch status
           for (const step of latestSteps || []) {
             if (step.status === "completed" && step.duration_ms) {
               send({
                 type: "step_complete",
                 step: step.step_type,
                 duration_ms: step.duration_ms,
+              });
+            }
+
+            // Notify client that a step is running on the worker VPS
+            const stepMeta = step.metadata as Record<string, unknown> | null;
+            if (step.status === "in_progress" && stepMeta?.dispatched_to_worker) {
+              send({
+                type: "worker_step",
+                step: step.step_type,
+                message: `Step ${step.step_type} is running on the worker VPS...`,
               });
             }
           }
