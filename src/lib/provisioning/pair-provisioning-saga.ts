@@ -300,7 +300,10 @@ export function createPairProvisioningSaga(
                   outputLines.push(`[S1] ${line}`);
                   context.log(`[Step 2][S1] ${line}`);
                 },
-              }).then(() => {
+              }).then((result) => {
+                if (!result.success) {
+                  throw new Error('HestiaCP install failed on Server 1 (non-zero exit)');
+                }
                 context.log('[Step 2] Server 1: HestiaCP installed');
               })
             );
@@ -316,7 +319,10 @@ export function createPairProvisioningSaga(
                   outputLines.push(`[S2] ${line}`);
                   context.log(`[Step 2][S2] ${line}`);
                 },
-              }).then(() => {
+              }).then((result) => {
+                if (!result.success) {
+                  throw new Error('HestiaCP install failed on Server 2 (non-zero exit)');
+                }
                 context.log('[Step 2] Server 2: HestiaCP installed');
               })
             );

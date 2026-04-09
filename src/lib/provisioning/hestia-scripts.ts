@@ -104,6 +104,17 @@ export async function installHestiaCP(
     // Not installed, proceed
   }
 
+  // Remove packages that conflict with HestiaCP installer
+  // Linode/DigitalOcean Ubuntu 22.04 images come with ufw pre-installed,
+  // which causes HestiaCP installer to abort with "should be installed on a clean server"
+  onProgress?.('Removing conflicting packages (ufw)...');
+  try {
+    await ssh.exec('DEBIAN_FRONTEND=noninteractive apt-get purge -y ufw 2>/dev/null || true', { timeout: 60000 });
+    await ssh.exec('apt-get autoremove -y 2>/dev/null || true', { timeout: 60000 });
+  } catch {
+    // Ignore — ufw may not be installed on all providers
+  }
+
   // Download installer
   const downloadCmd = 'wget -q https://raw.githubusercontent.com/hestiacp/hestiacp/release/install/hst-install.sh -O /tmp/hst-install.sh && chmod +x /tmp/hst-install.sh';
   await ssh.exec(downloadCmd, { timeout: 60000 });
