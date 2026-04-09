@@ -245,6 +245,29 @@ export function createPairProvisioningSaga(
         const outputLines: string[] = [];
 
         try {
+          // Connect SSH to both servers using IPs from Step 1
+          const server1IP = (ctx.server1IP as string) || context.server1?.ip;
+          const server2IP = (ctx.server2IP as string) || context.server2?.ip;
+
+          if (!server1IP || !server2IP) {
+            return {
+              success: false,
+              error: `Missing server IPs: server1=${server1IP}, server2=${server2IP}`,
+            };
+          }
+
+          context.log(`[Step 2] Connecting SSH to ${server1IP} and ${server2IP}...`);
+
+          // Wait a few seconds for SSH to be ready on fresh instances
+          await new Promise((r) => setTimeout(r, 15000));
+
+          await Promise.all([
+            ssh1.connect(server1IP, 22, 'root', { password }),
+            ssh2.connect(server2IP, 22, 'root', { password }),
+          ]);
+
+          context.log('[Step 2] SSH connected to both servers');
+
           // Check if already installed (idempotent)
           let s1Installed = false;
           let s2Installed = false;

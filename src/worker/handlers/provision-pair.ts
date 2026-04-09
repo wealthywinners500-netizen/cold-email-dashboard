@@ -11,6 +11,7 @@ import { decrypt } from '@/lib/provisioning/encryption';
 import { createSSHCredentials } from '@/lib/supabase/queries';
 import { encrypt } from '@/lib/provisioning/encryption';
 import type { ProvisioningContext, ProvisioningJobRow } from '@/lib/provisioning/types';
+import crypto from 'crypto';
 
 // Plan type mapping: wizard size label → provider-specific API plan ID
 const PLAN_TYPE_MAP: Record<string, Record<string, string>> = {
@@ -91,6 +92,10 @@ export async function handleProvisionPair(
     throw new Error('VPS provider or DNS registrar not found');
   }
 
+  // Generate a consistent root password for BOTH servers
+  // This ensures we can SSH into them after creation
+  const rootPassword = crypto.randomBytes(16).toString('base64url');
+
   const vpsConfig: Record<string, unknown> = {
     ...vpsProviderRow.config,
     apiKey: vpsProviderRow.api_key_encrypted
@@ -99,6 +104,7 @@ export async function handleProvisionPair(
     apiSecret: vpsProviderRow.api_secret_encrypted
       ? decrypt(vpsProviderRow.api_secret_encrypted)
       : undefined,
+    rootPassword, // Pass to provider so both servers get the same password
   };
 
   const dnsConfig: Record<string, unknown> = {
@@ -156,11 +162,12 @@ export async function handleProvisionPair(
     log: (msg: string) => console.log(`[Provision][${jobId}] ${msg}`),
   };
 
-  // Set region and serverSize on context metadata for saga steps to read
-  // The saga uses ctxMeta(context).region and ctxMeta(context).serverSize
+  // Set region, serverSize, and rootPassword on context metadata for saga steps to read
+  // The saga uses ctxMeta(context).region, ctxMeta(context).serverSize, ctxMeta(context).serverPassword
   const ctxAny = context as unknown as Record<string, unknown>;
   ctxAny.region = regionFromWizard;
   ctxAny.serverSize = providerPlan;
+  ctxAny.serverPassword = rootPassword;
 
   // 7. Progress callback — update DB for SSE consumers
   const onProgress = async (pct: number, step: string, output: string) => {
