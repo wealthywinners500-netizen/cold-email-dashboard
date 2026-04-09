@@ -15,9 +15,9 @@ interface SafeClerkProviderProps {
 export function SafeClerkProvider({ children }: SafeClerkProviderProps) {
   const publishableKey = process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 
-  // If no publishable key is set or it's a test key, just render children
-  // This prevents validation errors during static generation
-  if (!publishableKey || publishableKey.startsWith('pk_test')) {
+  // If no publishable key is set, render children without Clerk
+  // This only happens during build/static generation when env vars are absent
+  if (!publishableKey) {
     return <>{children}</>;
   }
 
