@@ -4,6 +4,13 @@ import { handleProcessSequenceStep } from "./handlers/process-sequence-step";
 import { handleCheckNoReply } from "./handlers/check-no-reply";
 import { handleSyncAllAccounts, handleClassifyReply, handleClassifyBatch } from "./handlers/sync-inbox";
 import { handleProcessBounce } from "./handlers/process-bounce";
+import { handleQueueSequenceSteps } from "./handlers/queue-sequence-steps";
+import { handleWarmupIncrement } from "./handlers/warm-up-increment";
+import { handleSmtpConnectionMonitor } from "./handlers/smtp-connection-monitor";
+import { handleAccountDeliverabilityMonitor } from "./handlers/account-deliverability-monitor";
+import { handleCampaignPerformanceMonitor } from "./handlers/campaign-performance-monitor";
+import { handleDistributeCampaignSends } from "./handlers/distribute-campaign-sends";
+import { handleVerifyNewLeads } from "./handlers/verify-new-leads";
 import { handleProvisionPair } from "./handlers/provision-pair";
 import { handleRollbackProvision } from "./handlers/rollback-provision";
 import { handleHealthCheck } from "./handlers/health-check";
@@ -35,6 +42,13 @@ async function main() {
     "check-no-reply",
     "classify-reply",
     "process-bounce",
+    "queue-sequence-steps",
+    "warm-up-increment-cron",
+    "smtp-connection-monitor",
+    "account-deliverability-monitor",
+    "campaign-performance-monitor",
+    "distribute-campaign-sends",
+    "verify-new-leads",
     "provision-server-pair",
     "rollback-provision",
     "server-health-check-cron",
@@ -194,7 +208,89 @@ async function main() {
     withErrorHandling(handleProcessBounce, "process-bounce")
   );
 
-  // Register provision-server-pair handler (B15-3)
+  // Register queue-sequence-steps cron (every 5 minutes)
+  await boss.schedule("queue-sequence-steps", "*/5 * * * *");
+  await boss.work("queue-sequence-steps", async () => {
+    console.log("[Worker] Queuing ready sequence steps...");
+    try {
+      await handleQueueSequenceSteps();
+    } catch (err) {
+      console.error("[Worker] Queue sequence steps failed:", err);
+      throw err;
+    }
+  });
+
+  // Register warm-up-increment-cron (daily at 1 AM)
+  await boss.schedule("warm-up-increment-cron", "0 1 * * *");
+  await boss.work("warm-up-increment-cron", async () => {
+    console.log("[Worker] Running warm-up increment...");
+    try {
+      await handleWarmupIncrement();
+    } catch (err) {
+      console.error("[Worker] Warm-up increment failed:", err);
+      throw err;
+    }
+  });
+
+  // Register smtp-connection-monitor cron (every 15 minutes)
+  await boss.schedule("smtp-connection-monitor", "*/15 * * * *");
+  await boss.work("smtp-connection-monitor", async () => {
+    console.log("[Worker] Monitoring SMTP connections...");
+    try {
+      await handleSmtpConnectionMonitor();
+    } catch (err) {
+      console.error("[Worker] SMTP connection monitor failed:", err);
+      throw err;
+    }
+  });
+
+  // Register account-deliverability-monitor cron (daily at 3 AM)
+  await boss.schedule("account-deliverability-monitor", "0 3 * * *");
+  await boss.work("account-deliverability-monitor", async () => {
+    console.log("[Worker] Monitoring account deliverability...");
+    try {
+      await handleAccountDeliverabilityMonitor();
+    } catch (err) {
+      console.error("[Worker] Account deliverability monitor failed:", err);
+      throw err;
+    }
+  });
+
+  // Register campaign-performance-monitor cron (daily at 4 AM)
+  await boss.schedule("campaign-performance-monitor", "0 4 * * *");
+  await boss.work("campaign-performance-monitor", async () => {
+    console.log("[Worker] Monitoring campaign performance...");
+    try {
+      await handleCampaignPerformanceMonitor();
+    } catch (err) {
+      console.error("[Worker] Campaign performance monitor failed:", err);
+      throw err;
+    }
+  });
+
+  // Register distribute-campaign-sends cron (daily at 6 AM)
+  await boss.schedule("distribute-campaign-sends", "0 6 * * *");
+  await boss.work("distribute-campaign-sends", async () => {
+    console.log("[Worker] Distributing campaign sends...");
+    try {
+      await handleDistributeCampaignSends();
+    } catch (err) {
+      console.error("[Worker] Distribute campaign sends failed:", err);
+      throw err;
+    }
+  });
+
+  // Register verify-new-leads handler
+  interface VerifyNewLeadsPayload {
+    orgId: string;
+  }
+
+  await boss.work<VerifyNewLeadsPayload>(
+    "verify-new-leads",
+    withErrorHandling(handleVerifyNewLeads, "verify-new-leads")
+  );
+
+  // Register provision-server-pair handler (B15-3, B16-hands-free)
   interface ProvisionPairPayload {
     jobId: string;
   }
@@ -219,7 +315,7 @@ async function main() {
     }
   );
 
-  // Register rollback-provision handler (B15-3)
+  // Register rollback-provision handler (B15-3, B16-hands-free)
   interface RollbackProvisionPayload {
     jobId: string;
   }

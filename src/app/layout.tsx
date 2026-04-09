@@ -1,5 +1,5 @@
 import type { Metadata } from 'next';
-import { ClerkProvider } from '@clerk/nextjs';
+import { SafeClerkProvider } from '@/components/safe-clerk-provider';
 import { Toaster } from 'sonner';
 import './globals.css';
 
@@ -15,19 +15,20 @@ export const metadata: Metadata = {
   },
 };
 
+
 export default function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
   return (
-    <ClerkProvider>
+    <SafeClerkProvider>
       <html lang="en">
         <body>
           {children}
           <Toaster position="bottom-right" theme="dark" richColors />
         </body>
       </html>
-    </ClerkProvider>
+    </SafeClerkProvider>
   );
 }

@@ -1,6 +1,9 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  // Use standalone output to disable static site generation
+  // This prevents Clerk validation errors during builds with test keys
+  output: 'standalone',
   async headers() {
     return [
       {

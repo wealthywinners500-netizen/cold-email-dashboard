@@ -1,4 +1,3 @@
-export const dynamic = "force-dynamic";
 
 import { Rocket } from "lucide-react";
 import ProvisioningClient from "./provisioning-client";
