@@ -18,7 +18,7 @@ import {
   Loader2,
   Eye,
 } from "lucide-react";
-import { DomainInput, type DomainStatus } from "@/components/provisioning/domain-input";
+import { DomainInput, type DomainStatus, type RegistrarOption } from "@/components/provisioning/domain-input";
 import type { VPSProviderRow, DNSRegistrarRow, VPSProviderType } from "@/lib/provisioning/types";
 
 // Port 25 status by provider
@@ -443,6 +443,12 @@ export default function NewProvisioningPage() {
                       domains={domains}
                       onDomainsChange={setDomains}
                       maxDomains={10}
+                      registrars={registrars.map((r: DNSRegistrarRow): RegistrarOption => ({
+                        id: r.id,
+                        name: r.name,
+                        registrar_type: r.registrar_type,
+                      }))}
+                      selectedRegistrarId={selectedRegistrar}
                     />
                   </div>
 

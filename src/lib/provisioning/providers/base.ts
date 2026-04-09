@@ -7,6 +7,7 @@ import type {
   ServerInfo,
   PTRParams,
   DNSRecordParams,
+  DomainInfo,
 } from "../types";
 
 /**
@@ -114,6 +115,17 @@ export abstract class BaseDNSRegistrar implements DNSRegistrar {
   abstract createRecord(params: DNSRecordParams): Promise<{ id: string }>;
   abstract deleteRecord(zone: string, recordId: string): Promise<void>;
   abstract testConnection(): Promise<{ ok: boolean; message: string }>;
+
+  /**
+   * Default listDomains() — throws so existing providers
+   * don't break until they implement their own version.
+   */
+  async listDomains(): Promise<DomainInfo[]> {
+    throw new Error(
+      `listDomains() is not implemented for registrar type "${this.registrarType}". ` +
+        `This registrar does not support domain auto-pull.`
+    );
+  }
 
   /**
    * Make an authenticated HTTP request with retry logic.

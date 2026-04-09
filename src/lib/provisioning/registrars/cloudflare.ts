@@ -1,5 +1,5 @@
 import { BaseDNSRegistrar } from "../providers/base";
-import type { DNSRecordParams, DNSRegistrarType } from "../types";
+import type { DNSRecordParams, DNSRegistrarType, DomainInfo } from "../types";
 
 interface CloudflareZoneResponse {
   result: Array<{ id: string; name: string; status: string; name_servers: string[] }>;
@@ -20,6 +20,26 @@ interface CloudflareCreateRecordResponse {
 
 interface CloudflareTokenVerifyResponse {
   result: { status: string };
+}
+
+interface CloudflareDNSRecord {
+  id: string;
+  type: string;
+  name: string;
+  content: string;
+}
+
+interface CloudflareDNSRecordsResponse {
+  result: CloudflareDNSRecord[];
+}
+
+interface CloudflareZonesListResponse {
+  result: Array<{ id: string; name: string; status: string; name_servers: string[] }>;
+  result_info: {
+    page: number;
+    per_page: number;
+    total_pages: number;
+  };
 }
 
 /**
@@ -222,5 +242,76 @@ export class CloudflareRegistrar extends BaseDNSRegistrar {
         message: `Cloudflare API connection failed: ${message}`,
       };
     }
+  }
+
+  /**
+   * List all domains (zones) managed in Cloudflare.
+   * Fetches zones with pagination (50 per page), checks MX records for each,
+   * and maps to DomainInfo format.
+   * Returns: array of DomainInfo with status, nameservers, and isAvailable flag.
+   */
+  async listDomains(): Promise<DomainInfo[]> {
+    this.log("Fetching all zones from Cloudflare...");
+
+    const domains: DomainInfo[] = [];
+    let page = 1;
+    let hasMorePages = true;
+
+    while (hasMorePages) {
+      const url = `${this.baseUrl}/zones?per_page=50&page=${page}`;
+      const response = await this.httpRequest<CloudflareZonesListResponse>(url);
+
+      if (!response.result || response.result.length === 0) {
+        hasMorePages = false;
+        break;
+      }
+
+      // Process each zone
+      for (const zone of response.result) {
+        this.log(`Processing zone: ${zone.name} (ID: ${zone.id})`);
+
+        // Check for MX records
+        let hasMxRecords = false;
+        try {
+          const mxUrl = `${this.baseUrl}/zones/${zone.id}/dns_records?type=MX`;
+          const mxResponse = await this.httpRequest<CloudflareDNSRecordsResponse>(mxUrl);
+          hasMxRecords = (mxResponse.result && mxResponse.result.length > 0) ? true : false;
+        } catch (error) {
+          this.log(`Warning: Could not check MX records for ${zone.name}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+
+        // Map Cloudflare status to DomainInfo status
+        let status: 'active' | 'expired' | 'pending' | 'unknown' = 'unknown';
+        if (zone.status === 'active') {
+          status = 'active';
+        } else if (zone.status === 'pending') {
+          status = 'pending';
+        } else if (zone.status === 'moved') {
+          status = 'unknown';
+        }
+
+        // isAvailable = active AND no MX records
+        const isAvailable = status === 'active' && !hasMxRecords;
+
+        domains.push({
+          domain: zone.name,
+          status,
+          expiresAt: null, // Cloudflare API doesn't provide expiration via zones endpoint
+          hasMxRecords,
+          nameservers: zone.name_servers,
+          isAvailable,
+        });
+      }
+
+      // Check if there are more pages
+      if (response.result_info && response.result_info.page < response.result_info.total_pages) {
+        page++;
+      } else {
+        hasMorePages = false;
+      }
+    }
+
+    this.log(`Total zones fetched: ${domains.length}`);
+    return domains;
   }
 }

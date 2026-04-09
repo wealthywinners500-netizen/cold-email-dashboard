@@ -1,4 +1,4 @@
-import type { DNSRecordParams } from "../types";
+import type { DNSRecordParams, DomainInfo } from "../types";
 import { BaseDNSRegistrar } from "../providers/base";
 
 /**
@@ -260,5 +260,130 @@ export class IonosRegistrar extends BaseDNSRegistrar {
       this.log(`Connection test failed: ${message}`);
       return { ok: false, message };
     }
+  }
+
+  /**
+   * List all domains from IONOS account with MX record status.
+   * GET /api/domains/v1/domainitems with pagination (limit=100, offset=0)
+   * For each domain, check MX records via DNS API.
+   * Returns DomainInfo array with deliverability assessment.
+   */
+  async listDomains(): Promise<DomainInfo[]> {
+    interface DomainItemStatus {
+      provisioning: "ACTIVE" | "INACTIVE" | "EXPIRED" | string;
+    }
+
+    interface DomainItem {
+      name: string;
+      status: DomainItemStatus;
+      expirationDate?: string;
+    }
+
+    interface DomainsApiResponse {
+      items: DomainItem[];
+      totalItems: number;
+    }
+
+    interface MxRecord {
+      name: string;
+      type: string;
+      content: string;
+    }
+
+    interface MxRecordsResponse {
+      records: MxRecord[];
+    }
+
+    const domains: DomainInfo[] = [];
+    let offset = 0;
+    const limit = 100;
+    let totalItems = limit; // Start with limit to ensure at least one iteration
+
+    this.log(`Fetching domains from IONOS account...`);
+
+    // Paginate through all domains
+    while (offset < totalItems) {
+      const url = `${this.baseUrl}/api/domains/v1/domainitems?limit=${limit}&offset=${offset}`;
+
+      try {
+        const response = await this.httpRequest<DomainsApiResponse>(url, {
+          method: "GET",
+        });
+
+        if (!response || !response.items) {
+          this.log(`No domains found at offset ${offset}`);
+          break;
+        }
+
+        totalItems = response.totalItems;
+        this.log(
+          `Fetched ${response.items.length} domains (total: ${totalItems}, offset: ${offset})`
+        );
+
+        // Process each domain
+        for (const domainItem of response.items) {
+          const domainName = domainItem.name;
+          let hasMxRecords: boolean | null = null;
+          let status: "active" | "expired" | "pending" | "unknown" = "unknown";
+
+          // Map provisioning status to our enum
+          if (domainItem.status?.provisioning === "ACTIVE") {
+            status = "active";
+          } else if (domainItem.status?.provisioning === "EXPIRED") {
+            status = "expired";
+          } else if (domainItem.status?.provisioning === "INACTIVE") {
+            status = "pending";
+          }
+
+          // Check for MX records using DNS API
+          try {
+            const zoneId = await this.getZoneId(domainName);
+            const mxUrl = `${this.baseUrl}/dns/v1/zones/${zoneId}/records?type=MX`;
+
+            const mxResponse = await this.httpRequest<MxRecordsResponse>(mxUrl, {
+              method: "GET",
+            });
+
+            hasMxRecords = mxResponse && mxResponse.records && mxResponse.records.length > 0;
+            this.log(`Domain ${domainName}: MX records found = ${hasMxRecords}`);
+          } catch (mxError) {
+            this.log(
+              `Could not check MX records for ${domainName}: ${
+                mxError instanceof Error ? mxError.message : "Unknown error"
+              }`
+            );
+            hasMxRecords = null;
+          }
+
+          // Determine availability: active status + no MX records + not expired
+          const isAvailable = status === "active" && hasMxRecords === false;
+
+          const domainInfo: DomainInfo = {
+            domain: domainName,
+            status,
+            expiresAt: domainItem.expirationDate || null,
+            hasMxRecords,
+            nameservers: [], // IONOS API doesn't provide nameservers in domain list
+            isAvailable,
+          };
+
+          domains.push(domainInfo);
+        }
+
+        offset += limit;
+
+        // Rate limiting: 2.5s delay between paginated requests
+        if (offset < totalItems) {
+          await new Promise((resolve) => setTimeout(resolve, 2500));
+        }
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : "Unknown error";
+        this.log(`Error fetching domains at offset ${offset}: ${errorMsg}`);
+        throw error;
+      }
+    }
+
+    this.log(`Domain listing complete: ${domains.length} domains found`);
+    return domains;
   }
 }

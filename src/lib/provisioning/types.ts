@@ -176,6 +176,16 @@ export interface VPSProvider {
   testConnection(): Promise<{ ok: boolean; message: string }>;
 }
 
+// Domain auto-pull types
+export interface DomainInfo {
+  domain: string;
+  status: 'active' | 'expired' | 'pending' | 'unknown';
+  expiresAt: string | null;
+  hasMxRecords: boolean | null; // null = not checked yet
+  nameservers: string[];
+  isAvailable: boolean; // our determination: no MX, not already used
+}
+
 export interface DNSRegistrar {
   readonly registrarType: DNSRegistrarType;
   setNameservers(domain: string, nameservers: string[]): Promise<void>;
@@ -187,6 +197,7 @@ export interface DNSRegistrar {
   createRecord(params: DNSRecordParams): Promise<{ id: string }>;
   deleteRecord(zone: string, recordId: string): Promise<void>;
   testConnection(): Promise<{ ok: boolean; message: string }>;
+  listDomains(): Promise<DomainInfo[]>;
 }
 
 // Runtime context passed through provisioning saga steps

@@ -1,4 +1,4 @@
-import type { DNSRecordParams, DNSRegistrarType } from "../types";
+import type { DNSRecordParams, DNSRegistrarType, DomainInfo } from "../types";
 import { BaseDNSRegistrar } from "../providers/base";
 
 interface PorkbunResponse {
@@ -6,6 +6,31 @@ interface PorkbunResponse {
   id?: string | number;
   yourIp?: string;
   [key: string]: unknown;
+}
+
+interface PorkbunDomain {
+  domain: string;
+  status: string;
+  expireDate?: string; // Unix timestamp
+  [key: string]: unknown;
+}
+
+interface PorkbunListAllResponse extends PorkbunResponse {
+  domains?: PorkbunDomain[];
+}
+
+interface PorkbunDNSRecord {
+  id: string;
+  type: string;
+  name: string;
+  content: string;
+  ttl: string;
+  prio?: string;
+  [key: string]: unknown;
+}
+
+interface PorkbunRetrieveDNSResponse extends PorkbunResponse {
+  records?: PorkbunDNSRecord[];
 }
 
 /**
@@ -239,6 +264,122 @@ export class PorkbunRegistrar extends BaseDNSRegistrar {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(`deleteRecord failed for ${recordId}: ${message}`);
+    }
+  }
+
+  /**
+   * List all domains in Porkbun account.
+   * POST /domain/listAll with auth in body.
+   * For each domain, fetch MX records to determine availability.
+   * Returns array of DomainInfo with isAvailable = active AND no MX records.
+   */
+  async listDomains(): Promise<DomainInfo[]> {
+    try {
+      this.log("Fetching all domains from Porkbun account...");
+
+      // Step 1: Fetch all domains
+      const listResponse = await this.httpRequest<PorkbunListAllResponse>(
+        `${this.baseUrl}/domain/listAll`,
+        {
+          method: "POST",
+          body: JSON.stringify(this.getAuthBody()),
+        }
+      );
+
+      if (listResponse.status !== "SUCCESS" || !listResponse.domains) {
+        throw new Error(
+          `Failed to list domains: ${listResponse.status || "no domains returned"}`
+        );
+      }
+
+      this.log(`Found ${listResponse.domains.length} domain(s)`);
+
+      // Step 2: For each domain, check MX records with 1.5s rate limiting
+      const domainInfos: DomainInfo[] = [];
+
+      for (let index = 0; index < listResponse.domains.length; index++) {
+        const porkbunDomain = listResponse.domains[index];
+
+        // Add delay between requests (1.5s) except for first request
+        if (index > 0) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+        }
+
+        const domainName = porkbunDomain.domain;
+        let hasMxRecords = false;
+
+        try {
+          // Check MX records
+          const dnsResponse = await this.httpRequest<PorkbunRetrieveDNSResponse>(
+            `${this.baseUrl}/dns/retrieve/${domainName}`,
+            {
+              method: "POST",
+              body: JSON.stringify(this.getAuthBody()),
+            }
+          );
+
+          if (dnsResponse.status === "SUCCESS" && dnsResponse.records) {
+            hasMxRecords = dnsResponse.records.some((record) => record.type === "MX");
+          }
+        } catch (error) {
+          // Log the error but continue processing other domains
+          const message = error instanceof Error ? error.message : String(error);
+          this.log(
+            `Warning: Failed to retrieve MX records for ${domainName}: ${message}`
+          );
+        }
+
+        // Map Porkbun status to DomainInfo status
+        const statusMap: Record<string, 'active' | 'expired' | 'pending' | 'unknown'> = {
+          'Active': 'active',
+          'ACTIVE': 'active',
+          'Expired': 'expired',
+          'EXPIRED': 'expired',
+          'Pending': 'pending',
+          'PENDING': 'pending',
+        };
+
+        const domainStatus: 'active' | 'expired' | 'pending' | 'unknown' =
+          statusMap[porkbunDomain.status] || 'unknown';
+
+        // Parse expireDate: Porkbun returns Unix timestamp
+        let expiresAt: string | null = null;
+        if (porkbunDomain.expireDate) {
+          try {
+            const timestamp = Number(porkbunDomain.expireDate);
+            if (!isNaN(timestamp) && timestamp > 0) {
+              expiresAt = new Date(timestamp * 1000).toISOString();
+            }
+          } catch {
+            // If parsing fails, leave expiresAt as null
+          }
+        }
+
+        // Domain is available if it's active AND has no MX records
+        const isAvailable = domainStatus === 'active' && !hasMxRecords;
+
+        const domainInfo: DomainInfo = {
+          domain: domainName,
+          status: domainStatus,
+          expiresAt,
+          hasMxRecords,
+          nameservers: [], // Porkbun listAll doesn't return nameservers; could fetch separately if needed
+          isAvailable,
+        };
+
+        domainInfos.push(domainInfo);
+        this.log(
+          `Domain ${domainName}: status=${domainStatus}, hasMX=${hasMxRecords}, available=${isAvailable}`
+        );
+      }
+
+      this.log(
+        `Processed ${domainInfos.length} domain(s), ${domainInfos.filter((d) => d.isAvailable).length} available`
+      );
+      return domainInfos;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`listDomains failed: ${message}`);
     }
   }
 }

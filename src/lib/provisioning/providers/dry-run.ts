@@ -13,6 +13,7 @@ import type {
   ServerInfo,
   PTRParams,
   DNSRecordParams,
+  DomainInfo,
 } from "../types";
 
 type LogCallback = (message: string) => void;
@@ -197,5 +198,17 @@ export class DryRunRegistrar implements DNSRegistrar {
     this.log("Testing connection");
     await delay(500);
     return { ok: true, message: "Dry-run registrar is always connected" };
+  }
+
+  async listDomains(): Promise<DomainInfo[]> {
+    await delay(500);
+    this.log("listDomains: returning 5 fake domains");
+    return [
+      { domain: "test-alpha.com", status: "active", expiresAt: "2027-06-15", hasMxRecords: false, nameservers: ["ns1.dry-run.test"], isAvailable: true },
+      { domain: "test-bravo.com", status: "active", expiresAt: "2027-08-22", hasMxRecords: false, nameservers: ["ns1.dry-run.test"], isAvailable: true },
+      { domain: "test-charlie.com", status: "active", expiresAt: "2027-03-10", hasMxRecords: true, nameservers: ["ns1.dry-run.test"], isAvailable: false },
+      { domain: "test-delta.com", status: "active", expiresAt: "2027-11-30", hasMxRecords: false, nameservers: ["ns1.dry-run.test"], isAvailable: true },
+      { domain: "test-echo.com", status: "expired", expiresAt: "2026-01-01", hasMxRecords: false, nameservers: [], isAvailable: false },
+    ];
   }
 }

@@ -1,5 +1,5 @@
 import { BaseDNSRegistrar } from "../providers/base";
-import type { DNSRecordParams } from "../types";
+import type { DNSRecordParams, DomainInfo } from "../types";
 
 /**
  * Namecheap XML API registrar implementation
@@ -387,5 +387,128 @@ export class NamecheapRegistrar extends BaseDNSRegistrar {
         message: `Namecheap connection failed: ${message}`,
       };
     }
+  }
+
+  /**
+   * List all domains from Namecheap account with MX record checking.
+   * 1. Fetch all domains using domains.getList with pagination
+   * 2. For each domain, fetch DNS hosts to check for MX records
+   * 3. Map to DomainInfo format
+   */
+  async listDomains(): Promise<DomainInfo[]> {
+    const domains: DomainInfo[] = [];
+    let page = 1;
+    let hasMore = true;
+
+    while (hasMore) {
+      this.log(`Fetching domains page ${page}`);
+
+      // Fetch domains for this page
+      const listResponse = await this.rawRequest("domains.getList", {
+        ListType: "ALL",
+        Page: page.toString(),
+        PageSize: "100",
+      });
+
+      // Parse total items and current items
+      const totalItemsMatch = listResponse.match(
+        /TotalItems="(\d+)"/
+      );
+      const totalItems = totalItemsMatch ? parseInt(totalItemsMatch[1], 10) : 0;
+
+      // Extract all domain elements from response
+      const domainRegex = /<Domain\s+([^>]*)\s*\/?>/g;
+      let domainMatch;
+      const domainsThisPage: Array<{
+        name: string;
+        isExpired: string;
+      }> = [];
+
+      while ((domainMatch = domainRegex.exec(listResponse)) !== null) {
+        const attrs = domainMatch[1];
+        const attrMap: Record<string, string> = {};
+
+        // Parse attributes: Name="example.com" IsExpired="false"
+        const attrRegex = /(\w+)="([^"]*)"/g;
+        let attrMatch;
+        while ((attrMatch = attrRegex.exec(attrs)) !== null) {
+          attrMap[attrMatch[1]] = attrMatch[2];
+        }
+
+        if (attrMap.Name) {
+          domainsThisPage.push({
+            name: attrMap.Name,
+            isExpired: attrMap.IsExpired || "false",
+          });
+        }
+      }
+
+      this.log(`Found ${domainsThisPage.length} domains on page ${page}`);
+
+      // For each domain, check MX records
+      for (const domainEntry of domainsThisPage) {
+        const domainName = domainEntry.name;
+        const isExpired = domainEntry.isExpired.toLowerCase() === "true";
+
+        this.log(`Checking MX records for ${domainName}`);
+
+        let hasMxRecords = false;
+
+        if (!isExpired) {
+          try {
+            const { sld, tld } = this.parseDomain(domainName);
+            const hostsResponse = await this.rawRequest(
+              "domains.dns.getHosts",
+              {
+                SLD: sld,
+                TLD: tld,
+              }
+            );
+
+            // Check if any MX records exist
+            const mxRecords = this.parseDNSRecords(hostsResponse).filter(
+              (r) => r.type === "MX"
+            );
+            hasMxRecords = mxRecords.length > 0;
+
+            this.log(
+              `Domain ${domainName}: ${hasMxRecords ? "has" : "no"} MX records`
+            );
+          } catch (error) {
+            this.log(
+              `Failed to check MX records for ${domainName}: ${
+                error instanceof Error ? error.message : String(error)
+              }`
+            );
+            hasMxRecords = null as any; // Mark as not checked
+          }
+        }
+
+        // Determine status based on expiration
+        const status = isExpired ? ("expired" as const) : ("active" as const);
+
+        // Domain is available if: not expired AND has no MX records
+        const isAvailable = !isExpired && !hasMxRecords;
+
+        domains.push({
+          domain: domainName,
+          status,
+          expiresAt: null, // Namecheap XML doesn't include expiration date in basic response
+          hasMxRecords,
+          nameservers: [], // Not included in domains.getList response
+          isAvailable,
+        });
+      }
+
+      // Check if there are more pages
+      const pageSize = 100;
+      const currentPage = page;
+      const totalFetched = currentPage * pageSize;
+      hasMore = totalFetched < totalItems;
+      page++;
+    }
+
+    this.log(`Total domains fetched: ${domains.length}`);
+    return domains;
   }
 }
