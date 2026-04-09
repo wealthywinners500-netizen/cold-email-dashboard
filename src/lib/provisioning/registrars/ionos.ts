@@ -11,14 +11,34 @@ import { BaseDNSRegistrar } from "../providers/base";
  * - Auth header: X-API-Key: {prefix}.{key} (apiKey is already concatenated)
  * - Zone operations use /dns/v1/zones endpoints
  * - Record CRUD requires zoneId lookup first
- * - Nameserver update via PUT /domains/{domain}
- * - Glue records created as A records for ns1/ns2 subdomains
+ * - Nameserver + glue records use /domains/v1/domainitems/{uuid}/nameservers (single PUT)
+ * - Domain listing uses /domains/v1/domainitems (response: {count, domains})
+ *
+ * Confirmed endpoints (2026-04-09 curl testing):
+ * - GET  /dns/v1/zones                                     → list DNS zones
+ * - GET  /dns/v1/zones/{zoneId}/records                    → list zone records (array)
+ * - POST /dns/v1/zones/{zoneId}/records                    → create records
+ * - GET  /domains/v1/domainitems?limit=N&offset=N          → list domains {count, domains}
+ * - GET  /domains/v1/domainitems/{uuid}                    → domain detail
+ * - GET  /domains/v1/domainitems/{uuid}/nameservers        → get NS + glue
+ * - PUT  /domains/v1/domainitems/{uuid}/nameservers        → set NS + glue (202 Accepted)
+ *
+ * WRONG endpoints (404 or 400):
+ * - /api/domains/v1/domainitems → 400 "Unsupported serviceId: api"
+ * - /domains/{domainName}       → 404
+ * - /domains/v1/domains/{name}  → 404
  */
 export class IonosRegistrar extends BaseDNSRegistrar {
   readonly registrarType = "ionos";
   private readonly baseUrl = "https://api.hosting.ionos.com";
   private lastRequestTime = 0;
-  private readonly minRequestInterval = 2400; // 2.4s for 25 requests/minute (1000ms * 60 / 25 = 2400ms)
+  private readonly minRequestInterval = 2400; // 2.4s for 25 requests/minute
+
+  // Cache for domain name → UUID mapping (avoids repeated list calls)
+  private domainIdCache = new Map<string, string>();
+
+  // Pending NS names stored by setNameservers() for use by setGlueRecords()
+  private pendingNameservers = new Map<string, string[]>();
 
   constructor(apiKey: string, apiSecret: string | null, config: Record<string, unknown>) {
     super(apiKey, apiSecret, config);
@@ -89,56 +109,123 @@ export class IonosRegistrar extends BaseDNSRegistrar {
   }
 
   /**
-   * Set nameservers for a domain.
-   * PUT /domains/{domain} with body { nameservers: [...] }
+   * Look up domain UUID from the Domains API.
+   * GET /domains/v1/domainitems?limit=200
+   * Caches results to avoid repeated API calls.
    */
-  async setNameservers(domain: string, nameservers: string[]): Promise<void> {
-    const url = `${this.baseUrl}/domains/${encodeURIComponent(domain)}`;
-    const body = {
-      nameservers,
-    };
+  private async getDomainId(domainName: string): Promise<string> {
+    // Check cache first
+    const cached = this.domainIdCache.get(domainName);
+    if (cached) return cached;
 
-    this.log(`Setting nameservers for ${domain}: ${nameservers.join(", ")}`);
+    interface DomainItem {
+      id: string;
+      name: string;
+      tld: string;
+    }
 
-    await this.httpRequest<void>(url, {
-      method: "PUT",
-      body: JSON.stringify(body),
-    });
+    interface DomainsResponse {
+      count: number;
+      domains: DomainItem[];
+    }
 
-    this.log(`Nameservers set successfully`);
+    this.log(`Looking up domain UUID for ${domainName}`);
+
+    let offset = 0;
+    const limit = 200;
+
+    while (true) {
+      const url = `${this.baseUrl}/domains/v1/domainitems?limit=${limit}&offset=${offset}`;
+      const response = await this.httpRequest<DomainsResponse>(url, { method: "GET" });
+
+      if (!response || !response.domains || response.domains.length === 0) {
+        break;
+      }
+
+      // Cache all results from this page
+      for (const d of response.domains) {
+        this.domainIdCache.set(d.name, d.id);
+      }
+
+      // Check if we found the domain
+      const found = this.domainIdCache.get(domainName);
+      if (found) {
+        this.log(`Found domain UUID: ${found}`);
+        return found;
+      }
+
+      offset += limit;
+      if (offset >= response.count) break;
+    }
+
+    throw new Error(
+      `Domain "${domainName}" not found in IONOS account. ` +
+      `Checked ${this.domainIdCache.size} domains.`
+    );
   }
 
   /**
-   * Create A records for glue records (ns1.domain, ns2.domain, etc.).
-   * For each { hostname, ip }, create an A record in the zone.
+   * Set nameservers for a domain.
+   *
+   * IONOS requires nameservers + glue (IPs) to be set in a single PUT call.
+   * This method stores the NS names for use by setGlueRecords() which makes
+   * the actual API call with both NS names and IPs.
+   *
+   * If setGlueRecords() is NOT called after this, the NS change won't happen.
+   * This is by design — NS without glue records would break DNS resolution
+   * for self-hosted nameservers (ns1.domain, ns2.domain under same zone).
+   */
+  async setNameservers(domain: string, nameservers: string[]): Promise<void> {
+    this.log(`Storing nameservers for ${domain}: ${nameservers.join(", ")} (will apply with glue records)`);
+    this.pendingNameservers.set(domain, nameservers);
+  }
+
+  /**
+   * Set glue records (child nameserver IPs) AND nameservers in one API call.
+   *
+   * IONOS API endpoint: PUT /domains/v1/domainitems/{uuid}/nameservers
+   * Body: {"type":"CUSTOM","nameservers":[{"name":"ns1.x","ipV4Addresses":["1.2.3.4"]}]}
+   * Response: 202 Accepted with {"id":"..."}
+   *
+   * This combines the nameserver + glue record operations because IONOS
+   * handles them as a single atomic update at the registrar level.
    */
   async setGlueRecords(
     domain: string,
     records: Array<{ hostname: string; ip: string }>
   ): Promise<void> {
-    const zoneId = await this.getZoneId(domain);
+    const domainId = await this.getDomainId(domain);
 
-    for (const record of records) {
-      this.log(`Creating glue record: ${record.hostname} -> ${record.ip}`);
+    // Build the nameserver array with glue IPs
+    const nameserverPayload = records.map((r) => ({
+      name: r.hostname,
+      ipV4Addresses: [r.ip],
+    }));
 
-      // Create A record for ns1.domain, ns2.domain, etc.
-      const createUrl = `${this.baseUrl}/dns/v1/zones/${zoneId}/records`;
-      const body = [
-        {
-          name: record.hostname,
-          type: "A",
-          content: record.ip,
-          ttl: 3600,
-        },
-      ];
+    const body = {
+      type: "CUSTOM",
+      nameservers: nameserverPayload,
+    };
 
-      await this.httpRequest<void>(createUrl, {
-        method: "POST",
-        body: JSON.stringify(body),
-      });
+    const url = `${this.baseUrl}/domains/v1/domainitems/${domainId}/nameservers`;
+    this.log(`Setting nameservers + glue for ${domain} (UUID: ${domainId})`);
+    this.log(`  Payload: ${JSON.stringify(body)}`);
+
+    // PUT returns 202 Accepted — IONOS processes asynchronously
+    // The httpRequest helper expects JSON response, but 202 may have minimal body
+    interface NSUpdateResponse {
+      id?: string;
     }
 
-    this.log(`Glue records created successfully`);
+    const result = await this.httpRequest<NSUpdateResponse>(url, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    });
+
+    this.log(`Nameservers + glue set successfully (update ID: ${result?.id || "n/a"})`);
+
+    // Clear pending NS
+    this.pendingNameservers.delete(domain);
   }
 
   /**
@@ -264,89 +351,81 @@ export class IonosRegistrar extends BaseDNSRegistrar {
 
   /**
    * List all domains from IONOS account with MX record status.
-   * GET /api/domains/v1/domainitems with pagination (limit=100, offset=0)
-   * For each domain, check MX records via DNS API.
-   * Returns DomainInfo array with deliverability assessment.
+   *
+   * GET /domains/v1/domainitems with pagination (limit=200, offset=0)
+   * Response shape: { count: number, domains: [{ id, name, tld }] }
+   *
+   * For each domain, check MX records via DNS API (gracefully handles 401 for
+   * zones on custom nameservers where IONOS DNS isn't active).
    */
   async listDomains(): Promise<DomainInfo[]> {
-    interface DomainItemStatus {
-      provisioning: "ACTIVE" | "INACTIVE" | "EXPIRED" | string;
-    }
-
     interface DomainItem {
+      id: string;
       name: string;
-      status: DomainItemStatus;
-      expirationDate?: string;
+      tld: string;
     }
 
     interface DomainsApiResponse {
-      items: DomainItem[];
-      totalItems: number;
-    }
-
-    interface MxRecord {
-      name: string;
-      type: string;
-      content: string;
-    }
-
-    interface MxRecordsResponse {
-      records: MxRecord[];
+      count: number;
+      domains: DomainItem[];
     }
 
     const domains: DomainInfo[] = [];
     let offset = 0;
-    const limit = 100;
-    let totalItems = limit; // Start with limit to ensure at least one iteration
+    const limit = 200;
+    let totalCount = limit; // Start with limit to ensure at least one iteration
 
     this.log(`Fetching domains from IONOS account...`);
 
     // Paginate through all domains
-    while (offset < totalItems) {
-      const url = `${this.baseUrl}/api/domains/v1/domainitems?limit=${limit}&offset=${offset}`;
+    while (offset < totalCount) {
+      const url = `${this.baseUrl}/domains/v1/domainitems?limit=${limit}&offset=${offset}`;
 
       try {
         const response = await this.httpRequest<DomainsApiResponse>(url, {
           method: "GET",
         });
 
-        if (!response || !response.items) {
+        if (!response || !response.domains) {
           this.log(`No domains found at offset ${offset}`);
           break;
         }
 
-        totalItems = response.totalItems;
+        totalCount = response.count;
         this.log(
-          `Fetched ${response.items.length} domains (total: ${totalItems}, offset: ${offset})`
+          `Fetched ${response.domains.length} domains (total: ${totalCount}, offset: ${offset})`
         );
 
         // Process each domain
-        for (const domainItem of response.items) {
+        for (const domainItem of response.domains) {
           const domainName = domainItem.name;
           let hasMxRecords: boolean | null = null;
-          let status: "active" | "expired" | "pending" | "unknown" = "unknown";
 
-          // Map provisioning status to our enum
-          if (domainItem.status?.provisioning === "ACTIVE") {
-            status = "active";
-          } else if (domainItem.status?.provisioning === "EXPIRED") {
-            status = "expired";
-          } else if (domainItem.status?.provisioning === "INACTIVE") {
-            status = "pending";
-          }
+          // Cache the domain ID
+          this.domainIdCache.set(domainName, domainItem.id);
 
           // Check for MX records using DNS API
+          // This may fail with 401 for domains on custom NS (not IONOS DNS) — that's OK
           try {
             const zoneId = await this.getZoneId(domainName);
             const mxUrl = `${this.baseUrl}/dns/v1/zones/${zoneId}/records?type=MX`;
 
-            const mxResponse = await this.httpRequest<MxRecordsResponse>(mxUrl, {
+            // IONOS DNS API returns an array of records directly, NOT wrapped in { records: [...] }
+            interface MxRecord {
+              id: string;
+              name: string;
+              type: string;
+              content: string;
+            }
+
+            const mxRecords = await this.httpRequest<MxRecord[]>(mxUrl, {
               method: "GET",
             });
 
-            hasMxRecords = mxResponse && mxResponse.records && mxResponse.records.length > 0;
+            hasMxRecords = Array.isArray(mxRecords) && mxRecords.length > 0;
             this.log(`Domain ${domainName}: MX records found = ${hasMxRecords}`);
           } catch (mxError) {
+            // 401 = DNS not managed by IONOS (custom NS), treat as no MX data
             this.log(
               `Could not check MX records for ${domainName}: ${
                 mxError instanceof Error ? mxError.message : "Unknown error"
@@ -355,15 +434,15 @@ export class IonosRegistrar extends BaseDNSRegistrar {
             hasMxRecords = null;
           }
 
-          // Determine availability: active status + no MX records + not expired
-          const isAvailable = status === "active" && hasMxRecords === false;
+          // Determine availability: no MX records (or unknown) = potentially available
+          const isAvailable = hasMxRecords === false;
 
           const domainInfo: DomainInfo = {
             domain: domainName,
-            status,
-            expiresAt: domainItem.expirationDate || null,
+            status: "active", // IONOS domainitems endpoint only returns active/registered domains
+            expiresAt: null, // Not available in domainitems list response
             hasMxRecords,
-            nameservers: [], // IONOS API doesn't provide nameservers in domain list
+            nameservers: [], // Would require per-domain /nameservers call (expensive)
             isAvailable,
           };
 
@@ -373,7 +452,7 @@ export class IonosRegistrar extends BaseDNSRegistrar {
         offset += limit;
 
         // Rate limiting: 2.5s delay between paginated requests
-        if (offset < totalItems) {
+        if (offset < totalCount) {
           await new Promise((resolve) => setTimeout(resolve, 2500));
         }
       } catch (error) {
