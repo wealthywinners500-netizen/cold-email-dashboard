@@ -258,15 +258,40 @@ export function createPairProvisioningSaga(
 
           context.log(`[Step 2] Connecting SSH to ${server1IP} and ${server2IP}...`);
 
-          // Wait a few seconds for SSH to be ready on fresh instances
-          await new Promise((r) => setTimeout(r, 15000));
-
-          await Promise.all([
-            ssh1.connect(server1IP, 22, 'root', { password }),
-            ssh2.connect(server2IP, 22, 'root', { password }),
-          ]);
-
-          context.log('[Step 2] SSH connected to both servers');
+          // Wait for cloud-init to finish and SSH to become ready
+          // Linode cloud-init takes 60-90s to set root password after API reports "active"
+          const maxSSHWait = 180000; // 3 minutes max
+          const backoffMs = [30000, 45000, 60000, 90000]; // Retry intervals
+          context.log('[Step 2] Waiting for cloud-init to complete and SSH to become ready...');
+          let sshReady = false;
+          const sshStartTime = Date.now();
+          for (const delay of backoffMs) {
+            if (Date.now() - sshStartTime > maxSSHWait) break;
+            await new Promise((r) => setTimeout(r, delay));
+            const elapsed = Math.round((Date.now() - sshStartTime) / 1000);
+            context.log(`[Step 2] SSH readiness check at ${elapsed}s...`);
+            try {
+              await Promise.all([
+                ssh1.connect(server1IP, 22, 'root', { password }),
+                ssh2.connect(server2IP, 22, 'root', { password }),
+              ]);
+              sshReady = true;
+              context.log(`[Step 2] SSH connected to both servers after ${elapsed}s`);
+              break;
+            } catch (sshErr) {
+              const msg = sshErr instanceof Error ? sshErr.message : String(sshErr);
+              context.log(`[Step 2] SSH not ready yet (${elapsed}s): ${msg}`);
+              // Disconnect any partial connections before retry
+              try { ssh1.disconnect(); } catch { /* ignore */ }
+              try { ssh2.disconnect(); } catch { /* ignore */ }
+            }
+          }
+          if (!sshReady) {
+            return {
+              success: false,
+              error: `SSH not ready after ${Math.round((Date.now() - sshStartTime) / 1000)}s. Cloud-init may still be running. Retry this step.`,
+            };
+          }
 
           // Check if already installed (idempotent)
           let s1Installed = false;
