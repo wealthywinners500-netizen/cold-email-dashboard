@@ -388,6 +388,25 @@ export async function createMailDomain(
   }
 
   if (!dkimSuccess) {
+    // Diagnostic: dump HestiaCP state so we can see WHY DKIM keeps failing
+    try {
+      const mailConfDump = await ssh.exec(
+        `cat /usr/local/hestia/data/users/admin/mail.conf 2>&1 | head -20`,
+        { timeout: 10000 }
+      );
+      console.log(`[DKIM-DIAG] mail.conf contents for ${domain}:\n${mailConfDump.stdout}`);
+    } catch (diagErr) {
+      console.log(`[DKIM-DIAG] Could not read mail.conf: ${diagErr}`);
+    }
+    try {
+      const dkimRun = await ssh.exec(
+        `${HESTIA_PATH_PREFIX}v-add-mail-domain-dkim admin ${domain} 2>&1 || true`,
+        { timeout: 15000 }
+      );
+      console.log(`[DKIM-DIAG] v-add-mail-domain-dkim stdout+stderr: ${dkimRun.stdout}`);
+    } catch (diagErr) {
+      console.log(`[DKIM-DIAG] Could not rerun dkim cmd: ${diagErr}`);
+    }
     throw new Error(`v-add-mail-domain-dkim failed after ${maxDkimAttempts} attempts for ${domain}`);
   }
 

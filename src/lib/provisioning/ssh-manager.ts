@@ -267,7 +267,12 @@ export class SSHManager {
       const finalCode = code || 0;
 
       if (finalCode !== 0) {
+        // Log stdout/stderr on failure so we can diagnose exit codes without re-running
+        const stderrSnippet = (stderr || '').trim().slice(0, 500);
+        const stdoutSnippet = (stdout || '').trim().slice(0, 500);
         this.log(`[SSH] Command failed with code ${finalCode}`);
+        if (stderrSnippet) this.log(`[SSH] STDERR: ${stderrSnippet}`);
+        if (stdoutSnippet) this.log(`[SSH] STDOUT: ${stdoutSnippet}`);
         throw new SSHCommandError(
           `Command failed with exit code ${finalCode}: ${command}`,
           stdout || '',
