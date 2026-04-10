@@ -353,22 +353,42 @@ export async function createMailDomain(
   // Create mail domain
   await ssh.exec(`${HESTIA_PATH_PREFIX}v-add-mail-domain admin ${domain}`, { timeout: 15000 });
 
-  // Wait for HestiaCP to fully commit the mail domain before generating DKIM
-  // Without this delay, v-add-mail-domain-dkim fails with exit code 4 (object doesn't exist)
-  await new Promise((resolve) => setTimeout(resolve, 3000));
+  // Poll until HestiaCP confirms the mail domain exists before generating DKIM.
+  // v-add-mail-domain returns immediately but HestiaCP can take 10-30s to fully commit
+  // the domain to its internal database. Without this, v-add-mail-domain-dkim fails
+  // with exit code 4 (object doesn't exist). Tests showed 8s wasn't enough.
+  const maxDkimAttempts = 6;
+  const dkimRetryDelay = 5000; // 5 seconds between attempts (up to 30s total)
+  let dkimSuccess = false;
 
-  // Generate DKIM (retry once after additional delay if HestiaCP still hasn't committed)
-  try {
-    await ssh.exec(`${HESTIA_PATH_PREFIX}v-add-mail-domain-dkim admin ${domain}`, { timeout: 15000 });
-  } catch (dkimError: unknown) {
-    const errMsg = dkimError instanceof Error ? dkimError.message : String(dkimError);
-    if (errMsg.includes('exit code 4') || errMsg.includes('code 4')) {
-      // HestiaCP still hasn't committed — wait longer and retry
-      await new Promise((resolve) => setTimeout(resolve, 5000));
+  for (let attempt = 1; attempt <= maxDkimAttempts; attempt++) {
+    // Wait before each attempt (including the first — give HestiaCP time to commit)
+    await new Promise((resolve) => setTimeout(resolve, dkimRetryDelay));
+
+    // Verify the mail domain is visible to HestiaCP before attempting DKIM
+    try {
+      await ssh.exec(`${HESTIA_PATH_PREFIX}v-list-mail-domain admin ${domain}`, { timeout: 10000 });
+    } catch {
+      // Domain not yet visible — skip DKIM attempt and wait
+      if (attempt < maxDkimAttempts) continue;
+    }
+
+    try {
       await ssh.exec(`${HESTIA_PATH_PREFIX}v-add-mail-domain-dkim admin ${domain}`, { timeout: 15000 });
-    } else {
+      dkimSuccess = true;
+      break;
+    } catch (dkimError: unknown) {
+      const errMsg = dkimError instanceof Error ? dkimError.message : String(dkimError);
+      if ((errMsg.includes('exit code 4') || errMsg.includes('code 4')) && attempt < maxDkimAttempts) {
+        // HestiaCP still hasn't committed — retry after delay
+        continue;
+      }
       throw dkimError;
     }
+  }
+
+  if (!dkimSuccess) {
+    throw new Error(`v-add-mail-domain-dkim failed after ${maxDkimAttempts} attempts for ${domain}`);
   }
 
   // Add SPF TXT record
