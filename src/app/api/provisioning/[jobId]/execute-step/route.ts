@@ -6,6 +6,11 @@ import { decrypt } from "@/lib/provisioning/encryption";
 import type { StepType, ProvisioningJobRow, VPSProviderType, DNSRegistrarType } from "@/lib/provisioning/types";
 
 export const dynamic = "force-dynamic";
+// Vercel Hobby plan supports up to 60s per serverless function. Step 1
+// (create_vps) polls the VPS provider until both servers become active —
+// Linode typically transitions within 30-45s, so 60s is tight but workable.
+// Without this export the default is 10s, which guarantees timeout.
+export const maxDuration = 60;
 
 // Steps that can run in serverless (API calls only, no SSH)
 // Order: create_vps(1), configure_registrar(3), set_ptr(5), verification_gate(8)

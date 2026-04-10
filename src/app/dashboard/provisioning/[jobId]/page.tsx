@@ -234,7 +234,14 @@ export default function JobDetailPage() {
     };
   }, [jobId]);
 
-  // Client-driven DryRun execution loop
+  // Client-driven saga execution loop
+  // Hard lesson (Test #12, 2026-04-10): This loop was previously gated on
+  // provider_type === "dry_run", which left real provisioning jobs frozen at
+  // pending forever because (a) pollProvisioningJobs cron is disabled and
+  // (b) the legacy monolithic handler is disabled. The canonical path is now
+  // exclusively client → /execute-step → worker bridge, so this loop must
+  // run for ALL provider types. The /execute-step route handles serverless
+  // steps (1,3,5,8) inline and dispatches worker steps (2,4,6,7) to the VPS.
   const executeDryRunLoop = useCallback(async () => {
     if (dryRunExecuting) return;
     setDryRunExecuting(true);
@@ -342,19 +349,19 @@ export default function JobDetailPage() {
     };
   }, [job?.status, connectSSE]);
 
-  // Auto-start DryRun execution when job loads
+  // Auto-start saga execution loop when job loads.
+  // Runs for ALL provider types (dry_run + real) because the canonical
+  // execute-step → worker bridge is the only active saga driver — the worker
+  // pollProvisioningJobs cron and legacy monolithic handler are both disabled.
   useEffect(() => {
     if (
       job &&
       !dryRunExecuting &&
-      (job.status === "pending" || job.status === "in_progress") &&
-      job.config &&
-      typeof job.config === "object" &&
-      (job.config as Record<string, unknown>).provider_type === "dry_run"
+      (job.status === "pending" || job.status === "in_progress")
     ) {
       executeDryRunLoop();
     }
-  }, [job?.id, job?.status, job?.config]);
+  }, [job?.id, job?.status]);
 
   const handleCancel = async () => {
     if (!confirm("Cancel this provisioning job? Any created resources will be rolled back.")) return;
