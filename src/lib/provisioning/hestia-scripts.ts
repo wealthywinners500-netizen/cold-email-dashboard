@@ -21,6 +21,13 @@ import type { SSHManager, SSHCommandError } from './ssh-manager';
 import { parseDNSRecords, parseDKIMOutput } from './hestia-parsers';
 import type { DNSRecord } from './hestia-parsers';
 
+/**
+ * HestiaCP installs its CLI tools to /usr/local/hestia/bin/ which
+ * is NOT in $PATH for non-login SSH sessions. All v-* commands must
+ * be prefixed with this PATH export.
+ */
+const HESTIA_PATH_PREFIX = 'export PATH=/usr/local/hestia/bin:$PATH && ';
+
 // ============================================
 // Types
 // ============================================
@@ -95,7 +102,7 @@ export async function installHestiaCP(
 
   // Check if HestiaCP is already installed (idempotent)
   try {
-    const checkResult = await ssh.exec('which v-list-sys-info', { timeout: 10000 });
+    const checkResult = await ssh.exec(`${HESTIA_PATH_PREFIX}which v-list-sys-info`, { timeout: 10000 });
     if (checkResult.code === 0) {
       const adminUrl = `https://${hostname}:8083`;
       return { success: true, adminUrl };
@@ -167,7 +174,7 @@ export async function createDNSZone(
 
   // Check if zone already exists (idempotent)
   try {
-    const checkResult = await ssh.exec(`v-list-dns-domain admin ${domain} 2>/dev/null`, { timeout: 10000 });
+    const checkResult = await ssh.exec(`${HESTIA_PATH_PREFIX}v-list-dns-domain admin ${domain} 2>/dev/null`, { timeout: 10000 });
     if (checkResult.code === 0 && checkResult.stdout.trim().length > 0) {
       // Zone exists — clean it up and ensure records are correct
       await cleanupDNSZoneDefaults(ssh, domain, nsDomain);
@@ -179,7 +186,7 @@ export async function createDNSZone(
   }
 
   // Create the zone
-  await ssh.exec(`v-add-dns-domain admin ${domain} ${server1IP}`, { timeout: 30000 });
+  await ssh.exec(`${HESTIA_PATH_PREFIX}v-add-dns-domain admin ${domain} ${server1IP}`, { timeout: 30000 });
 
   // Clean up bad defaults (Hard Lesson #12, #13)
   await cleanupDNSZoneDefaults(ssh, domain, nsDomain);
@@ -200,29 +207,29 @@ async function cleanupDNSZoneDefaults(
   nsDomain: string
 ): Promise<void> {
   // List existing records
-  const { stdout } = await ssh.exec(`v-list-dns-records admin ${domain} plain`, { timeout: 15000 });
+  const { stdout } = await ssh.exec(`${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`, { timeout: 15000 });
   const existingRecords = parseDNSRecords(stdout);
 
   for (const record of existingRecords) {
     // Hard Lesson #12: Remove stale ns2.clouding.host NS records
     if (record.type === 'NS' && record.value.includes('clouding.host')) {
-      await ssh.exec(`v-delete-dns-record admin ${domain} ${record.id}`, { timeout: 10000 });
+      await ssh.exec(`${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${record.id}`, { timeout: 10000 });
     }
 
     // Hard Lesson #13: Remove default webmail CNAME
     if (record.type === 'CNAME' && record.host === 'webmail') {
-      await ssh.exec(`v-delete-dns-record admin ${domain} ${record.id}`, { timeout: 10000 });
+      await ssh.exec(`${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${record.id}`, { timeout: 10000 });
     }
 
     // Remove any stale NS records that don't match our nsDomain
     if (record.type === 'NS' && !record.value.includes(nsDomain)) {
-      await ssh.exec(`v-delete-dns-record admin ${domain} ${record.id}`, { timeout: 10000 });
+      await ssh.exec(`${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${record.id}`, { timeout: 10000 });
     }
   }
 
   // Hard Lesson #13: Fix SOA MNAME to ns1.NSDOMAIN
   await ssh.exec(
-    `v-change-dns-domain-soa admin ${domain} ns1.${nsDomain}`,
+    `${HESTIA_PATH_PREFIX}v-change-dns-domain-soa admin ${domain} ns1.${nsDomain}`,
     { timeout: 10000 }
   ).catch(() => {
     // Some HestiaCP versions don't have this command; we'll handle it via record editing
@@ -281,7 +288,7 @@ async function ensureDNSRecords(
   }
 
   // Get existing records for comparison
-  const { stdout } = await ssh.exec(`v-list-dns-records admin ${domain} plain`, { timeout: 15000 });
+  const { stdout } = await ssh.exec(`${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`, { timeout: 15000 });
   const existing = parseDNSRecords(stdout);
 
   // Add records that don't already exist
@@ -296,7 +303,7 @@ async function ensureDNSRecords(
     if (!alreadyExists) {
       const priorityArg = req.priority !== undefined ? req.priority : '';
       await ssh.exec(
-        `v-add-dns-record admin ${domain} ${req.host} ${req.type} '${req.value}' ${priorityArg}`.trim(),
+        `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} ${req.host} ${req.type} '${req.value}' ${priorityArg}`.trim(),
         { timeout: 10000 }
       );
     }
@@ -321,7 +328,7 @@ export async function createMailDomain(
 
   // Check if mail domain already exists (idempotent)
   try {
-    const checkResult = await ssh.exec(`v-list-mail-domain admin ${domain} 2>/dev/null`, { timeout: 10000 });
+    const checkResult = await ssh.exec(`${HESTIA_PATH_PREFIX}v-list-mail-domain admin ${domain} 2>/dev/null`, { timeout: 10000 });
     if (checkResult.code === 0 && checkResult.stdout.trim().length > 0) {
       // Already exists — just ensure accounts and DKIM
       const dkimRecord = await extractDKIM(ssh, domain);
@@ -333,14 +340,14 @@ export async function createMailDomain(
   }
 
   // Create mail domain
-  await ssh.exec(`v-add-mail-domain admin ${domain}`, { timeout: 15000 });
+  await ssh.exec(`${HESTIA_PATH_PREFIX}v-add-mail-domain admin ${domain}`, { timeout: 15000 });
 
   // Generate DKIM
-  await ssh.exec(`v-add-mail-domain-dkim admin ${domain}`, { timeout: 15000 });
+  await ssh.exec(`${HESTIA_PATH_PREFIX}v-add-mail-domain-dkim admin ${domain}`, { timeout: 15000 });
 
   // Add SPF TXT record
   await ssh.exec(
-    `v-add-dns-record admin ${domain} @ TXT '"v=spf1 +a +mx -all"'`,
+    `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ TXT '"v=spf1 +a +mx -all"'`,
     { timeout: 10000 }
   ).catch(() => {
     // May already exist from zone creation
@@ -349,7 +356,7 @@ export async function createMailDomain(
   // Add DMARC TXT record
   const dmarcEmail = adminEmail || `postmaster@${domain}`;
   await ssh.exec(
-    `v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100; rua=mailto:${dmarcEmail}"'`,
+    `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100; rua=mailto:${dmarcEmail}"'`,
     { timeout: 10000 }
   ).catch(() => {
     // May already exist
@@ -376,7 +383,7 @@ async function ensureMailAccounts(
   for (const account of accounts) {
     try {
       await ssh.exec(
-        `v-add-mail-account admin ${domain} ${account} '${escapedPassword}'`,
+        `${HESTIA_PATH_PREFIX}v-add-mail-account admin ${domain} ${account} '${escapedPassword}'`,
         { timeout: 10000 }
       );
     } catch (err) {
@@ -400,7 +407,7 @@ async function ensureMailAccounts(
  */
 export async function extractDKIM(ssh: SSHManager, domain: string): Promise<string> {
   const { stdout } = await ssh.exec(
-    `v-list-mail-domain-dkim-dns admin ${domain}`,
+    `${HESTIA_PATH_PREFIX}v-list-mail-domain-dkim-dns admin ${domain}`,
     { timeout: 15000 }
   );
   return parseDKIMOutput(stdout);
@@ -426,7 +433,7 @@ export async function replicateZone(
 
   // Read all records from source
   const { stdout: sourceRecordsRaw } = await sourceSSH.exec(
-    `v-list-dns-records admin ${domain} plain`,
+    `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
     { timeout: 15000 }
   );
   const sourceRecords = parseDNSRecords(sourceRecordsRaw);
@@ -434,7 +441,7 @@ export async function replicateZone(
   // Check if zone already exists on target (idempotent)
   let targetZoneExists = false;
   try {
-    const checkResult = await targetSSH.exec(`v-list-dns-domain admin ${domain} 2>/dev/null`, { timeout: 10000 });
+    const checkResult = await targetSSH.exec(`${HESTIA_PATH_PREFIX}v-list-dns-domain admin ${domain} 2>/dev/null`, { timeout: 10000 });
     if (checkResult.code === 0 && checkResult.stdout.trim().length > 0) {
       targetZoneExists = true;
     }
@@ -448,29 +455,29 @@ export async function replicateZone(
     const primaryIP = primaryRecord?.value || '127.0.0.1';
 
     // Create the zone on target
-    await targetSSH.exec(`v-add-dns-domain admin ${domain} ${primaryIP}`, { timeout: 30000 });
+    await targetSSH.exec(`${HESTIA_PATH_PREFIX}v-add-dns-domain admin ${domain} ${primaryIP}`, { timeout: 30000 });
   }
 
   // Delete stale defaults on target (same cleanup as createDNSZone)
   // Hard Lesson #12, #13
   const { stdout: targetRecordsRaw } = await targetSSH.exec(
-    `v-list-dns-records admin ${domain} plain`,
+    `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
     { timeout: 15000 }
   );
   const targetRecords = parseDNSRecords(targetRecordsRaw);
 
   for (const record of targetRecords) {
     if (record.type === 'NS' && record.value.includes('clouding.host')) {
-      await targetSSH.exec(`v-delete-dns-record admin ${domain} ${record.id}`, { timeout: 10000 });
+      await targetSSH.exec(`${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${record.id}`, { timeout: 10000 });
     }
     if (record.type === 'CNAME' && record.host === 'webmail') {
-      await targetSSH.exec(`v-delete-dns-record admin ${domain} ${record.id}`, { timeout: 10000 });
+      await targetSSH.exec(`${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${record.id}`, { timeout: 10000 });
     }
   }
 
   // Refresh target records after cleanup
   const { stdout: cleanTargetRaw } = await targetSSH.exec(
-    `v-list-dns-records admin ${domain} plain`,
+    `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
     { timeout: 15000 }
   );
   const cleanTargetRecords = parseDNSRecords(cleanTargetRaw);
@@ -490,7 +497,7 @@ export async function replicateZone(
     if (!existsOnTarget) {
       const priorityArg = srcRecord.priority !== undefined ? srcRecord.priority : '';
       await targetSSH.exec(
-        `v-add-dns-record admin ${domain} ${srcRecord.host} ${srcRecord.type} '${srcRecord.value}' ${priorityArg}`.trim(),
+        `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} ${srcRecord.host} ${srcRecord.type} '${srcRecord.value}' ${priorityArg}`.trim(),
         { timeout: 10000 }
       );
     }
@@ -503,7 +510,7 @@ export async function replicateZone(
       if (sourceDKIM) {
         // Ensure mail domain exists on target
         try {
-          await targetSSH.exec(`v-add-mail-domain admin ${domain}`, { timeout: 15000 });
+          await targetSSH.exec(`${HESTIA_PATH_PREFIX}v-add-mail-domain admin ${domain}`, { timeout: 15000 });
         } catch {
           // May already exist
         }
@@ -511,7 +518,7 @@ export async function replicateZone(
         // Add DKIM to target DNS
         const dkimHost = `_domainkey.${domain}`;
         await targetSSH.exec(
-          `v-add-dns-record admin ${domain} ${dkimHost} TXT '${sourceDKIM}'`,
+          `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} ${dkimHost} TXT '${sourceDKIM}'`,
           { timeout: 10000 }
         ).catch(() => {
           // May already exist
@@ -564,7 +571,7 @@ export async function hardenSecurity(ssh: SSHManager): Promise<void> {
     );
     const mailDomains = domainsOutput.split('\n').map((d) => d.trim()).filter(Boolean);
     for (const d of mailDomains) {
-      await ssh.exec(`v-change-mail-domain-antispam admin ${d} disabled`, { timeout: 10000 }).catch(() => {});
+      await ssh.exec(`${HESTIA_PATH_PREFIX}v-change-mail-domain-antispam admin ${d} disabled`, { timeout: 10000 }).catch(() => {});
     }
   } catch {
     // No mail domains yet — skip per-domain disable
@@ -628,7 +635,7 @@ export async function issueSSLCert(
     await ssh.exec('v-add-letsencrypt-host', { timeout: 120000 });
   } else {
     // Issue domain cert: v-add-letsencrypt-domain admin DOMAIN
-    await ssh.exec(`v-add-letsencrypt-domain admin ${domain}`, { timeout: 120000 });
+    await ssh.exec(`${HESTIA_PATH_PREFIX}v-add-letsencrypt-domain admin ${domain}`, { timeout: 120000 });
   }
 
   // Verify CN matches expected
@@ -670,7 +677,7 @@ export async function issueSSLCert(
  */
 export async function setHostname(ssh: SSHManager, hostname: string): Promise<void> {
   // Set hostname via HestiaCP
-  await ssh.exec(`v-change-sys-hostname ${hostname}`, { timeout: 30000 });
+  await ssh.exec(`${HESTIA_PATH_PREFIX}v-change-sys-hostname ${hostname}`, { timeout: 30000 });
 
   // Verify with hostname -f
   const { stdout } = await ssh.exec('hostname -f', { timeout: 10000 });
