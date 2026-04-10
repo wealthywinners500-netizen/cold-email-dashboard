@@ -34,7 +34,7 @@ export interface InstallProgress {
 
 /**
  * Parses DNS records from HestiaCP output
- * Format: tab-separated RECORD_ID TYPE HOST VALUE PRIORITY TTL
+ * Format: tab-separated RECORD_ID RECORD(host) TYPE PRIORITY VALUE SUSPENDED TIME DATE TTL
  * Handles both plain and JSON formats
  *
  * @param output Raw output from `v-list-dns-records admin DOMAIN`
@@ -63,6 +63,9 @@ export function parseDNSRecords(output: string): DNSRecord[] {
   }
 
   // Parse plain format: tab-separated
+  // HestiaCP v-list-dns-records plain column order:
+  //   ID  RECORD(host)  TYPE  PRIORITY  VALUE  SUSPENDED  TIME  DATE  TTL
+  // Note: PRIORITY is always present (empty or '-' for non-MX/SRV records)
   const lines = output.split("\n");
   const records: DNSRecord[] = [];
 
@@ -71,37 +74,35 @@ export function parseDNSRecords(output: string): DNSRecord[] {
     if (!trimmed) continue;
 
     const parts = trimmed.split("\t");
-    if (parts.length < 5) continue; // Need at least ID, TYPE, HOST, VALUE, TTL
+    if (parts.length < 5) continue; // Need at least ID, HOST, TYPE, PRIORITY, VALUE
 
     try {
       const id = parts[0]?.trim();
-      const type = parts[1]?.trim();
-      const host = parts[2]?.trim();
-      const value = parts[3]?.trim();
-      const priorityStr = parts[4]?.trim();
-      const ttlStr = parts[5]?.trim() || parts[4]?.trim();
+      const host = parts[1]?.trim();      // RECORD column = hostname (@, mail1, etc.)
+      const type = parts[2]?.trim();      // TYPE column (A, MX, NS, TXT, etc.)
+      const priorityStr = parts[3]?.trim(); // PRIORITY column (number for MX/SRV, empty/- otherwise)
+      const value = parts[4]?.trim();     // VALUE column
+      // parts[5] = SUSPENDED, parts[6] = TIME, parts[7] = DATE
+      const ttlStr = parts[8]?.trim();    // TTL column
 
       // Validate required fields
       if (!id || !type || host === undefined || !value) continue;
 
-      // Determine if this record has priority (MX, SRV records)
+      // Parse priority for MX/SRV records
       let priority: number | undefined;
-      let ttl: number;
-
-      if (["MX", "SRV"].includes(type.toUpperCase())) {
+      if (["MX", "SRV"].includes(type.toUpperCase()) && priorityStr && priorityStr !== '-' && priorityStr !== '') {
         priority = Number(priorityStr);
-        ttl = Number(ttlStr) || 3600;
-      } else {
-        ttl = Number(priorityStr) || 3600;
       }
+
+      const ttl = (ttlStr && !isNaN(Number(ttlStr))) ? Number(ttlStr) : 3600;
 
       records.push({
         id,
         type,
         host,
         value,
-        priority: isNaN(priority as number) ? undefined : priority,
-        ttl: isNaN(ttl) ? 3600 : ttl,
+        priority: (priority !== undefined && !isNaN(priority)) ? priority : undefined,
+        ttl,
       });
     } catch {
       // Skip malformed lines
