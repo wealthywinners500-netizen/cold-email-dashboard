@@ -350,64 +350,53 @@ export async function createMailDomain(
     // Doesn't exist, create it
   }
 
-  // Create mail domain
+  // Create mail domain. Modern HestiaCP (1.8+) creates the mail domain WITH
+  // DKIM=yes enabled by default, so v-add-mail-domain-dkim would then fail with
+  // exit code 4 (E_EXISTS: "DKIM=yes already exists"). We check the DKIM field
+  // after creation and only call v-add-mail-domain-dkim if it's not already set.
   await ssh.exec(`${HESTIA_PATH_PREFIX}v-add-mail-domain admin ${domain}`, { timeout: 15000 });
 
-  // Poll until HestiaCP confirms the mail domain exists before generating DKIM.
-  // v-add-mail-domain returns immediately but HestiaCP can take 10-30s to fully commit
-  // the domain to its internal database. Without this, v-add-mail-domain-dkim fails
-  // with exit code 4 (object doesn't exist). Tests showed 8s wasn't enough.
-  const maxDkimAttempts = 6;
-  const dkimRetryDelay = 5000; // 5 seconds between attempts (up to 30s total)
-  let dkimSuccess = false;
+  // Wait briefly for HestiaCP to commit the new domain to mail.conf
+  await new Promise((resolve) => setTimeout(resolve, 3000));
 
-  for (let attempt = 1; attempt <= maxDkimAttempts; attempt++) {
-    // Wait before each attempt (including the first — give HestiaCP time to commit)
-    await new Promise((resolve) => setTimeout(resolve, dkimRetryDelay));
-
-    // Verify the mail domain is visible to HestiaCP before attempting DKIM
-    try {
-      await ssh.exec(`${HESTIA_PATH_PREFIX}v-list-mail-domain admin ${domain}`, { timeout: 10000 });
-    } catch {
-      // Domain not yet visible — skip DKIM attempt and wait
-      if (attempt < maxDkimAttempts) continue;
-    }
-
-    try {
-      await ssh.exec(`${HESTIA_PATH_PREFIX}v-add-mail-domain-dkim admin ${domain}`, { timeout: 15000 });
-      dkimSuccess = true;
-      break;
-    } catch (dkimError: unknown) {
-      const errMsg = dkimError instanceof Error ? dkimError.message : String(dkimError);
-      if ((errMsg.includes('exit code 4') || errMsg.includes('code 4')) && attempt < maxDkimAttempts) {
-        // HestiaCP still hasn't committed — retry after delay
-        continue;
-      }
-      throw dkimError;
-    }
+  // Check whether DKIM is already enabled on the newly-created domain
+  let dkimAlreadyEnabled = false;
+  try {
+    const dkimCheck = await ssh.exec(
+      `${HESTIA_PATH_PREFIX}v-list-mail-domain admin ${domain} json 2>/dev/null | grep -i '"DKIM"' || true`,
+      { timeout: 10000 }
+    );
+    dkimAlreadyEnabled = /["']?DKIM["']?\s*:\s*["']?yes/i.test(dkimCheck.stdout);
+  } catch {
+    // Fall through — will try to enable DKIM below
   }
 
-  if (!dkimSuccess) {
-    // Diagnostic: dump HestiaCP state so we can see WHY DKIM keeps failing
-    try {
-      const mailConfDump = await ssh.exec(
-        `cat /usr/local/hestia/data/users/admin/mail.conf 2>&1 | head -20`,
-        { timeout: 10000 }
-      );
-      console.log(`[DKIM-DIAG] mail.conf contents for ${domain}:\n${mailConfDump.stdout}`);
-    } catch (diagErr) {
-      console.log(`[DKIM-DIAG] Could not read mail.conf: ${diagErr}`);
+  if (!dkimAlreadyEnabled) {
+    // v-add-mail-domain did not auto-enable DKIM — enable it now.
+    // Retry once in case the domain hasn't fully committed yet.
+    let lastErr: unknown = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await ssh.exec(
+          `${HESTIA_PATH_PREFIX}v-add-mail-domain-dkim admin ${domain}`,
+          { timeout: 15000 }
+        );
+        lastErr = null;
+        break;
+      } catch (err: unknown) {
+        lastErr = err;
+        const errMsg = err instanceof Error ? err.message : String(err);
+        // If HestiaCP reports DKIM already exists, treat as success
+        if (/already exists/i.test(errMsg) || /DKIM=yes/i.test(errMsg)) {
+          lastErr = null;
+          break;
+        }
+        if (attempt < 3) {
+          await new Promise((resolve) => setTimeout(resolve, 5000));
+        }
+      }
     }
-    try {
-      const dkimRun = await ssh.exec(
-        `${HESTIA_PATH_PREFIX}v-add-mail-domain-dkim admin ${domain} 2>&1 || true`,
-        { timeout: 15000 }
-      );
-      console.log(`[DKIM-DIAG] v-add-mail-domain-dkim stdout+stderr: ${dkimRun.stdout}`);
-    } catch (diagErr) {
-      console.log(`[DKIM-DIAG] Could not rerun dkim cmd: ${diagErr}`);
-    }
-    throw new Error(`v-add-mail-domain-dkim failed after ${maxDkimAttempts} attempts for ${domain}`);
+    if (lastErr) throw lastErr;
   }
 
   // Add SPF TXT record
