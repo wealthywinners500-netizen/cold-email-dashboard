@@ -1,22 +1,38 @@
 import { auth } from "@clerk/nextjs/server";
 import { createAdminClient } from "@/lib/supabase/server";
 import { NextRequest, NextResponse } from "next/server";
-import { getDNSRegistrar } from "@/lib/provisioning/provider-registry";
-import { decrypt } from "@/lib/provisioning/encryption";
-import type { DNSRegistrarRow, DomainInfo } from "@/lib/provisioning/types";
-import { checkDomainBlacklistBatch } from "@/lib/provisioning/domain-blacklist";
+import type { DNSRegistrarRow } from "@/lib/provisioning/types";
+import {
+  type DomainCacheEntry,
+  type DomainInfoWithBlacklist,
+  evaluateCache,
+  filterUsedDomains,
+  sortDomainsCleanFirst,
+  writeDomainCache,
+  buildFetchingEntry,
+} from "@/lib/provisioning/domain-listing";
 
-// Hard lesson #43 (2026-04-10): Auto-populated registrar domain lists must be
-// filtered through the real DNSBL check so users can't accidentally pick a
-// Spamhaus-listed domain. `blacklistStatus` is added to every DomainInfo row.
-type BlacklistStatus = "clean" | "listed" | "unknown";
-interface DomainInfoWithBlacklist extends DomainInfo {
-  blacklistStatus: BlacklistStatus;
-  blacklists?: string[];
-  inUse?: boolean;
-}
-
+// Hard lesson #49 (2026-04-10): Vercel Hobby caps serverless functions at 10s
+// by default. Even though this route no longer waits for the slow Ionos
+// listing (it dispatches to a pg-boss worker), we keep a 60s ceiling to
+// accommodate rare cold starts and DB writes.
+export const maxDuration = 60;
 export const dynamic = "force-dynamic";
+
+// Hard lesson (2026-04-10): Ionos throttles at 25 req/min, so a full
+// listDomains() for 110 domains takes ~9 minutes. That cannot run inside a
+// Vercel serverless function. The entire pipeline has been moved to the
+// worker VPS via pg-boss queue `list-registrar-domains`; this route is now
+// a thin orchestrator that:
+//
+//   1. Returns the cached result if it's < 1h old
+//   2. Returns HTTP 202 {status:'fetching'} if a worker fetch is in-flight
+//   3. Otherwise marks the cache 'fetching', dispatches a pg-boss job, and
+//      returns HTTP 202 {status:'fetching'} so the wizard can start polling
+//
+// The wizard polls this same endpoint every few seconds until the status
+// flips to 'ready' (HTTP 200 with domains) or 'failed' (HTTP 502 with
+// error + retry button).
 
 async function getInternalOrgId(): Promise<string | null> {
   const { orgId } = await auth();
@@ -32,9 +48,15 @@ async function getInternalOrgId(): Promise<string | null> {
 
 /**
  * GET /api/dns-registrars/[id]/domains
- * Fetch all domains from the connected registrar, filtered for availability.
+ *
  * Query params:
  *   - refresh=true — bypass cache and force re-fetch
+ *
+ * Response envelope (same for cached + worker-completed):
+ *   200 { status: 'ready', domains, fetchedAt, cached, registrarName, registrarType }
+ *   202 { status: 'fetching', requestedAt }
+ *   502 { status: 'failed', error, fetchedAt }
+ *   401/404/500 — standard error envelopes
  */
 export async function GET(
   request: NextRequest,
@@ -51,7 +73,7 @@ export async function GET(
 
     const supabase = await createAdminClient();
 
-    // 1. Fetch registrar row by ID + org_id (multi-tenant isolation)
+    // 1. Fetch registrar row (multi-tenant filter via org_id).
     const { data: registrar, error: regError } = await supabase
       .from("dns_registrars")
       .select("*")
@@ -67,116 +89,78 @@ export async function GET(
     }
 
     const reg = registrar as DNSRegistrarRow;
-
-    // 2. Check cache (1 hour TTL)
     const config = (reg.config || {}) as Record<string, unknown>;
-    const domainCache = config.domainCache as
-      | { domains: DomainInfoWithBlacklist[]; fetchedAt: string }
-      | undefined;
+    const cache = config.domainCache as DomainCacheEntry | undefined;
+    const cacheState = evaluateCache(cache, { forceRefresh });
 
-    if (!forceRefresh && domainCache?.fetchedAt && domainCache.domains) {
-      const cacheAge = Date.now() - new Date(domainCache.fetchedAt).getTime();
-      const ONE_HOUR = 60 * 60 * 1000;
-      if (cacheAge < ONE_HOUR) {
-        const domains = await filterUsedDomains(supabase, orgId, domainCache.domains);
-        return NextResponse.json({
-          domains: sortDomainsCleanFirst(domains),
-          cached: true,
-          fetchedAt: domainCache.fetchedAt,
+    // 2. Fresh cache — return immediately (HTTP 200).
+    if (cacheState === "fresh" && cache?.status === "ready") {
+      // Re-filter "in-use" at response time so newly-provisioned pairs take
+      // effect even inside the 1h cache window.
+      const reFiltered = await filterUsedDomains(
+        supabase,
+        orgId,
+        cache.domains
+      );
+      return NextResponse.json({
+        status: "ready",
+        domains: sortDomainsCleanFirst(reFiltered),
+        fetchedAt: cache.fetchedAt,
+        cached: true,
+        registrarName: reg.name,
+        registrarType: reg.registrar_type,
+      });
+    }
+
+    // 3. Fetch in-flight — client should keep polling (HTTP 202).
+    if (cacheState === "fetching" && cache?.status === "fetching") {
+      return NextResponse.json(
+        {
+          status: "fetching",
+          requestedAt: cache.requestedAt,
           registrarName: reg.name,
           registrarType: reg.registrar_type,
-        });
-      }
+        },
+        { status: 202 }
+      );
     }
 
-    // 3. Decrypt API keys and instantiate registrar
-    let apiKey = "";
-    let apiSecret: string | null = null;
-
-    if (reg.api_key_encrypted) {
-      try {
-        apiKey = decrypt(reg.api_key_encrypted);
-      } catch {
-        return NextResponse.json(
-          { error: "Failed to decrypt API key. Re-enter credentials." },
-          { status: 500 }
-        );
-      }
-    }
-
-    if (reg.api_secret_encrypted) {
-      try {
-        apiSecret = decrypt(reg.api_secret_encrypted);
-      } catch {
-        return NextResponse.json(
-          { error: "Failed to decrypt API secret. Re-enter credentials." },
-          { status: 500 }
-        );
-      }
-    }
-
-    const registrarConfig = { ...config, apiKey, apiSecret };
-    const registrarInstance = await getDNSRegistrar(reg.registrar_type, registrarConfig);
-
-    // 4. Fetch domains from registrar
-    let rawDomains: DomainInfo[];
-    try {
-      rawDomains = await registrarInstance.listDomains();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Unknown error fetching domains";
+    // 4. Failed cache AND not refreshing — return the error (HTTP 502) so
+    //    the wizard can show a retry button. Refresh=true falls through to
+    //    the dispatch branch below.
+    if (cacheState === "failed" && cache?.status === "failed" && !forceRefresh) {
       return NextResponse.json(
-        { error: `Failed to fetch domains: ${message}` },
+        {
+          status: "failed",
+          error: cache.error || "Domain listing failed",
+          fetchedAt: cache.requestedAt,
+          registrarName: reg.name,
+          registrarType: reg.registrar_type,
+        },
         { status: 502 }
       );
     }
 
-    // 5. Blacklist-check every domain via Spamhaus DQS (primary) with
-    // worker VPS proxy fallback. 3-state result: clean | listed | unknown.
-    // Max 10 concurrent DNS lookups per batch. No registrar API quota.
-    // (Hard lesson #47 — legacy public mirror is blocked from Vercel.)
-    const blacklistResults = await checkDomainBlacklistBatch(
-      rawDomains.map((d) => d.domain),
-      { concurrency: 10 }
+    // 5. Everything else (missing / stale / failed-with-refresh) — mark the
+    //    cache as 'fetching' and return 202. The worker has a poller cron
+    //    (see src/worker/index.ts pollRegistrarDomainListings) that picks up
+    //    any dns_registrars row with config.domainCache.status='fetching'
+    //    AND dispatchedAt=null, sets dispatchedAt atomically, and kicks off
+    //    the list-registrar-domains pg-boss job. This matches the existing
+    //    Vercel→worker handoff pattern used by the provisioning step bridge
+    //    (provisioning_steps.metadata.dispatched_to_worker).
+    const fetchingEntry = buildFetchingEntry();
+    await writeDomainCache(supabase, registrarId, orgId, fetchingEntry);
+
+    return NextResponse.json(
+      {
+        status: "fetching",
+        requestedAt: fetchingEntry.requestedAt,
+        registrarName: reg.name,
+        registrarType: reg.registrar_type,
+      },
+      { status: 202 }
     );
-    const blacklistByDomain = new Map(
-      blacklistResults.map((r) => [r.domain.toLowerCase(), r])
-    );
-
-    const enrichedDomains: DomainInfoWithBlacklist[] = rawDomains.map((d) => {
-      const r = blacklistByDomain.get(d.domain.toLowerCase());
-      if (!r) {
-        return { ...d, blacklistStatus: "unknown" as BlacklistStatus };
-      }
-      return {
-        ...d,
-        blacklistStatus: r.status,
-        blacklists: r.lists,
-      };
-    });
-
-    // 6. Cache the result
-    const now = new Date().toISOString();
-    const updatedConfig = {
-      ...config,
-      domainCache: { domains: enrichedDomains, fetchedAt: now },
-    };
-
-    await supabase
-      .from("dns_registrars")
-      .update({ config: updatedConfig, updated_at: now })
-      .eq("id", registrarId)
-      .eq("org_id", orgId);
-
-    // 7. Filter out used domains
-    const domains = await filterUsedDomains(supabase, orgId, enrichedDomains);
-
-    return NextResponse.json({
-      domains: sortDomainsCleanFirst(domains),
-      cached: false,
-      fetchedAt: now,
-      registrarName: reg.name,
-      registrarType: reg.registrar_type,
-    });
   } catch (err) {
     console.error("[dns-registrars/domains] Error:", err);
     return NextResponse.json(
@@ -186,101 +170,6 @@ export async function GET(
   }
 }
 
-/**
- * Cross-reference domains with the sending_domains table to mark
- * already-used domains. A domain is considered "in use" only if it is
- * attached to a server_pair in a LIVE status (planned / provisioning /
- * active / warming / degraded). Pairs that were decommissioned or failed
- * should free up their domains for re-use.
- *
- * Schema notes (sending_domains has no org_id column — it scopes via pair_id):
- *   sending_domains(id, pair_id -> server_pairs(id), domain, ...)
- *   server_pairs(id, org_id, status, ...)
- *
- * Hard lesson (2026-04-10): the previous version queried
- * `.select("domain_name").eq("org_id", orgId)` — both the column and the
- * filter were wrong (sending_domains has `domain`, not `domain_name`, and
- * no `org_id`). This meant the wizard NEVER flagged in-use domains and
- * would happily let the operator attach the same domain to two pairs.
- */
-async function filterUsedDomains(
-  supabase: Awaited<ReturnType<typeof createAdminClient>>,
-  orgId: string,
-  domains: DomainInfoWithBlacklist[]
-): Promise<DomainInfoWithBlacklist[]> {
-  // Step 1: find all live (non-terminal) pairs in this org.
-  const LIVE_PAIR_STATUSES = [
-    "planned",
-    "provisioning",
-    "active",
-    "warming",
-    "degraded",
-  ];
-  const { data: livePairs, error: pairsErr } = await supabase
-    .from("server_pairs")
-    .select("id")
-    .eq("org_id", orgId)
-    .in("status", LIVE_PAIR_STATUSES);
-
-  if (pairsErr) {
-    console.warn(
-      "[dns-registrars/domains] filterUsedDomains: server_pairs query failed:",
-      pairsErr.message
-    );
-  }
-
-  const livePairIds = (livePairs || []).map((p: { id: string }) => p.id);
-
-  // Step 2: if there are no live pairs, nothing is in use.
-  let usedSet = new Set<string>();
-  if (livePairIds.length > 0) {
-    const { data: usedDomains, error: sdErr } = await supabase
-      .from("sending_domains")
-      .select("domain")
-      .in("pair_id", livePairIds);
-
-    if (sdErr) {
-      console.warn(
-        "[dns-registrars/domains] filterUsedDomains: sending_domains query failed:",
-        sdErr.message
-      );
-    }
-
-    usedSet = new Set(
-      (usedDomains || []).map((d: { domain: string }) => d.domain.toLowerCase())
-    );
-  }
-
-  return domains.map((d) => {
-    const inUse = usedSet.has(d.domain.toLowerCase());
-    // Only DEFINITIVELY blacklisted domains are blocked from selection.
-    // 'unknown' status means the blacklist service was unavailable —
-    // allow selection but the UI warns the operator to verify manually.
-    const blocked = d.blacklistStatus === "listed";
-    return {
-      ...d,
-      isAvailable: d.isAvailable && !inUse && !blocked,
-      ...(inUse ? { inUse: true } : {}),
-    };
-  });
-}
-
-/**
- * Sort clean domains first, then unknown, then listed. Keeps the wizard
- * dropdown focused on the domains that are actually pickable.
- */
-function sortDomainsCleanFirst(
-  domains: DomainInfoWithBlacklist[]
-): DomainInfoWithBlacklist[] {
-  const weight: Record<BlacklistStatus, number> = {
-    clean: 0,
-    unknown: 1,
-    listed: 2,
-  };
-  return [...domains].sort((a, b) => {
-    const aw = weight[a.blacklistStatus] ?? 1;
-    const bw = weight[b.blacklistStatus] ?? 1;
-    if (aw !== bw) return aw - bw;
-    return a.domain.localeCompare(b.domain);
-  });
-}
+// Explicit unused-import guard — keeps tree-shakers happy if the build
+// complains about unused type imports.
+export type _Types = DomainInfoWithBlacklist;

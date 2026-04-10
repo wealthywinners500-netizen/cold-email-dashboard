@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import {
   X as XIcon,
   Loader2,
@@ -58,13 +58,25 @@ interface DomainInputProps {
 type InputMode = "single" | "bulk" | "registrar";
 
 interface FetchState {
-  loading: boolean;
+  // 'idle'     — no fetch in flight, nothing to show
+  // 'loading'  — initial dispatch in progress (first HTTP call)
+  // 'polling'  — worker is fetching, we're polling every 5s
+  // 'ready'    — got the domain list
+  // 'failed'   — worker returned an error
+  phase: "idle" | "loading" | "polling" | "ready" | "failed";
   error: string | null;
   domains: (DomainInfo & { inUse?: boolean })[];
   registrarName: string | null;
   cached: boolean;
   fetchedAt: string | null;
+  requestedAt: string | null;
 }
+
+// Poll interval for the /api/dns-registrars/[id]/domains endpoint while the
+// worker is fetching. Hard lesson #49: worker-side listing of 110 domains
+// takes ~9 min, so we give the UI headroom up to 15 min before giving up.
+const POLL_INTERVAL_MS = 5000;
+const POLL_MAX_DURATION_MS = 15 * 60 * 1000;
 
 const DOMAIN_REGEX = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
 
@@ -149,14 +161,42 @@ export function DomainInput({
   const [fetchRegistrar, setFetchRegistrar] = useState<string>(selectedRegistrarId || "");
   const [showDropdown, setShowDropdown] = useState(false);
   const [fetchState, setFetchState] = useState<FetchState>({
-    loading: false,
+    phase: "idle",
     error: null,
     domains: [],
     registrarName: null,
     cached: false,
     fetchedAt: null,
+    requestedAt: null,
   });
   const [selectedFetched, setSelectedFetched] = useState<Set<string>>(new Set());
+
+  // Refs so our polling loop isn't recreated on every render and can be
+  // cancelled cleanly on unmount / mode-change / registrar-change.
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollStartRef = useRef<number | null>(null);
+  const activeRegistrarRef = useRef<string | null>(null);
+
+  const stopPolling = useCallback(() => {
+    if (pollTimerRef.current) {
+      clearTimeout(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+    pollStartRef.current = null;
+  }, []);
+
+  // Cleanup on unmount — kills any in-flight poll timer.
+  useEffect(() => {
+    return () => stopPolling();
+  }, [stopPolling]);
+
+  // Cleanup when leaving registrar mode — abandon any in-flight poll.
+  useEffect(() => {
+    if (mode !== "registrar") {
+      stopPolling();
+      activeRegistrarRef.current = null;
+    }
+  }, [mode, stopPolling]);
 
   // ---- Single/Bulk mode handlers (unchanged from original) ----
 
@@ -277,45 +317,218 @@ export function DomainInput({
   };
 
   // ---- Registrar fetch handlers ----
+  //
+  // Hard lesson #49 (2026-04-10): listing 110 Ionos domains takes ~9 min
+  // because the API is throttled at 25 req/min and we need 2 calls per domain
+  // (zone + MX record). That cannot run inside a Vercel serverless function.
+  // The endpoint has been refactored to an async-polling contract:
+  //
+  //   POST/GET first call → 202 { status: 'fetching', requestedAt }
+  //   subsequent GETs      → 202 { status: 'fetching' } until worker done
+  //   done                 → 200 { status: 'ready',  domains, fetchedAt }
+  //   error                → 502 { status: 'failed', error }
+  //
+  // The wizard polls every 5s and gives up after 15 min.
 
-  const fetchDomains = useCallback(
-    async (registrarId: string, refresh = false) => {
-      setFetchState((prev) => ({ ...prev, loading: true, error: null }));
-      setSelectedFetched(new Set());
+  const pollOnce = useCallback(
+    async (registrarId: string): Promise<void> => {
+      // Guard: if the user switched registrars / modes while we were waiting,
+      // stop updating state for the previous fetch.
+      if (activeRegistrarRef.current !== registrarId) return;
+
       try {
-        const url = `/api/dns-registrars/${registrarId}/domains${refresh ? "?refresh=true" : ""}`;
-        const res = await fetch(url);
+        const res = await fetch(
+          `/api/dns-registrars/${registrarId}/domains`
+        );
         const data = await res.json();
-        if (!res.ok) {
+
+        if (activeRegistrarRef.current !== registrarId) return;
+
+        // HTTP 200 — worker finished, render the list.
+        if (res.status === 200 && data.status === "ready") {
+          stopPolling();
+          setFetchState({
+            phase: "ready",
+            error: null,
+            domains: data.domains || [],
+            registrarName: data.registrarName || null,
+            cached: data.cached || false,
+            fetchedAt: data.fetchedAt || null,
+            requestedAt: null,
+          });
+          const available = (data.domains || [])
+            .filter((d: DomainInfo) => d.isAvailable)
+            .map((d: DomainInfo) => d.domain);
+          setSelectedFetched(new Set(available));
+          return;
+        }
+
+        // HTTP 202 — worker still fetching, schedule next poll.
+        if (res.status === 202 && data.status === "fetching") {
+          const started = pollStartRef.current ?? Date.now();
+          if (pollStartRef.current === null) pollStartRef.current = started;
+
+          if (Date.now() - started > POLL_MAX_DURATION_MS) {
+            stopPolling();
+            setFetchState((prev) => ({
+              ...prev,
+              phase: "failed",
+              error:
+                "Timed out waiting for domains (15 min). The worker may be stuck — retry, or check the worker VPS.",
+            }));
+            return;
+          }
+
           setFetchState((prev) => ({
             ...prev,
-            loading: false,
-            error: data.error || "Failed to fetch domains",
+            phase: "polling",
+            error: null,
+            registrarName: data.registrarName || prev.registrarName,
+            requestedAt: data.requestedAt || prev.requestedAt,
+          }));
+
+          pollTimerRef.current = setTimeout(
+            () => pollOnce(registrarId),
+            POLL_INTERVAL_MS
+          );
+          return;
+        }
+
+        // HTTP 502 — worker failed, surface the error + retry button.
+        if (res.status === 502 || data.status === "failed") {
+          stopPolling();
+          setFetchState((prev) => ({
+            ...prev,
+            phase: "failed",
+            error: data.error || "Worker failed to list domains",
           }));
           return;
         }
-        setFetchState({
-          loading: false,
-          error: null,
-          domains: data.domains || [],
-          registrarName: data.registrarName || null,
-          cached: data.cached || false,
-          fetchedAt: data.fetchedAt || null,
-        });
-        // Auto-select available domains
-        const available = (data.domains || [])
-          .filter((d: DomainInfo) => d.isAvailable)
-          .map((d: DomainInfo) => d.domain);
-        setSelectedFetched(new Set(available));
-      } catch {
+
+        // Anything else — surface as an error.
+        stopPolling();
         setFetchState((prev) => ({
           ...prev,
-          loading: false,
-          error: "Network error fetching domains",
+          phase: "failed",
+          error: data.error || `Unexpected response (HTTP ${res.status})`,
+        }));
+      } catch (err) {
+        if (activeRegistrarRef.current !== registrarId) return;
+        // Transient network error — keep polling so the UI recovers
+        // automatically if Vercel has a blip. Bail out via the overall
+        // POLL_MAX_DURATION_MS budget above.
+        const started = pollStartRef.current ?? Date.now();
+        if (pollStartRef.current === null) pollStartRef.current = started;
+        if (Date.now() - started > POLL_MAX_DURATION_MS) {
+          stopPolling();
+          setFetchState((prev) => ({
+            ...prev,
+            phase: "failed",
+            error:
+              err instanceof Error
+                ? `Network error: ${err.message}`
+                : "Network error fetching domains",
+          }));
+          return;
+        }
+        pollTimerRef.current = setTimeout(
+          () => pollOnce(registrarId),
+          POLL_INTERVAL_MS
+        );
+      }
+    },
+    [stopPolling]
+  );
+
+  const fetchDomains = useCallback(
+    async (registrarId: string, refresh = false) => {
+      // Reset any previous poll state + mark this registrar as the active one.
+      stopPolling();
+      activeRegistrarRef.current = registrarId;
+      pollStartRef.current = Date.now();
+      setSelectedFetched(new Set());
+      setFetchState((prev) => ({
+        ...prev,
+        phase: "loading",
+        error: null,
+        domains: [],
+        fetchedAt: null,
+        requestedAt: null,
+        registrarName:
+          registrars.find((r) => r.id === registrarId)?.name || prev.registrarName,
+      }));
+
+      try {
+        const url = `/api/dns-registrars/${registrarId}/domains${
+          refresh ? "?refresh=true" : ""
+        }`;
+        const res = await fetch(url);
+        const data = await res.json();
+
+        if (activeRegistrarRef.current !== registrarId) return;
+
+        // Fresh-cache path — 200 + ready in one shot.
+        if (res.status === 200 && data.status === "ready") {
+          setFetchState({
+            phase: "ready",
+            error: null,
+            domains: data.domains || [],
+            registrarName: data.registrarName || null,
+            cached: data.cached || false,
+            fetchedAt: data.fetchedAt || null,
+            requestedAt: null,
+          });
+          const available = (data.domains || [])
+            .filter((d: DomainInfo) => d.isAvailable)
+            .map((d: DomainInfo) => d.domain);
+          setSelectedFetched(new Set(available));
+          return;
+        }
+
+        // Worker dispatched / in-flight — start polling.
+        if (res.status === 202 && data.status === "fetching") {
+          setFetchState((prev) => ({
+            ...prev,
+            phase: "polling",
+            error: null,
+            registrarName: data.registrarName || prev.registrarName,
+            requestedAt: data.requestedAt || null,
+          }));
+          pollTimerRef.current = setTimeout(
+            () => pollOnce(registrarId),
+            POLL_INTERVAL_MS
+          );
+          return;
+        }
+
+        // Previous failure — surface the error, leave Retry visible.
+        if (res.status === 502 || data.status === "failed") {
+          setFetchState((prev) => ({
+            ...prev,
+            phase: "failed",
+            error: data.error || "Worker failed to list domains",
+          }));
+          return;
+        }
+
+        setFetchState((prev) => ({
+          ...prev,
+          phase: "failed",
+          error: data.error || `Unexpected response (HTTP ${res.status})`,
+        }));
+      } catch (err) {
+        if (activeRegistrarRef.current !== registrarId) return;
+        setFetchState((prev) => ({
+          ...prev,
+          phase: "failed",
+          error:
+            err instanceof Error
+              ? `Network error: ${err.message}`
+              : "Network error fetching domains",
         }));
       }
     },
-    []
+    [registrars, stopPolling, pollOnce]
   );
 
   const toggleFetched = useCallback((domain: string) => {
@@ -467,16 +680,40 @@ export function DomainInput({
             )}
           </div>
 
-          {/* Loading */}
-          {fetchState.loading && (
+          {/* Loading — first dispatch */}
+          {fetchState.phase === "loading" && (
             <div className="flex items-center justify-center gap-2 rounded-lg border border-gray-700 bg-gray-800/50 py-8 text-sm text-gray-400">
               <Loader2 className="h-5 w-5 animate-spin text-blue-500" />
-              Fetching domains from {registrars.find((r) => r.id === fetchRegistrar)?.name || "registrar"}...
+              Dispatching fetch to {registrars.find((r) => r.id === fetchRegistrar)?.name || "registrar"}...
+            </div>
+          )}
+
+          {/* Polling — worker is actively listing domains */}
+          {fetchState.phase === "polling" && (
+            <div className="rounded-lg border border-blue-800/50 bg-blue-900/10 px-4 py-5 text-sm text-blue-200">
+              <div className="flex items-center gap-2">
+                <Loader2 className="h-5 w-5 animate-spin text-blue-400 flex-shrink-0" />
+                <div className="flex-1">
+                  <div className="font-medium">
+                    Fetching domains from {fetchState.registrarName || "registrar"}...
+                  </div>
+                  <div className="mt-1 text-xs text-blue-300/80">
+                    This can take several minutes for accounts with many domains.
+                    The worker is running Spamhaus blacklist checks on each one;
+                    the wizard will update automatically when it&apos;s done.
+                  </div>
+                  {fetchState.requestedAt && (
+                    <div className="mt-1 text-xs text-blue-300/60">
+                      Started {new Date(fetchState.requestedAt).toLocaleTimeString()}
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
           )}
 
           {/* Error */}
-          {fetchState.error && (
+          {fetchState.phase === "failed" && fetchState.error && (
             <div className="rounded-lg border border-red-800/50 bg-red-900/20 px-4 py-3 text-sm text-red-300">
               <div className="flex items-center gap-2">
                 <XCircle className="h-4 w-4 flex-shrink-0" />
@@ -494,7 +731,7 @@ export function DomainInput({
           )}
 
           {/* Domain List */}
-          {!fetchState.loading && !fetchState.error && fetchState.domains.length > 0 && (
+          {fetchState.phase === "ready" && fetchState.domains.length > 0 && (
             <div className="rounded-lg border border-gray-700 bg-gray-800/50">
               {/* Header */}
               <div className="flex items-center justify-between border-b border-gray-700 px-4 py-2.5">
@@ -578,7 +815,7 @@ export function DomainInput({
           )}
 
           {/* Empty state */}
-          {!fetchState.loading && !fetchState.error && fetchState.domains.length === 0 &&
+          {fetchState.phase === "ready" && fetchState.domains.length === 0 &&
             fetchRegistrar && fetchState.registrarName && (
               <div className="rounded-lg border border-gray-700 bg-gray-800/50 px-4 py-6 text-center text-sm text-gray-500">
                 No domains found in {fetchState.registrarName}.

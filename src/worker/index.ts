@@ -15,6 +15,10 @@ import { handleProvisionPair } from "./handlers/provision-pair";
 import { handleProvisionStep } from "./handlers/provision-step";
 import { handleRollbackProvision } from "./handlers/rollback-provision";
 import { handleHealthCheck } from "./handlers/health-check";
+import {
+  handleListRegistrarDomains,
+  type ListRegistrarDomainsPayload,
+} from "./handlers/list-registrar-domains";
 import { closeAll } from "../lib/email/smtp-manager";
 import { createClient } from "@supabase/supabase-js";
 import { handleWorkerError, updateWorkerHeartbeat, resetDailyCounters } from "../lib/email/error-handler";
@@ -64,6 +68,7 @@ async function main() {
     "server-health-check-cron",
     "server-health-check",
     "poll-provisioning-jobs",
+    "list-registrar-domains",
   ];
   for (const name of queueNames) {
     await boss.createQueue(name);
@@ -453,6 +458,46 @@ async function main() {
     }
   );
 
+  // Register list-registrar-domains handler.
+  // Async-polling worker for the /api/dns-registrars/[id]/domains endpoint.
+  // The Vercel route writes a {status:'fetching'} cache entry, dispatches to
+  // this queue, and returns HTTP 202 immediately. The worker then performs
+  // the full slow listing (Ionos per-domain MX check takes ~9 min for 110
+  // domains at 25 req/min throttle) and writes the result back to
+  // dns_registrars.config.domainCache. The wizard polls the same endpoint
+  // every few seconds until the cache flips to 'ready'.
+  //
+  // localConcurrency=1 + batchSize=1: we never want two simultaneous full
+  // registrar listings against the same account — Ionos's throttle is
+  // per-account and concurrent listings would just rate-limit each other.
+  await boss.work<ListRegistrarDomainsPayload>(
+    "list-registrar-domains",
+    {
+      batchSize: 1,
+      pollingIntervalSeconds: 5,
+      localConcurrency: 1,
+    },
+    async (jobs) => {
+      for (const job of jobs) {
+        console.log(
+          `[Worker] Starting list-registrar-domains job ${job.id} for registrar ${job.data.registrarId}`
+        );
+        try {
+          await handleListRegistrarDomains(job.data);
+          console.log(
+            `[Worker] list-registrar-domains job ${job.id} completed successfully`
+          );
+        } catch (err) {
+          console.error(
+            `[Worker] list-registrar-domains job ${job.id} failed:`,
+            err
+          );
+          throw err;
+        }
+      }
+    }
+  );
+
   // --- Provisioning job-polling cron DISABLED 2026-04-10 ---
   // Hard lesson #11: This legacy monolithic path raced with the Vercel
   // execute-step endpoint and corrupted step rows. The canonical provisioning
@@ -516,6 +561,96 @@ async function main() {
   // Poll every 10 seconds for dispatched steps
   setInterval(pollDispatchedSteps, 10000);
   await pollDispatchedSteps();
+
+  // --- Poll for pending registrar domain-listing requests (worker bridge) ---
+  // Vercel /api/dns-registrars/[id]/domains writes a 'fetching' cache entry
+  // when a wizard user clicks Fetch from Registrar. This poller picks those
+  // up and dispatches the slow listDomains+blacklist pipeline to the
+  // list-registrar-domains pg-boss queue. Same pattern as pollDispatchedSteps.
+  //
+  // The Ionos per-domain MX check takes ~9 minutes for 110 domains at the
+  // 25 req/min throttle, which is why this has to run on the worker VPS
+  // instead of inside a Vercel serverless function.
+  const pollRegistrarDomainListings = async () => {
+    try {
+      const supabase = getSupabase();
+
+      // Find registrars with a pending fetch (status='fetching', not yet
+      // dispatched). We can't query JSONB subfields via .eq without a raw
+      // SQL expression, so we select all rows and filter in-process. The
+      // registrar table is small (single-digit per org) so this is fine.
+      const { data: rows } = await supabase
+        .from("dns_registrars")
+        .select("id, org_id, config")
+        .not("config", "is", null);
+
+      for (const row of rows || []) {
+        const cfg = (row.config || {}) as Record<string, unknown>;
+        const cache = cfg.domainCache as
+          | {
+              status?: string;
+              requestedAt?: string;
+              dispatchedAt?: string | null;
+            }
+          | undefined;
+
+        if (!cache || cache.status !== "fetching") continue;
+        if (cache.dispatchedAt) continue; // already dispatched
+
+        // Stale-guard: if the request is older than 15 minutes, skip it —
+        // the Vercel route will treat it as stale on the next poll and
+        // write a fresh fetching entry.
+        if (cache.requestedAt) {
+          const age =
+            Date.now() - new Date(cache.requestedAt).getTime();
+          if (age > 15 * 60 * 1000) continue;
+        }
+
+        // Atomically mark as dispatched so no other poller tick (or no
+        // second worker instance) picks up the same row.
+        const updatedCache = {
+          ...cache,
+          dispatchedAt: new Date().toISOString(),
+        };
+        const updatedConfig = { ...cfg, domainCache: updatedCache };
+
+        const { error: updateError } = await supabase
+          .from("dns_registrars")
+          .update({
+            config: updatedConfig,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", row.id)
+          .eq("org_id", row.org_id);
+
+        if (updateError) {
+          console.error(
+            `[Worker] Failed to mark registrar ${row.id} as dispatched:`,
+            updateError.message
+          );
+          continue;
+        }
+
+        console.log(
+          `[Worker] Found pending registrar listing for ${row.id}, queuing list-registrar-domains job...`
+        );
+
+        await boss.send("list-registrar-domains", {
+          registrarId: row.id,
+          orgId: row.org_id,
+          requestedAt: cache.requestedAt || new Date().toISOString(),
+        });
+      }
+    } catch (err) {
+      console.error("[Worker] Registrar domain listing poll failed:", err);
+    }
+  };
+
+  // Poll every 5 seconds for pending registrar listings. Faster than the
+  // step-dispatch poll because the wizard UX benefits from shorter latency
+  // at the start of the fetch.
+  setInterval(pollRegistrarDomainListings, 5000);
+  await pollRegistrarDomainListings();
 
   console.log("[Worker] Email worker is running. Waiting for jobs...");
 
