@@ -15,13 +15,26 @@ export enum PlanResource {
 /**
  * Plan tier definitions
  *
- * 'comped' is an admin-granted free access tier with same limits as starter.
- * It bypasses the Stripe subscription requirement in POST /api/provisioning,
- * so an operator can grant a specific org free access via:
- *   UPDATE organizations SET plan_tier='comped' WHERE clerk_org_id='<friend>';
- * Everyone else needs a real Stripe subscription to provision.
+ * ADMIN-GRANTED FREE TIERS (bypass the Stripe subscription requirement in
+ * POST /api/provisioning):
+ *
+ *   'developer' — Internal / founder / dev-team accounts that must never be
+ *   billed for the app itself. Enterprise-level resource limits (999 across
+ *   the board) so day-to-day usage is unconstrained. Meant for Dean's own
+ *   org, co-founders, and anyone building on the platform. Grant via:
+ *     UPDATE organizations SET plan_tier='developer' WHERE clerk_org_id='<org>';
+ *   Stripe webhooks will NOT downgrade a developer tier — see guard logic
+ *   in src/app/api/webhooks/stripe/route.ts.
+ *
+ *   'comped' — Short-term free access for a beta tester, support apology, or
+ *   friend trial. Starter-level resource caps so the grant doesn't consume
+ *   disproportionate infra. Grant via:
+ *     UPDATE organizations SET plan_tier='comped' WHERE clerk_org_id='<org>';
+ *
+ * PAID TIERS: starter / pro / enterprise — require a non-null
+ * stripe_subscription_id for provisioning to be allowed.
  */
-export type PlanTier = 'starter' | 'pro' | 'enterprise' | 'comped';
+export type PlanTier = 'starter' | 'pro' | 'enterprise' | 'comped' | 'developer';
 
 /**
  * Plan limits structure
@@ -78,6 +91,19 @@ const PLAN_TIERS: Record<PlanTier, PlanLimits> = {
     daily_sends: 5000,
     lead_contacts: 25000,
     team_members: 5,
+  },
+  developer: {
+    // Internal / founder / dev-team tier. Enterprise-level ceilings so day-to-day
+    // development and dogfooding never hits a resource cap. Like 'comped', this tier
+    // bypasses the Stripe subscription gate in isProvisioningAllowed. Unlike 'comped',
+    // the limits are uncapped (999) instead of starter-level, because developer accounts
+    // are the people building the platform — they shouldn't be throttled.
+    server_pairs: 999,
+    email_accounts: 999,
+    campaigns: 999,
+    daily_sends: 50000,
+    lead_contacts: 999,
+    team_members: 25,
   },
   enterprise: {
     server_pairs: 999,
@@ -328,8 +354,14 @@ export async function isProvisioningAllowed(
   const plan = ((org.plan_tier as PlanTier) || 'starter') as PlanTier;
   const hasSubscription = Boolean(org.stripe_subscription_id);
 
-  // Step 2: billing gate. Comped bypasses. Everyone else needs a subscription.
-  if (plan !== 'comped' && !hasSubscription) {
+  // Step 2: billing gate.
+  // Admin-granted free tiers ('developer', 'comped') bypass the Stripe
+  // subscription requirement. Paid tiers (starter/pro/enterprise) must have
+  // a non-null stripe_subscription_id before any VPS/DNS resources can be
+  // allocated — this is the control-plane block that prevents a signed-in
+  // user with no active subscription from spinning up real cloud resources.
+  const isAdminGrantedFree = plan === 'developer' || plan === 'comped';
+  if (!isAdminGrantedFree && !hasSubscription) {
     return { status: 'billing_required', plan };
   }
 

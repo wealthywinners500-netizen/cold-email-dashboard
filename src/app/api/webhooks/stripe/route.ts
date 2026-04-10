@@ -39,6 +39,24 @@ async function getPlanTierFromPriceId(priceId: string): Promise<string | null> {
   return null;
 }
 
+// Admin-granted free tiers are never automatically changed by Stripe webhook
+// events. A developer or comped account that somehow ends up with a Stripe
+// subscription must be managed manually — we will NOT silently overwrite the
+// admin intent. Returns true if the org's current plan_tier should be left
+// alone regardless of what Stripe is telling us.
+async function isAdminGrantedFreeTier(
+  supabase: Awaited<ReturnType<typeof createAdminClient>>,
+  orgId: string
+): Promise<boolean> {
+  const { data } = await supabase
+    .from('organizations')
+    .select('plan_tier')
+    .eq('id', orgId)
+    .single();
+  const current = data?.plan_tier as string | undefined;
+  return current === 'developer' || current === 'comped';
+}
+
 export async function POST(request: NextRequest) {
   const signature = request.headers.get('stripe-signature');
 
@@ -84,6 +102,26 @@ export async function POST(request: NextRequest) {
           break;
         }
 
+        // Admin-granted free tier guard: if this org is 'developer' or 'comped',
+        // refuse to silently overwrite the admin intent. A Stripe checkout
+        // against a dev/comped account is almost certainly an accident; at
+        // minimum we want to surface it in logs rather than flip the tier.
+        if (await isAdminGrantedFreeTier(supabase, orgId)) {
+          console.warn(
+            `[stripe-webhook] Skipping checkout.session.completed plan_tier update for admin-granted free org ${orgId} (subscription ${session.subscription}). Clear plan_tier manually if this was intentional.`
+          );
+          // Still store the customer/subscription IDs so future webhooks can
+          // correlate, but DO NOT touch plan_tier.
+          await supabase
+            .from('organizations')
+            .update({
+              stripe_customer_id: session.customer as string,
+              stripe_subscription_id: session.subscription as string,
+            })
+            .eq('id', orgId);
+          break;
+        }
+
         // Update organization
         await supabase
           .from('organizations')
@@ -122,6 +160,14 @@ export async function POST(request: NextRequest) {
           break;
         }
 
+        // Admin-granted free tier guard: see checkout.session.completed above.
+        if (await isAdminGrantedFreeTier(supabase, orgId)) {
+          console.warn(
+            `[stripe-webhook] Skipping customer.subscription.updated plan_tier update for admin-granted free org ${orgId}.`
+          );
+          break;
+        }
+
         await supabase
           .from('organizations')
           .update({ plan_tier: planTier })
@@ -137,6 +183,18 @@ export async function POST(request: NextRequest) {
 
         if (!orgId) {
           console.error('No org ID in subscription metadata');
+          break;
+        }
+
+        // Admin-granted free tier guard: NEVER downgrade a developer or comped
+        // account just because a Stripe subscription somewhere was cancelled.
+        // This is the most important guard of the three — without it, any
+        // stray subscription.deleted event would silently blow away the admin
+        // intent and quietly put Dean's founder account back on starter caps.
+        if (await isAdminGrantedFreeTier(supabase, orgId)) {
+          console.warn(
+            `[stripe-webhook] Skipping customer.subscription.deleted reset for admin-granted free org ${orgId}. plan_tier left untouched.`
+          );
           break;
         }
 

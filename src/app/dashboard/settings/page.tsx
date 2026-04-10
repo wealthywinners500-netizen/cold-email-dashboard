@@ -41,6 +41,12 @@ function getPlanBadgeColor(planTier: string): string {
       return "bg-purple-900 text-purple-200";
     case "pro":
       return "bg-blue-900 text-blue-200";
+    case "developer":
+      // Green — internal / founder tier with unlimited limits, not billed.
+      return "bg-emerald-900 text-emerald-200";
+    case "comped":
+      // Amber — admin-granted short-term free tier at starter caps.
+      return "bg-amber-900 text-amber-200";
     case "starter":
     default:
       return "bg-gray-800 text-gray-200";
