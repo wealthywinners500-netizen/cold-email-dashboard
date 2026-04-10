@@ -421,6 +421,20 @@ export class IonosRegistrar extends BaseDNSRegistrar {
     const limit = 200;
     let totalCount = limit; // Start with limit to ensure at least one iteration
 
+    // Hard lesson #57 (2026-04-10): Test #13 wizard Step 2 hang root cause.
+    // Per-domain MX checks call `/dns/v1/zones/{id}/records?type=MX`, which
+    // requires the `DOMAINS.DNS.READ` scope on the IONOS API key. Dean's
+    // current key lacks that scope, so every MX check 401s. With throttling
+    // retry/backoff, each 401 burns ~6 seconds and for 110 domains that's
+    // ~11 minutes — right up against the wizard's 15-min polling budget.
+    //
+    // Circuit breaker: after the first 401 (or any 4xx on MX check) we stop
+    // probing MX for the remaining domains and log it once. The loop still
+    // returns all domains from the much-cheaper `domainitems` listing and
+    // leaves `hasMxRecords = null` (unknown). Completion time drops from
+    // ~11 min to ~5 seconds.
+    let mxChecksDisabled = false;
+
     this.log(`Fetching domains from IONOS account...`);
 
     // Paginate through all domains
@@ -450,38 +464,63 @@ export class IonosRegistrar extends BaseDNSRegistrar {
           // Cache the domain ID
           this.domainIdCache.set(domainName, domainItem.id);
 
-          // Check for MX records using DNS API
-          // This may fail with 401 for domains on custom NS (not IONOS DNS) — that's OK
-          try {
-            const zoneId = await this.getZoneId(domainName);
-            const mxUrl = `${this.baseUrl}/dns/v1/zones/${zoneId}/records?type=MX`;
+          // Check for MX records using DNS API — unless the circuit breaker
+          // above has tripped. This may fail with 401 for zones on custom NS
+          // or for API keys that lack DNS scope; the breaker handles both.
+          if (!mxChecksDisabled) {
+            try {
+              const zoneId = await this.getZoneId(domainName);
+              const mxUrl = `${this.baseUrl}/dns/v1/zones/${zoneId}/records?type=MX`;
 
-            // IONOS DNS API returns an array of records directly, NOT wrapped in { records: [...] }
-            interface MxRecord {
-              id: string;
-              name: string;
-              type: string;
-              content: string;
+              // IONOS DNS API returns an array of records directly, NOT wrapped in { records: [...] }
+              interface MxRecord {
+                id: string;
+                name: string;
+                type: string;
+                content: string;
+              }
+
+              const mxRecords = await this.httpRequest<MxRecord[]>(mxUrl, {
+                method: "GET",
+              });
+
+              hasMxRecords = Array.isArray(mxRecords) && mxRecords.length > 0;
+              this.log(`Domain ${domainName}: MX records found = ${hasMxRecords}`);
+            } catch (mxError) {
+              const mxMsg =
+                mxError instanceof Error ? mxError.message : "Unknown error";
+              // Flip the circuit breaker on 401/403 — if the API key can't
+              // read DNS at all, every subsequent call will fail identically.
+              // We still return the domain list (hasMxRecords=null) so the
+              // wizard can show them for manual review.
+              if (
+                mxMsg.includes("401") ||
+                mxMsg.includes("403") ||
+                mxMsg.toLowerCase().includes("unauthorized") ||
+                mxMsg.toLowerCase().includes("not authorized")
+              ) {
+                this.log(
+                  `MX check denied for ${domainName} (${mxMsg}). ` +
+                    `IONOS API key lacks DNS scope — disabling MX checks for ` +
+                    `remaining domains. Wizard will show them as MX-unknown.`
+                );
+                mxChecksDisabled = true;
+              } else {
+                this.log(
+                  `Could not check MX records for ${domainName}: ${mxMsg}`
+                );
+              }
+              hasMxRecords = null;
             }
-
-            const mxRecords = await this.httpRequest<MxRecord[]>(mxUrl, {
-              method: "GET",
-            });
-
-            hasMxRecords = Array.isArray(mxRecords) && mxRecords.length > 0;
-            this.log(`Domain ${domainName}: MX records found = ${hasMxRecords}`);
-          } catch (mxError) {
-            // 401 = DNS not managed by IONOS (custom NS), treat as no MX data
-            this.log(
-              `Could not check MX records for ${domainName}: ${
-                mxError instanceof Error ? mxError.message : "Unknown error"
-              }`
-            );
-            hasMxRecords = null;
           }
 
-          // Determine availability: no MX records (or unknown) = potentially available
-          const isAvailable = hasMxRecords === false;
+          // Determine availability: confirmed no MX records OR unknown = selectable.
+          // Only confirmed-has-MX domains are marked unavailable. This matches
+          // how operators use the wizard in practice — the real gate is the
+          // downstream Spamhaus/blacklist check plus visual review, not the
+          // MX heuristic. Prior behavior (hasMxRecords===false) locked out
+          // every domain when the API key lacked DNS scope.
+          const isAvailable = hasMxRecords !== true;
 
           const domainInfo: DomainInfo = {
             domain: domainName,
