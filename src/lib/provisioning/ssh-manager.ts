@@ -58,6 +58,7 @@ export class SSHManager {
   private host: string = '';
   private port: number = 22;
   private username: string = '';
+  private authConfig: SSHAuthConfig | null = null;
   private isConnectedFlag: boolean = false;
   private keepaliveIntervalHandle: NodeJS.Timeout | null = null;
   private missedKeepalives: number = 0;
@@ -97,6 +98,7 @@ export class SSHManager {
     this.host = host;
     this.port = port;
     this.username = username;
+    this.authConfig = auth;
 
     let lastError: Error | null = null;
 
@@ -164,7 +166,10 @@ export class SSHManager {
 
       try {
         // Use a simple echo command to keep connection alive
-        this.ssh.execCommand('echo "keepalive"').catch(() => {
+        this.ssh.execCommand('echo "keepalive"').then(() => {
+          // Only reset on SUCCESS (fixes race condition where reset ran before promise resolved)
+          this.missedKeepalives = 0;
+        }).catch(() => {
           this.missedKeepalives++;
           this.log(
             `[SSH] Keepalive missed (${this.missedKeepalives}/${this.maxMissedKeepalives})`
@@ -177,8 +182,6 @@ export class SSHManager {
             this.disconnect().catch(() => {});
           }
         });
-
-        this.missedKeepalives = 0;
       } catch {
         this.missedKeepalives++;
       }
@@ -230,6 +233,15 @@ export class SSHManager {
    * Default timeout: 60s
    */
   async exec(command: string, options?: ExecOptions): Promise<ExecResult> {
+    // Auto-reconnect if connection was dropped (e.g., idle timeout during DNS propagation wait)
+    if ((!this.ssh || !this.isConnectedFlag) && this.authConfig && this.host) {
+      this.log(`[SSH] Connection lost — auto-reconnecting to ${this.username}@${this.host}:${this.port}...`);
+      // Reset state for fresh connection
+      this.ssh = null;
+      this.isConnectedFlag = false;
+      await this.connect(this.host, this.port, this.username, this.authConfig);
+    }
+
     if (!this.ssh || !this.isConnectedFlag) {
       throw new SSHConnectionError('Not connected');
     }
@@ -302,6 +314,14 @@ export class SSHManager {
     onStdout?: (chunk: string) => void,
     onStderr?: (chunk: string) => void
   ): Promise<number> {
+    // Auto-reconnect if connection was dropped
+    if ((!this.ssh || !this.isConnectedFlag) && this.authConfig && this.host) {
+      this.log(`[SSH] Connection lost — auto-reconnecting to ${this.username}@${this.host}:${this.port}...`);
+      this.ssh = null;
+      this.isConnectedFlag = false;
+      await this.connect(this.host, this.port, this.username, this.authConfig);
+    }
+
     if (!this.ssh || !this.isConnectedFlag) {
       throw new SSHConnectionError('Not connected');
     }
