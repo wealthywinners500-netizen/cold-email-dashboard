@@ -431,7 +431,34 @@ export function createPairProvisioningSaga(
             { hostname: `ns2.${context.nsDomain}`, ip: server2IP },
           ]);
 
+          // Hard lesson #53: sending domains must be delegated to the new pair's NS too,
+          // otherwise mail from the new pair fails SPF/reverse-DNS alignment at recipient MTAs.
+          // The ns_domain glue records above are necessary but not sufficient — each sending
+          // domain is its own registered name at the registrar and carries its own NS records.
+          const ns1Host = `ns1.${context.nsDomain}`;
+          const ns2Host = `ns2.${context.nsDomain}`;
+          const sendingDomainDelegation: Array<{ domain: string; ok: boolean; error?: string }> = [];
+          for (const sendingDomain of context.sendingDomains ?? []) {
+            try {
+              await dnsRegistrar.updateNameserversOnly(sendingDomain, [ns1Host, ns2Host]);
+              sendingDomainDelegation.push({ domain: sendingDomain, ok: true });
+              context.log(`[Step 3] Delegated ${sendingDomain} → ${ns1Host}, ${ns2Host}`);
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              sendingDomainDelegation.push({ domain: sendingDomain, ok: false, error: msg });
+              context.log(`[Step 3] FAILED to delegate ${sendingDomain}: ${msg}`);
+            }
+          }
+          const failedDelegations = sendingDomainDelegation.filter((d) => !d.ok);
+          if (failedDelegations.length > 0) {
+            return {
+              success: false,
+              error: `Sending domain NS delegation failed for: ${failedDelegations.map((d) => `${d.domain} (${d.error})`).join('; ')}`,
+            };
+          }
+
           context.log('[Step 3] NS and glue records submitted to registrar.');
+          context.log(`[Step 3] ${sendingDomainDelegation.length} sending domains delegated to new pair.`);
           context.log('[Step 3] Propagation started — will take 12-48 hours globally.');
           context.log('[Step 3] Continuing setup in parallel (no need to wait for full propagation).');
 

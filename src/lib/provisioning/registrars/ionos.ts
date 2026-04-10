@@ -174,6 +174,10 @@ export class IonosRegistrar extends BaseDNSRegistrar {
    * If setGlueRecords() is NOT called after this, the NS change won't happen.
    * This is by design — NS without glue records would break DNS resolution
    * for self-hosted nameservers (ns1.domain, ns2.domain under same zone).
+   *
+   * @deprecated Use this only for the ns_domain (where glue records are required).
+   *            For delegating sending domains (which don't need glue), use updateNameserversOnly() instead.
+   *            Hard lesson #54: The stashing pattern is fragile; prefer updateNameserversOnly for atomic calls.
    */
   async setNameservers(domain: string, nameservers: string[]): Promise<void> {
     this.log(`Storing nameservers for ${domain}: ${nameservers.join(", ")} (will apply with glue records)`);
@@ -226,6 +230,48 @@ export class IonosRegistrar extends BaseDNSRegistrar {
 
     // Clear pending NS
     this.pendingNameservers.delete(domain);
+  }
+
+  /**
+   * Update nameservers ONLY (without glue records).
+   *
+   * This is for delegating sending domains to a new pair's NS servers.
+   * Unlike setNameservers() which stashes NS names for later use in setGlueRecords(),
+   * this method makes the actual API call immediately via PUT /domains/v1/domainitems/{uuid}/nameservers
+   *
+   * The request body contains only nameserver names (no ipV4Addresses field),
+   * which is appropriate for delegated domains where glue IPs already exist at the TLD level.
+   *
+   * Hard lesson #54: Ionos stashing pattern is fragile for sending domains
+   * (setNameservers + setGlueRecords both required). This method does one atomic call.
+   */
+  async updateNameserversOnly(domain: string, nameservers: string[]): Promise<void> {
+    const domainId = await this.getDomainId(domain);
+
+    // Build nameserver payload WITHOUT ipV4Addresses
+    const nameserverPayload = nameservers.map((ns) => ({
+      name: ns,
+    }));
+
+    const body = {
+      type: "CUSTOM",
+      nameservers: nameserverPayload,
+    };
+
+    const url = `${this.baseUrl}/domains/v1/domainitems/${domainId}/nameservers`;
+    this.log(`Updating nameservers for ${domain} (UUID: ${domainId}): ${nameservers.join(", ")}`);
+    this.log(`  Payload: ${JSON.stringify(body)}`);
+
+    interface NSUpdateResponse {
+      id?: string;
+    }
+
+    const result = await this.httpRequest<NSUpdateResponse>(url, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    });
+
+    this.log(`Nameservers updated successfully (update ID: ${result?.id || "n/a"})`);
   }
 
   /**

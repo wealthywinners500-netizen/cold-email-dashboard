@@ -111,6 +111,7 @@ export abstract class BaseDNSRegistrar implements DNSRegistrar {
     domain: string,
     records: Array<{ hostname: string; ip: string }>
   ): Promise<void>;
+  abstract updateNameserversOnly(domain: string, nameservers: string[]): Promise<void>;
   abstract createZone(domain: string): Promise<void>;
   abstract createRecord(params: DNSRecordParams): Promise<{ id: string }>;
   abstract deleteRecord(zone: string, recordId: string): Promise<void>;

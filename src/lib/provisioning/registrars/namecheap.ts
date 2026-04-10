@@ -331,6 +331,15 @@ export class NamecheapRegistrar extends BaseDNSRegistrar {
   }
 
   /**
+   * Update nameservers only (no glue records).
+   * For Namecheap, this delegates to setNameservers since it already
+   * makes a direct API call (no stashing pattern like IONOS).
+   */
+  async updateNameserversOnly(domain: string, nameservers: string[]): Promise<void> {
+    return this.setNameservers(domain, nameservers);
+  }
+
+  /**
    * Create glue records (NS records with associated IPs).
    * Calls domains.ns.create for each glue record.
    */

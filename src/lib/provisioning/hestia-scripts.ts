@@ -28,6 +28,15 @@ import type { DNSRecord } from './hestia-parsers';
  */
 export const HESTIA_PATH_PREFIX = 'export PATH=/usr/local/hestia/bin:$PATH && ';
 
+/**
+ * Full PATH for v-commands that internally invoke coreutils (hostname, date, grep, sed).
+ * Used for Let's Encrypt certificate functions which need access to hostname and date.
+ *
+ * Hard Lesson #51: v-add-letsencrypt-host requires full PATH because it internally calls
+ * hostname, date, grep, sed — not just v-commands. Non-login SSH has empty $PATH.
+ */
+export const HESTIA_FULL_PATH = 'export PATH=/usr/local/hestia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+
 // ============================================
 // Types
 // ============================================
@@ -675,6 +684,9 @@ export async function hardenSecurity(ssh: SSHManager): Promise<void> {
 
 /**
  * Issue Let's Encrypt SSL certificate for a domain or hostname.
+ *
+ * Hard Lesson #51: v-add-letsencrypt-host requires full PATH + explicit admin arg.
+ * Hard Lesson #52: v-add-letsencrypt-domain requires v-add-web-domain to exist first.
  */
 export async function issueSSLCert(
   ssh: SSHManager,
@@ -695,10 +707,25 @@ export async function issueSSLCert(
 
   if (isHostname) {
     // Issue hostname cert: v-add-letsencrypt-host
-    await ssh.exec('v-add-letsencrypt-host', { timeout: 120000 });
+    // Hard Lesson #51: Use full PATH + explicit 'admin' arg + bash -lc for login shell
+    await ssh.exec(`bash -lc "${HESTIA_FULL_PATH} && v-add-letsencrypt-host admin"`, { timeout: 120000 });
   } else {
-    // Issue domain cert: v-add-letsencrypt-domain admin DOMAIN
-    await ssh.exec(`${HESTIA_PATH_PREFIX}v-add-letsencrypt-domain admin ${domain}`, { timeout: 120000 });
+    // Issue domain cert: v-add-letsencrypt-domain
+    // Hard Lesson #52: Ensure v-add-web-domain exists first (required by HestiaCP)
+    // Treat exit 4 (already exists) as non-fatal
+    try {
+      await ssh.exec(`bash -lc "${HESTIA_FULL_PATH} && v-add-web-domain admin ${domain}"`, { timeout: 120000 });
+    } catch (err: unknown) {
+      const exitCode = (err as any)?.code;
+      if (exitCode !== 4) {
+        throw err;
+      }
+      // exit 4 = already exists, continue
+    }
+
+    // Now issue the LE domain cert with full PATH + explicit admin arg
+    // Hard Lesson #51: Full PATH required for internal hostname/date/grep/sed calls
+    await ssh.exec(`bash -lc "${HESTIA_FULL_PATH} && v-add-letsencrypt-domain admin ${domain}"`, { timeout: 120000 });
   }
 
   // Verify CN matches expected

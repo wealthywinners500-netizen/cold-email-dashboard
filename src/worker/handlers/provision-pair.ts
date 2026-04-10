@@ -203,20 +203,35 @@ export async function handleProvisionPair(
 
       // Insert server_pair
       if (server1IP && server2IP) {
-        const { data: serverPair } = await supabase
+        // Compute next pair_number for this org (per-org sequence)
+        const { data: maxPairRow } = await supabase
+          .from('server_pairs')
+          .select('pair_number')
+          .eq('org_id', provJob.org_id)
+          .order('pair_number', { ascending: false })
+          .limit(1)
+          .single();
+
+        const nextPairNumber = ((maxPairRow?.pair_number as number) || 0) + 1;
+
+        const { data: serverPair, error: insertError } = await supabase
           .from('server_pairs')
           .insert({
             org_id: provJob.org_id,
+            pair_number: nextPairNumber,
             ns_domain: provJob.ns_domain,
-            server1_ip: server1IP,
-            server2_ip: server2IP,
-            server1_hostname: `mail1.${provJob.ns_domain}`,
-            server2_hostname: `mail2.${provJob.ns_domain}`,
-            status: 'active',
-            health_status: 'healthy',
+            s1_ip: server1IP,
+            s1_hostname: `mail1.${provJob.ns_domain}`,
+            s2_ip: server2IP,
+            s2_hostname: `mail2.${provJob.ns_domain}`,
+            status: 'complete',
           })
           .select()
           .single();
+
+        if (insertError) {
+          throw new Error(`Failed to insert server_pairs row: ${insertError.message}`);
+        }
 
         if (serverPair) {
           // Update job with server_pair_id

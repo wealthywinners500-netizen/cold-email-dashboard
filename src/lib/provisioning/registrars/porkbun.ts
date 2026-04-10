@@ -169,6 +169,15 @@ export class PorkbunRegistrar extends BaseDNSRegistrar {
   }
 
   /**
+   * Update nameservers only (no glue records).
+   * For Porkbun, this delegates to setNameservers since it already
+   * makes a direct API call (no stashing pattern like IONOS).
+   */
+  async updateNameserversOnly(domain: string, nameservers: string[]): Promise<void> {
+    return this.setNameservers(domain, nameservers);
+  }
+
+  /**
    * Create a zone (no-op for Porkbun — zones exist when you own the domain).
    * Verify with ping.
    */

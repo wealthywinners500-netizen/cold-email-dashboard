@@ -194,6 +194,13 @@ export interface DNSRegistrar {
     domain: string,
     records: Array<{ hostname: string; ip: string }>
   ): Promise<void>;
+  /**
+   * Hard lesson #53/#54: directly PUT nameservers for a domain (no glue).
+   * Used to delegate sending domains to a new pair's ns1/ns2 hosts.
+   * Unlike setNameservers (which may be a local stash), this MUST hit the
+   * registrar's API immediately.
+   */
+  updateNameserversOnly(domain: string, nameservers: string[]): Promise<void>;
   createZone(domain: string): Promise<void>;
   createRecord(params: DNSRecordParams): Promise<{ id: string }>;
   deleteRecord(zone: string, recordId: string): Promise<void>;

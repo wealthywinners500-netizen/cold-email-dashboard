@@ -161,6 +161,12 @@ export class DryRunRegistrar implements DNSRegistrar {
     this.log(`Glue records set for ${domain}`);
   }
 
+  async updateNameserversOnly(domain: string, nameservers: string[]): Promise<void> {
+    this.log(`Delegating ${domain} → ${nameservers.join(", ")} (no glue)`);
+    await delay(1200);
+    this.log(`Nameservers updated for ${domain}`);
+  }
+
   async createZone(domain: string): Promise<void> {
     this.log(`Creating zone: ${domain}`);
     await delay(1000);

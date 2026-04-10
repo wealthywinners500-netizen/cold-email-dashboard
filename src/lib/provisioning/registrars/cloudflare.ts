@@ -211,6 +211,17 @@ export class CloudflareRegistrar extends BaseDNSRegistrar {
   }
 
   /**
+   * Update nameservers only (no glue records).
+   * NOT SUPPORTED on Cloudflare. Custom nameservers require Business+ plan.
+   */
+  async updateNameserversOnly(domain: string, nameservers: string[]): Promise<void> {
+    throw new Error(
+      `Cloudflare manages nameservers automatically. Custom nameservers require Business+ plan. ` +
+        `Set NS records at your domain registrar instead.`
+    );
+  }
+
+  /**
    * Test connection to Cloudflare API.
    * GET /user/tokens/verify — returns { result: { status: "active" } }
    */
