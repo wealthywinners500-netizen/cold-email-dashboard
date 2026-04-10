@@ -91,6 +91,33 @@ export async function POST(req: Request) {
   try {
     switch (evt.type) {
       case "organization.created": {
+        // Idempotent insert: Svix retries, duplicate deliveries, and
+        // admin-side pre-creates (e.g., when an operator manually flips a
+        // friend's org to 'developer' before Clerk webhook delivery catches
+        // up) must not produce 500s here, because a 500 makes Svix keep
+        // retrying forever. Instead, check for an existing row first and
+        // treat duplicates as success.
+        //
+        // Critically, we NEVER overwrite plan_tier on an already-existing row.
+        // A developer/comped account that somehow receives a late webhook
+        // replay must not get silently downgraded to 'starter'. Only new
+        // rows get `plan_tier: 'starter'`.
+        const { data: existing, error: lookupErr } = await adminClient
+          .from("organizations")
+          .select("id, plan_tier")
+          .or(`clerk_org_id.eq.${orgId},id.eq.${orgId}`)
+          .limit(1)
+          .maybeSingle();
+
+        if (lookupErr) throw lookupErr;
+
+        if (existing) {
+          console.log(
+            `[Clerk Webhook] organization.created for ${orgId}: row already exists (plan_tier=${existing.plan_tier}), skipping insert.`
+          );
+          break;
+        }
+
         // Explicit plan_tier='starter' makes the default visible at the
         // call site rather than relying on the DB default from migration 001.
         // New orgs have no stripe_subscription_id, so the billing gate in
@@ -102,7 +129,25 @@ export async function POST(req: Request) {
           name: orgName,
           plan_tier: "starter",
         });
-        if (error) throw error;
+
+        if (error) {
+          // Race: a concurrent bootstrap call won the insert between our
+          // lookup and this statement. Unique-constraint violation means
+          // the row now exists — which is exactly what we wanted. Log and
+          // swallow, do NOT rethrow (a rethrow here would 500 Svix and
+          // trigger pointless retries).
+          const isDuplicate =
+            error.code === "23505" ||
+            /duplicate key|already exists/i.test(error.message);
+          if (isDuplicate) {
+            console.log(
+              `[Clerk Webhook] organization.created for ${orgId}: duplicate-key race, row already exists. Treating as success.`
+            );
+            break;
+          }
+          throw error;
+        }
+
         console.log(`[Clerk Webhook] Organization created: ${orgId}`);
         break;
       }

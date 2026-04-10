@@ -103,6 +103,47 @@ export default function DashboardLayout({
     }
   }, [organization, userMemberships.data, setActive, router]);
 
+  // Lazy org bootstrap: once a Clerk org is active, make sure a matching row
+  // exists in Supabase's `organizations` table. The canonical path for this
+  // is the Clerk webhook (`/api/webhooks/clerk`), but if that webhook is
+  // misconfigured, missing its signing secret, or simply hasn't been set up
+  // in the Clerk dashboard yet, every dashboard API route 401s forever. The
+  // bootstrap endpoint upserts the row lazily so a brand-new paying customer
+  // is never locked out of their own dashboard. It is idempotent and will
+  // NOT overwrite plan_tier on an existing row, so repeated calls (or a
+  // later webhook replay) are safe. See src/lib/org-bootstrap.ts for the
+  // full rationale.
+  useEffect(() => {
+    if (!organization) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/auth/bootstrap-org", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        });
+        if (!res.ok) {
+          console.warn(
+            `[dashboard-layout] bootstrap-org returned ${res.status}; dashboard data queries may 401 until the organizations row is created.`
+          );
+          return;
+        }
+        const data = await res.json().catch(() => null);
+        if (cancelled) return;
+        // If we just created the row, the dashboard server components need
+        // a refresh so their data queries can re-run against the new row.
+        if (data?.status === "created") {
+          router.refresh();
+        }
+      } catch (err) {
+        console.warn("[dashboard-layout] bootstrap-org call failed:", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [organization, router]);
+
   // Fetch unread inbox count
   useEffect(() => {
     async function fetchUnread() {
