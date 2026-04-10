@@ -302,10 +302,21 @@ async function ensureDNSRecords(
 
     if (!alreadyExists) {
       const priorityArg = req.priority !== undefined ? req.priority : '';
-      await ssh.exec(
-        `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} ${req.host} ${req.type} '${req.value}' ${priorityArg}`.trim(),
-        { timeout: 10000 }
-      );
+      try {
+        await ssh.exec(
+          `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} ${req.host} ${req.type} '${req.value}' ${priorityArg}`.trim(),
+          { timeout: 10000 }
+        );
+      } catch (err: any) {
+        // HestiaCP exit code 3 = record already exists (parser may miss trailing dots etc.)
+        // Exit code 4 = object doesn't exist (e.g., DNS zone not ready yet)
+        // Treat code 3 as non-fatal for idempotency
+        if (err?.code === 3) {
+          // Record already exists — skip silently
+        } else {
+          throw err;
+        }
+      }
     }
   }
 }
@@ -496,10 +507,19 @@ export async function replicateZone(
 
     if (!existsOnTarget) {
       const priorityArg = srcRecord.priority !== undefined ? srcRecord.priority : '';
-      await targetSSH.exec(
-        `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} ${srcRecord.host} ${srcRecord.type} '${srcRecord.value}' ${priorityArg}`.trim(),
-        { timeout: 10000 }
-      );
+      try {
+        await targetSSH.exec(
+          `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} ${srcRecord.host} ${srcRecord.type} '${srcRecord.value}' ${priorityArg}`.trim(),
+          { timeout: 10000 }
+        );
+      } catch (err: any) {
+        // HestiaCP exit code 3 = record already exists — non-fatal
+        if (err?.code === 3) {
+          // Skip silently
+        } else {
+          throw err;
+        }
+      }
     }
   }
 
