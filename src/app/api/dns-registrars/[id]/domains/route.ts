@@ -4,7 +4,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getDNSRegistrar } from "@/lib/provisioning/provider-registry";
 import { decrypt } from "@/lib/provisioning/encryption";
 import type { DNSRegistrarRow, DomainInfo } from "@/lib/provisioning/types";
-import { checkDomainsBlacklistBatch } from "@/lib/provisioning/domain-blacklist";
+import { checkDomainBlacklistBatch } from "@/lib/provisioning/domain-blacklist";
 
 // Hard lesson #43 (2026-04-10): Auto-populated registrar domain lists must be
 // filtered through the real DNSBL check so users can't accidentally pick a
@@ -130,10 +130,11 @@ export async function GET(
       );
     }
 
-    // 5. Blacklist-check every domain (Spamhaus DBL + SURBL + URIBL) so the
-    // wizard dropdown can pre-mark listed domains. Max 10 concurrent DNS
-    // lookups per batch. This is pure DNS — no registrar API quota applies.
-    const blacklistResults = await checkDomainsBlacklistBatch(
+    // 5. Blacklist-check every domain via Spamhaus DQS (primary) with
+    // worker VPS proxy fallback. 3-state result: clean | listed | unknown.
+    // Max 10 concurrent DNS lookups per batch. No registrar API quota.
+    // (Hard lesson #47 — legacy public mirror is blocked from Vercel.)
+    const blacklistResults = await checkDomainBlacklistBatch(
       rawDomains.map((d) => d.domain),
       { concurrency: 10 }
     );
@@ -148,8 +149,8 @@ export async function GET(
       }
       return {
         ...d,
-        blacklistStatus: (r.clean ? "clean" : "listed") as BlacklistStatus,
-        blacklists: r.blacklists,
+        blacklistStatus: r.status,
+        blacklists: r.lists,
       };
     });
 
@@ -252,7 +253,9 @@ async function filterUsedDomains(
 
   return domains.map((d) => {
     const inUse = usedSet.has(d.domain.toLowerCase());
-    // Also mark blacklisted domains as unavailable so the wizard can't pick them.
+    // Only DEFINITIVELY blacklisted domains are blocked from selection.
+    // 'unknown' status means the blacklist service was unavailable —
+    // allow selection but the UI warns the operator to verify manually.
     const blocked = d.blacklistStatus === "listed";
     return {
       ...d,

@@ -953,15 +953,24 @@ export function createPairProvisioningSaga(
           context.log(`[Step 8] Subnet diversity check failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
         }
 
-        // --- Hard lesson #43: Domain blacklist defense-in-depth ---
-        // check-domain was stubbed before this fix, so older jobs may have
-        // launched with Spamhaus-listed domains. Re-check at the end so the
-        // verification report surfaces any domain blacklisting. Does NOT fail
-        // the saga (the pair hardware is still fine) — just warns.
+        // --- Hard lesson #43/#47: Domain blacklist defense-in-depth ---
+        // check-domain was stubbed before #43, then DNS-blocked from Vercel
+        // before #47. Either failure mode could allow Spamhaus-listed domains
+        // through. Re-check at the end of the saga so the verification report
+        // surfaces any blacklisted domain. Does NOT fail the saga (the pair
+        // hardware is still fine) — just warns.
+        //
+        // 3-state result handling:
+        //   - 'listed'  → emit DOMAIN_BLACKLISTED warning (definitive hit)
+        //   - 'unknown' → emit BLACKLIST_CHECK_UNAVAILABLE warning so the
+        //                 operator knows to verify on MXToolbox manually
+        //   - 'clean'   → log OK and move on
         try {
           const allSagaDomains = [context.nsDomain, ...context.sendingDomains];
           const blResults = await checkDomainsBlacklistBatch(allSagaDomains, { concurrency: 5 });
-          const listed = blResults.filter((r) => !r.clean);
+          const listed = blResults.filter((r) => r.status === 'listed');
+          const unknown = blResults.filter((r) => r.status === 'unknown');
+
           if (listed.length > 0) {
             for (const r of listed) {
               const msg = `Domain ${r.domain} is listed on: ${r.blacklists.join(', ')}`;
@@ -972,7 +981,19 @@ export function createPairProvisioningSaga(
               });
               context.log(`[Step 8] WARNING: ${msg}`);
             }
-          } else {
+          }
+
+          if (unknown.length > 0) {
+            const msg = `Blacklist service unavailable for: ${unknown.map((r) => r.domain).join(', ')}`;
+            warnings.push({
+              code: 'BLACKLIST_CHECK_UNAVAILABLE',
+              message: msg,
+              remediation: 'Run a manual MXToolbox blacklist scan on each listed domain to confirm clean status.',
+            });
+            context.log(`[Step 8] WARNING: ${msg} (method=${unknown[0]?.method ?? 'unavailable'})`);
+          }
+
+          if (listed.length === 0 && unknown.length === 0) {
             context.log(`[Step 8] OK: all ${allSagaDomains.length} domains clean on DNSBLs`);
           }
         } catch (err) {

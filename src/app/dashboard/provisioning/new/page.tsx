@@ -168,10 +168,18 @@ export default function NewProvisioningPage() {
   }, [accountsPerDomain]);
 
   // Validation per step
+  // Hard lesson #43/#47 (2026-04-10): Block launch only on `status === 'listed'`
+  // (definitively blacklisted). `unknown` is allowed because the blacklist
+  // service may be temporarily unavailable; the UI shows an amber warning
+  // and asks the operator to verify on MXToolbox manually.
   const canProceedStep0 = selectedProvider && selectedRegion && selectedSize;
-  const canProceedStep1 = selectedRegistrar && nsDomain.trim() && domains.length > 0 && !domains.some((d) => d.clean === false);
+  const canProceedStep1 =
+    selectedRegistrar &&
+    nsDomain.trim() &&
+    domains.length > 0 &&
+    !domains.some((d) => d.status === "listed");
   const canProceedStep2 = true; // Config step always valid
-  const allDomainsChecked = domains.length > 0 && domains.every((d) => d.clean !== null);
+  const allDomainsChecked = domains.length > 0 && domains.every((d) => d.status !== null);
 
   const canProceed = [canProceedStep0, canProceedStep1, canProceedStep2, confirmChecked][currentStep];
 

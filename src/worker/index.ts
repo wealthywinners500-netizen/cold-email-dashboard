@@ -18,6 +18,7 @@ import { handleHealthCheck } from "./handlers/health-check";
 import { closeAll } from "../lib/email/smtp-manager";
 import { createClient } from "@supabase/supabase-js";
 import { handleWorkerError, updateWorkerHeartbeat, resetDailyCounters } from "../lib/email/error-handler";
+import { startBlacklistProxy } from "./blacklist-proxy";
 
 function getSupabase() {
   return createClient(
@@ -32,6 +33,13 @@ async function main() {
 
   const boss = await initBoss();
   console.log("[Worker] pg-boss started");
+
+  // Hard lesson #47 (2026-04-10): Spamhaus blocks DNSBL queries from cloud
+  // IPs. The worker VPS lives on a non-cloud IP and exposes an HTTP proxy
+  // for the Vercel app's domain-blacklist helper to fall back to whenever
+  // the primary Spamhaus DQS check returns 'unknown'. Auth via the shared
+  // WORKER_CALLBACK_SECRET that's already used for the worker callback.
+  const blacklistServer = startBlacklistProxy();
 
   // Create all queues (required by pg-boss v12+)
   const queueNames = [
@@ -515,6 +523,9 @@ async function main() {
   const shutdown = async (signal: string) => {
     console.log(`[Worker] Received ${signal}, shutting down...`);
     clearInterval(heartbeatInterval);
+    if (blacklistServer) {
+      await new Promise<void>((resolve) => blacklistServer.close(() => resolve()));
+    }
     closeAll();
     await stopBoss();
     process.exit(0);

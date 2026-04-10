@@ -5,161 +5,278 @@
 //   - /api/dns-registrars/[id]/domains route (IONOS auto-populate filter)
 //   - pair-provisioning-saga.ts Step 8 verification_gate (post-provision warning)
 //
-// Hard lesson #43 (2026-04-10): Never ship a stubbed blacklist check. The
-// previous check-domain endpoint returned { clean: true } for every domain,
-// which allowed krogeradcollective.info (Spamhaus-listed) to pass Test #11.
+// Hard lesson #43 (2026-04-10): Never ship a stubbed blacklist check.
+// Hard lesson #46 (2026-04-10): Spamhaus reserved 127.255.255.x return codes
+//   must be classified as "resolver blocked", not "listed".
+// Hard lesson #47 (2026-04-10): Spamhaus actively blocks DNSBL queries from
+//   cloud provider IP ranges (AWS/GCP/Azure/Vercel). The legacy public mirror
+//   `dbl.spamhaus.org` returns 127.255.255.254 ("anonymous public resolver —
+//   DENIED") for EVERY query from Vercel, regardless of whether the domain
+//   is actually listed. The official workaround is Spamhaus Data Query
+//   Service (DQS), which uses a per-account key embedded in the query name:
+//     {domain}.{key}.dbl.dq.spamhaus.net
+//   Set SPAMHAUS_DQS_KEY in the Vercel env. Signup: https://portal.spamhaus.com
+//
+// This module now implements a 3-tier blacklist check:
+//   1. PRIMARY: DQS (cloud-IP-allowed, auth'd via SPAMHAUS_DQS_KEY)
+//   2. FALLBACK: worker VPS proxy (non-cloud IP, queries legacy mirrors)
+//   3. UNAVAILABLE: definitive "unknown" result — wizard warns, doesn't block
 // ============================================
 
 import dns from 'dns/promises';
 
-/**
- * Default DNSBL list checked for every domain. These are the three most
- * authoritative URI/domain blocklists for cold-email deliverability:
- *   - dbl.spamhaus.org     — Spamhaus Domain Block List
- *   - multi.surbl.org      — SURBL multi-list
- *   - uribl.spameatingmonkey.net — SpamEatingMonkey URI list
- */
-export const DEFAULT_DOMAIN_BLACKLISTS = [
-  'dbl.spamhaus.org',
-  'multi.surbl.org',
-  'uribl.spameatingmonkey.net',
-];
+// Spamhaus DQS query format — official docs:
+// https://docs.spamhaus.com/datasets/docs/source/70-access-methods/data-query-service/040-dqs-queries.html
+// Format: {domain}.{key}.{zone}.dq.spamhaus.net
+const DQS_ZONES = ['dbl'] as const; // can add 'zrd' (zero-reputation domain) later
 
-export interface DomainBlacklistResult {
+// Spamhaus DBL "listed" return codes (legitimate listing signals, not errors).
+// Any A-record value in 127.0.1.0/24 is a legitimate DBL hit.
+const DBL_LISTED_CODES = new Set([
+  '127.0.1.2',   // spam domain
+  '127.0.1.4',   // phish domain
+  '127.0.1.5',   // malware domain
+  '127.0.1.6',   // botnet C&C domain
+  '127.0.1.102', // abused legit spam
+  '127.0.1.103', // abused legit redirector
+  '127.0.1.104', // abused legit phish
+  '127.0.1.105', // abused legit malware
+  '127.0.1.106', // abused legit botnet
+]);
+
+// Spamhaus "denied / error" return codes (resolver-blocked or quota).
+// These MUST NOT be counted as hits — they mean we couldn't get a real answer.
+const DENIED_CODES = new Set([
+  '127.255.255.252', // typo in DNSBL zone name
+  '127.255.255.254', // anonymous public resolver denied (cloud IP)
+  '127.255.255.255', // rate-limit exceeded
+]);
+
+export type BlacklistStatus = 'clean' | 'listed' | 'unknown';
+export type BlacklistMethod =
+  | 'dqs'              // primary: Spamhaus DQS
+  | 'fallback-proxy'   // secondary: worker VPS proxy
+  | 'legacy-public'    // tertiary: legacy public mirrors (worker only)
+  | 'unavailable';     // no method succeeded
+
+export interface BlacklistResult {
   domain: string;
+  status: BlacklistStatus;
+  lists: string[];              // which lists flagged it (when status='listed')
+  raw: Record<string, string[]>; // per-list raw A records (debugging)
+  method: BlacklistMethod;
+  // Backwards-compat aliases — `clean` only true when status === 'clean'.
   clean: boolean;
   blacklists: string[];
-  /** Lists that failed with a transient DNS error (not counted as listed). */
-  errors: Array<{ list: string; code: string; message: string }>;
 }
 
-/**
- * Classify a DNSBL A-record response. DNSBLs encode the meaning of a hit in
- * the A-record value, and ALSO use reserved codes to signal "your resolver
- * is blocked / rate-limited / misconfigured". Treating those reserved codes
- * as hits produces false positives.
- *
- * Legitimate listing codes are in the form 127.0.x.y (low second octet),
- * e.g. Spamhaus DBL 127.0.1.2 / 127.0.1.4, SURBL 127.0.0.2/4/8, URIBL
- * 127.0.0.2/4/8. Resolver-error codes are ALWAYS in 127.255.255.0/24, e.g.:
- *   - 127.255.255.252  typo in DNSBL name
- *   - 127.255.255.254  anonymous query via public/bulk resolver (DENIED)
- *   - 127.255.255.255  rate-limit exceeded
- *
- * Hard lesson #46 (2026-04-10): Vercel serverless DNS resolvers are
- * identified by Spamhaus as public/bulk resolvers and receive
- * 127.255.255.254 for EVERY lookup, including clean domains like google.com.
- * Without this filter, the check-domain endpoint reported every domain as
- * listed on dbl.spamhaus.org, which would make the wizard dropdown empty
- * and block every provisioning launch.
- */
-type HitClass = 'listed' | 'blocked_resolver' | 'not_listed';
-
-function classifyDnsblResponse(addresses: string[]): HitClass {
-  if (!addresses || addresses.length === 0) return 'not_listed';
-
-  let sawLegitHit = false;
-  let sawBlockedResolver = false;
-
-  for (const addr of addresses) {
-    const parts = addr.split('.').map(Number);
-    if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) continue;
-    const [a, b, c] = parts;
-    // 127.255.255.x = resolver-blocked / error sentinel (all major DNSBLs).
-    if (a === 127 && b === 255 && c === 255) {
-      sawBlockedResolver = true;
-      continue;
-    }
-    // Legitimate listing codes are 127.0.x.y with x < 255.
-    if (a === 127 && b === 0) {
-      sawLegitHit = true;
-      continue;
-    }
-    // Anything else (including 127.0.255.x or non-127 addresses) is unknown —
-    // treat as blocked/error rather than a hit.
-    sawBlockedResolver = true;
-  }
-
-  if (sawLegitHit) return 'listed';
-  if (sawBlockedResolver) return 'blocked_resolver';
-  return 'not_listed';
+function makeResult(
+  domain: string,
+  status: BlacklistStatus,
+  lists: string[],
+  raw: Record<string, string[]>,
+  method: BlacklistMethod
+): BlacklistResult {
+  return {
+    domain,
+    status,
+    lists,
+    raw,
+    method,
+    clean: status === 'clean',
+    blacklists: lists,
+  };
 }
 
+// ============================================
+// Low-level DNS helper
+// ============================================
+
 /**
- * Check a single DNSBL for a domain. Returns true if the domain is listed
- * with a legitimate listing code, false if not listed OR if the resolver
- * was blocked (fail-open). Throws only on transport-level DNS failures that
- * are NOT ENOTFOUND/ENODATA/SERVFAIL.
+ * Resolve an A record. Returns the addresses, OR [] on NXDOMAIN (not listed).
+ * Throws on all other errors (caller decides fail-open vs error out).
  */
-async function isListedOn(domain: string, list: string): Promise<boolean> {
+async function resolveOrNxdomain(host: string): Promise<string[]> {
   try {
-    const addresses = await dns.resolve4(`${domain}.${list}`);
-    const cls = classifyDnsblResponse(addresses);
-    if (cls === 'blocked_resolver') {
-      console.warn(
-        `[domain-blacklist] ${list} lookup for ${domain} returned ` +
-          `resolver-blocked sentinel ${addresses.join(',')} — treating as not-listed (fail-open)`
-      );
-      return false;
-    }
-    return cls === 'listed';
+    return await dns.resolve4(host);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    // ENOTFOUND / ENODATA = not listed (normal case).
-    // SERVFAIL is the other common "blocked resolver" signal from Spamhaus —
-    // treat as fail-open so we don't flag every domain.
-    if (code === 'ENOTFOUND' || code === 'ENODATA' || code === 'ESERVFAIL') {
-      return false;
-    }
+    if (code === 'ENOTFOUND' || code === 'ENODATA') return [];
     throw err;
   }
 }
 
 /**
- * Check a domain against the default DNSBL set (or a custom list).
- * Fails open on transient DNS errors (per-list), but records them in `errors`.
+ * Classify a set of DNSBL A-records. Used for BOTH DQS and legacy paths —
+ * they use the same 127.0.x.y listing / 127.255.255.x denied scheme.
  */
-export async function checkDomainBlacklists(
-  domain: string,
-  lists: string[] = DEFAULT_DOMAIN_BLACKLISTS
-): Promise<DomainBlacklistResult> {
-  const cleanDomain = domain.trim().toLowerCase();
-  const hits: string[] = [];
-  const errors: Array<{ list: string; code: string; message: string }> = [];
+function classifyDblAddresses(
+  addresses: string[]
+): { status: BlacklistStatus; sawDenied: boolean } {
+  if (addresses.length === 0) return { status: 'clean', sawDenied: false };
 
-  for (const bl of lists) {
+  let sawListed = false;
+  let sawDenied = false;
+
+  for (const addr of addresses) {
+    if (DENIED_CODES.has(addr)) {
+      sawDenied = true;
+      continue;
+    }
+    if (DBL_LISTED_CODES.has(addr) || addr.startsWith('127.0.1.')) {
+      sawListed = true;
+      continue;
+    }
+    // 127.0.0.x used by other DNSBL families (SURBL/URIBL) — treat as listed too
+    if (addr.startsWith('127.0.0.')) {
+      sawListed = true;
+      continue;
+    }
+    // Anything else is unexpected — treat as denied rather than hit
+    sawDenied = true;
+  }
+
+  if (sawListed) return { status: 'listed', sawDenied };
+  if (sawDenied) return { status: 'unknown', sawDenied };
+  return { status: 'clean', sawDenied };
+}
+
+// ============================================
+// Primary path: Spamhaus DQS
+// ============================================
+
+async function checkViaDQS(domain: string): Promise<BlacklistResult | null> {
+  const key = process.env.SPAMHAUS_DQS_KEY;
+  if (!key) return null;
+
+  const cleaned = domain.toLowerCase().replace(/\.$/, '');
+  const raw: Record<string, string[]> = {};
+  const lists: string[] = [];
+  let anyDenied = false;
+
+  for (const zone of DQS_ZONES) {
+    const host = `${cleaned}.${key}.${zone}.dq.spamhaus.net`;
     try {
-      if (await isListedOn(cleanDomain, bl)) {
-        hits.push(bl);
+      const addresses = await resolveOrNxdomain(host);
+      raw[zone] = addresses;
+      const { status, sawDenied } = classifyDblAddresses(addresses);
+      if (sawDenied) anyDenied = true;
+      if (status === 'listed') {
+        lists.push(`${zone}.dq.spamhaus.net`);
       }
     } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code || 'UNKNOWN';
-      const message = err instanceof Error ? err.message : String(err);
-      errors.push({ list: bl, code, message });
       console.error(
-        `[domain-blacklist] ${bl} lookup failed for ${cleanDomain}: ${code} ${message}`
+        `[domain-blacklist] DQS ${zone} lookup failed for ${cleaned}:`,
+        err instanceof Error ? err.message : err
       );
+      anyDenied = true; // transient — treat as unknown so fallback can try
     }
   }
 
-  return {
-    domain: cleanDomain,
-    clean: hits.length === 0,
-    blacklists: hits,
-    errors,
-  };
+  if (lists.length > 0) {
+    return makeResult(cleaned, 'listed', lists, raw, 'dqs');
+  }
+  if (anyDenied) {
+    return makeResult(cleaned, 'unknown', [], raw, 'dqs');
+  }
+  return makeResult(cleaned, 'clean', [], raw, 'dqs');
+}
+
+// ============================================
+// Fallback path: worker VPS proxy
+// ============================================
+
+async function checkViaWorkerProxy(
+  domain: string
+): Promise<BlacklistResult | null> {
+  const workerUrl = process.env.WORKER_BLACKLIST_URL; // e.g. https://worker.example/internal/blacklist-check
+  const secret = process.env.WORKER_CALLBACK_SECRET;
+  if (!workerUrl || !secret) return null;
+
+  try {
+    const res = await fetch(workerUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Worker-Secret': secret,
+      },
+      body: JSON.stringify({ domain }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) {
+      console.error(
+        `[domain-blacklist] Worker proxy returned ${res.status} for ${domain}`
+      );
+      return null;
+    }
+    const data = (await res.json()) as {
+      status?: BlacklistStatus;
+      lists?: string[];
+      raw?: Record<string, string[]>;
+    };
+    if (!data.status) return null;
+    return makeResult(
+      domain.toLowerCase(),
+      data.status,
+      data.lists || [],
+      data.raw || {},
+      'fallback-proxy'
+    );
+  } catch (err) {
+    console.error(
+      `[domain-blacklist] Worker proxy fallback failed for ${domain}:`,
+      err instanceof Error ? err.message : err
+    );
+    return null;
+  }
+}
+
+// ============================================
+// Public API
+// ============================================
+
+/**
+ * Check a single domain against the blacklist tier chain.
+ *   1. DQS (if SPAMHAUS_DQS_KEY set)
+ *   2. Worker proxy (if WORKER_BLACKLIST_URL + WORKER_CALLBACK_SECRET set)
+ *   3. Returns `unknown` with method='unavailable'
+ *
+ * Returns a 3-state result. Callers MUST handle 'unknown' explicitly —
+ * do NOT treat it as clean OR as listed. The wizard should warn-but-allow;
+ * the IONOS domain-list enrichment should sort unknowns between clean and
+ * listed.
+ */
+export async function checkDomainBlacklist(
+  domain: string
+): Promise<BlacklistResult> {
+  const cleaned = domain.trim().toLowerCase();
+
+  // Tier 1: DQS
+  const dqs = await checkViaDQS(cleaned);
+  if (dqs && dqs.status !== 'unknown') return dqs;
+
+  // Tier 2: worker proxy (only if DQS returned unknown or was unavailable)
+  const proxy = await checkViaWorkerProxy(cleaned);
+  if (proxy && proxy.status !== 'unknown') return proxy;
+
+  // If DQS returned a definitive "unknown" and proxy wasn't configured,
+  // return the DQS result to preserve its `raw` field for debugging.
+  if (dqs) return dqs;
+  if (proxy) return proxy;
+
+  return makeResult(cleaned, 'unknown', [], {}, 'unavailable');
 }
 
 /**
- * Batch check many domains with bounded concurrency. Uses Promise.allSettled
- * so one DNS timeout can't take down the whole batch.
+ * Batch check with bounded concurrency. Uses per-domain try/catch so one
+ * failure can't take down the whole batch.
  */
-export async function checkDomainsBlacklistBatch(
+export async function checkDomainBlacklistBatch(
   domains: string[],
-  options: { concurrency?: number; lists?: string[] } = {}
-): Promise<DomainBlacklistResult[]> {
-  const { concurrency = 10, lists = DEFAULT_DOMAIN_BLACKLISTS } = options;
-  const results: DomainBlacklistResult[] = new Array(domains.length);
+  options: { concurrency?: number } = {}
+): Promise<BlacklistResult[]> {
+  const { concurrency = 10 } = options;
+  const results: BlacklistResult[] = new Array(domains.length);
   let cursor = 0;
 
   async function worker() {
@@ -167,15 +284,19 @@ export async function checkDomainsBlacklistBatch(
       const idx = cursor++;
       const domain = domains[idx];
       try {
-        results[idx] = await checkDomainBlacklists(domain, lists);
+        results[idx] = await checkDomainBlacklist(domain);
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        results[idx] = {
-          domain: domain.toLowerCase(),
-          clean: true, // fail-open: we'd rather warn than block on transient DNS
-          blacklists: [],
-          errors: [{ list: 'batch', code: 'BATCH_ERROR', message }],
-        };
+        console.error(
+          `[domain-blacklist] batch worker failed for ${domain}:`,
+          err instanceof Error ? err.message : err
+        );
+        results[idx] = makeResult(
+          domain.toLowerCase(),
+          'unknown',
+          [],
+          {},
+          'unavailable'
+        );
       }
     }
   }
@@ -186,4 +307,26 @@ export async function checkDomainsBlacklistBatch(
   );
   await Promise.all(workers);
   return results;
+}
+
+// ============================================
+// Backwards-compat shims
+// ============================================
+// Old code imported `checkDomainBlacklists` / `checkDomainsBlacklistBatch` /
+// `DomainBlacklistResult`. Keep them as thin wrappers so we can migrate
+// consumers one at a time without breaking the build.
+
+export type DomainBlacklistResult = BlacklistResult;
+
+export async function checkDomainBlacklists(
+  domain: string
+): Promise<BlacklistResult> {
+  return checkDomainBlacklist(domain);
+}
+
+export async function checkDomainsBlacklistBatch(
+  domains: string[],
+  options: { concurrency?: number } = {}
+): Promise<BlacklistResult[]> {
+  return checkDomainBlacklistBatch(domains, options);
 }

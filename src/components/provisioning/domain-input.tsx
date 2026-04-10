@@ -18,11 +18,25 @@ import type { DomainInfo } from "@/lib/provisioning/types";
 // ============================================
 // Types
 // ============================================
+// 3-state blacklist model (hard lesson #47, 2026-04-10).
+//   'clean'   — definitively not listed (via Spamhaus DQS or worker proxy)
+//   'listed'  — definitively listed; blocks wizard launch (hard lesson #43)
+//   'unknown' — blacklist service unavailable; warn-but-allow, operator
+//               must verify manually on MXToolbox
+//   null      — not yet checked
+type BlacklistStatus = "clean" | "listed" | "unknown";
+type BlacklistMethod =
+  | "dqs"
+  | "fallback-proxy"
+  | "legacy-public"
+  | "unavailable";
+
 interface DomainStatus {
   domain: string;
   checking: boolean;
-  clean: boolean | null;
+  status: BlacklistStatus | null;
   blacklists: string[];
+  method?: BlacklistMethod;
 }
 
 export interface RegistrarOption {
@@ -161,7 +175,7 @@ export function DomainInput({
       return false;
     }
     setInputError(null);
-    onDomainsChange([...domains, { domain, checking: false, clean: null, blacklists: [] }]);
+    onDomainsChange([...domains, { domain, checking: false, status: null, blacklists: [] }]);
     return true;
   }, [domains, onDomainsChange, maxDomains]);
 
@@ -191,7 +205,7 @@ export function DomainInput({
         errors.push(`Max ${maxDomains} domains reached`);
         break;
       }
-      newDomains.push({ domain, checking: false, clean: null, blacklists: [] });
+      newDomains.push({ domain, checking: false, status: null, blacklists: [] });
     }
 
     onDomainsChange(newDomains);
@@ -219,10 +233,26 @@ export function DomainInput({
       });
       if (res.ok) {
         const data = await res.json();
+        // 3-state response. Prefer data.status if present, but fall back to
+        // the legacy boolean fields for backwards compat during rollout.
+        const status: BlacklistStatus =
+          data.status === "clean" || data.status === "listed" || data.status === "unknown"
+            ? data.status
+            : data.clean === true
+              ? "clean"
+              : data.blacklisted === true
+                ? "listed"
+                : "unknown";
         onDomainsChange(
           domains.map((d) =>
             d.domain === domain
-              ? { ...d, checking: false, clean: data.clean, blacklists: data.blacklists }
+              ? {
+                  ...d,
+                  checking: false,
+                  status,
+                  blacklists: data.blacklists || [],
+                  method: data.method,
+                }
               : d
           )
         );
@@ -239,7 +269,7 @@ export function DomainInput({
   };
 
   const checkAll = async () => {
-    const unchecked = domains.filter((d) => d.clean === null && !d.checking);
+    const unchecked = domains.filter((d) => d.status === null && !d.checking);
     for (const d of unchecked) {
       await checkDomain(d.domain);
       await new Promise((r) => setTimeout(r, 200));
@@ -309,7 +339,7 @@ export function DomainInput({
     for (const domainName of selectedFetched) {
       if (newDomains.length >= maxDomains) break;
       if (newDomains.some((d) => d.domain === domainName)) continue;
-      newDomains.push({ domain: domainName, checking: false, clean: null, blacklists: [] });
+      newDomains.push({ domain: domainName, checking: false, status: null, blacklists: [] });
     }
     onDomainsChange(newDomains);
     setSelectedFetched(new Set());
@@ -317,8 +347,9 @@ export function DomainInput({
 
   const availableCount = fetchState.domains.filter((d) => d.isAvailable && !d.inUse).length;
   const selectedCount = selectedFetched.size;
-  const hasUnchecked = domains.some((d) => d.clean === null && !d.checking);
-  const hasBlacklisted = domains.some((d) => d.clean === false);
+  const hasUnchecked = domains.some((d) => d.status === null && !d.checking);
+  const hasBlacklisted = domains.some((d) => d.status === "listed");
+  const hasUnknown = domains.some((d) => d.status === "unknown");
 
   return (
     <div className="space-y-4">
@@ -582,23 +613,37 @@ export function DomainInput({
               >
                 {d.checking ? (
                   <Loader2 className="w-4 h-4 text-blue-400 animate-spin flex-shrink-0" />
-                ) : d.clean === true ? (
+                ) : d.status === "clean" ? (
                   <CheckCircle2 className="w-4 h-4 text-green-400 flex-shrink-0" />
-                ) : d.clean === false ? (
+                ) : d.status === "listed" ? (
                   <XCircle className="w-4 h-4 text-red-400 flex-shrink-0" />
+                ) : d.status === "unknown" ? (
+                  <AlertTriangle
+                    className="w-4 h-4 text-amber-400 flex-shrink-0"
+                    aria-label="Blacklist service unavailable — verify manually on MXToolbox before launching"
+                  />
                 ) : (
                   <div className="w-4 h-4 rounded-full border border-gray-600 flex-shrink-0" />
                 )}
 
                 <span className="text-sm text-white font-mono flex-1 truncate">{d.domain}</span>
 
-                {d.clean === false && d.blacklists.length > 0 && (
+                {d.status === "listed" && d.blacklists.length > 0 && (
                   <span className="text-xs text-red-400 truncate max-w-[150px]">
                     {d.blacklists.join(", ")}
                   </span>
                 )}
 
-                {d.clean === null && !d.checking && (
+                {d.status === "unknown" && (
+                  <span
+                    className="text-xs text-amber-400 truncate max-w-[180px]"
+                    title="Blacklist service unavailable — verify manually on MXToolbox before launching"
+                  >
+                    Verify on MXToolbox
+                  </span>
+                )}
+
+                {d.status === null && !d.checking && (
                   <button
                     onClick={() => checkDomain(d.domain)}
                     className="text-xs text-gray-400 hover:text-white"
@@ -621,6 +666,17 @@ export function DomainInput({
             <p className="text-red-400 text-xs flex items-center gap-1">
               <XCircle className="w-3.5 h-3.5" />
               Remove blacklisted domains before proceeding
+            </p>
+          )}
+
+          {!hasBlacklisted && hasUnknown && (
+            <p className="text-amber-400 text-xs flex items-start gap-1">
+              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+              <span>
+                Blacklist service unavailable for one or more domains. You can
+                proceed, but verify each unknown domain on MXToolbox before
+                launching.
+              </span>
             </p>
           )}
         </div>

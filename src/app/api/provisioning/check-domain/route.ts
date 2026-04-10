@@ -1,6 +1,6 @@
 import { auth } from "@clerk/nextjs/server";
 import { NextResponse } from "next/server";
-import { checkDomainBlacklists } from "@/lib/provisioning/domain-blacklist";
+import { checkDomainBlacklist } from "@/lib/provisioning/domain-blacklist";
 
 export const dynamic = "force-dynamic";
 
@@ -69,14 +69,22 @@ export async function POST(req: Request) {
       );
     }
 
-    const result = await checkDomainBlacklists(cleanDomain);
+    const result = await checkDomainBlacklist(cleanDomain);
 
+    // 3-state response. `clean` and `blacklisted` are kept for backwards
+    // compatibility with the DomainInput component, but the authoritative
+    // field is `status`:
+    //   - 'clean'   → definitively not listed (via DQS or worker proxy)
+    //   - 'listed'  → definitively listed on at least one blacklist
+    //   - 'unknown' → blacklist service unavailable (warn, don't block)
     return NextResponse.json({
       domain: result.domain,
-      clean: result.clean,
-      blacklisted: !result.clean,
-      blacklists: result.blacklists,
-      ...(result.errors.length > 0 ? { errors: result.errors } : {}),
+      status: result.status,
+      clean: result.status === "clean",
+      blacklisted: result.status === "listed",
+      blacklists: result.lists,
+      method: result.method,
+      ...(Object.keys(result.raw).length > 0 ? { raw: result.raw } : {}),
     });
   } catch (err) {
     console.error("[check-domain] error", err);
