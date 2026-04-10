@@ -73,6 +73,17 @@ export async function handleProvisionPair(
     throw new Error(`Failed to load provisioning job ${jobId}: ${jobError?.message}`);
   }
 
+  // --- Hard lesson #13 (2026-04-10): Refuse re-entry for terminal/claimed jobs ---
+  // Previously, pg-boss retry + legacy pollProvisioningJobs cron would re-deliver
+  // the same job to a worker that had already completed (or rolled_back) it,
+  // causing step rows to be overwritten mid-flight. Gate at the top of the handler.
+  if (job.status !== 'pending') {
+    console.log(
+      `[Provision] Job ${jobId} not pending (status=${job.status}), skipping — already claimed by another execution path`
+    );
+    return;
+  }
+
   const provJob = job as ProvisioningJobRow;
 
   // 2. Load provider configs and decrypt API keys
@@ -146,6 +157,7 @@ export async function handleProvisionPair(
   // 6. Build context — include region + mapped plan from job config
   const jobConfig = (provJob.config || {}) as Record<string, string>;
   const regionFromWizard = jobConfig.region || 'us-east';
+  const secondaryRegionFromWizard = jobConfig.secondaryRegion || regionFromWizard;
   const sizeLabel = jobConfig.size || 'small';
   const providerPlan = resolveProviderPlan(vpsProviderRow.provider_type, sizeLabel);
 
@@ -162,10 +174,11 @@ export async function handleProvisionPair(
     log: (msg: string) => console.log(`[Provision][${jobId}] ${msg}`),
   };
 
-  // Set region, serverSize, and rootPassword on context metadata for saga steps to read
-  // The saga uses ctxMeta(context).region, ctxMeta(context).serverSize, ctxMeta(context).serverPassword
+  // Set region, secondaryRegion, serverSize, and rootPassword on context metadata for saga steps to read
+  // The saga uses ctxMeta(context).region, ctxMeta(context).secondaryRegion, ctxMeta(context).serverSize, ctxMeta(context).serverPassword
   const ctxAny = context as unknown as Record<string, unknown>;
   ctxAny.region = regionFromWizard;
+  ctxAny.secondaryRegion = secondaryRegionFromWizard;
   ctxAny.serverSize = providerPlan;
   ctxAny.serverPassword = rootPassword;
 

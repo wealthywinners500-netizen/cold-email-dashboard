@@ -38,6 +38,8 @@ import type {
   ProvisioningContext,
 } from './types';
 import type { SagaStep, StepResult } from './saga-engine';
+import { checkSubnetDiversity } from './verification';
+import { checkDomainsBlacklistBatch } from './domain-blacklist';
 
 // Helper to access dynamic metadata on context safely
 function ctxMeta(context: ProvisioningContext): Record<string, unknown> {
@@ -140,17 +142,30 @@ export function createPairProvisioningSaga(
           const hostname1 = `mail1.${context.nsDomain}`;
           const hostname2 = `mail2.${context.nsDomain}`;
 
+          // --- Hard lesson #44: Region diversity for subnet isolation ---
+          // secondaryRegion (optional) controls mail2's region separately from
+          // mail1. Defaults to the primary region if unset — caller should
+          // pick a different region for real production pairs to guarantee
+          // different /24 networks.
+          const primaryRegion = (ctxMeta(context).region as string) || 'default';
+          const secondaryRegion =
+            (ctxMeta(context).secondaryRegion as string) || primaryRegion;
+          const serverSize = (ctxMeta(context).serverSize as string) || 'default';
+          context.log(
+            `[Step 1] mail1 region=${primaryRegion}, mail2 region=${secondaryRegion}, size=${serverSize}`
+          );
+
           // Create both servers
           const [server1, server2] = await Promise.all([
             vpsProvider.createServer({
               name: hostname1,
-              region: (ctxMeta(context)).region as string || 'default',
-              size: (ctxMeta(context)).serverSize as string || 'default',
+              region: primaryRegion,
+              size: serverSize,
             }),
             vpsProvider.createServer({
               name: hostname2,
-              region: (ctxMeta(context)).region as string || 'default',
-              size: (ctxMeta(context)).serverSize as string || 'default',
+              region: secondaryRegion,
+              size: serverSize,
             }),
           ]);
 
@@ -188,12 +203,14 @@ export function createPairProvisioningSaga(
 
           return {
             success: true,
-            output: `VPS pair created: ${finalServer1.ip} + ${finalServer2.ip}`,
+            output: `VPS pair created: ${finalServer1.ip} (${primaryRegion}) + ${finalServer2.ip} (${secondaryRegion})`,
             metadata: {
               server1ProviderId: finalServer1.id,
               server2ProviderId: finalServer2.id,
               server1IP: finalServer1.ip,
               server2IP: finalServer2.ip,
+              server1Region: primaryRegion,
+              server2Region: secondaryRegion,
             },
           };
         } catch (err) {
@@ -911,6 +928,56 @@ export function createPairProvisioningSaga(
         const server2IP = ctx.server2IP as string;
         const resolvers = ['8.8.8.8', '1.1.1.1', '9.9.9.9'];
         const failures: string[] = [];
+        const warnings: Array<{ code: string; message: string; remediation?: string }> = [];
+
+        // --- Hard lesson #44: Subnet diversity check ---
+        // MXToolbox flags pairs that share a /24. Linode assigns IPs from the
+        // same regional pool, so same region → near-guaranteed shared /24.
+        // Non-fatal warning so Dean can decide per-pair whether to rollback.
+        try {
+          const subnet = checkSubnetDiversity(server1IP, server2IP);
+          if (subnet.sameSlash24) {
+            const msg = `mail1 (${server1IP}) and mail2 (${server2IP}) share /24 ${subnet.slash24_1}. MXToolbox will flag this as a same-subnet pair.`;
+            warnings.push({
+              code: 'SAME_SUBNET_24',
+              message: msg,
+              remediation: 'Rollback and reprovision mail2 in a different region (set secondaryRegion in the wizard), or request Linode support for placement diversity.',
+            });
+            context.log(`[Step 8] WARNING: Same /24 detected for pair — ${msg}`);
+          } else if (subnet.sameSlash16) {
+            context.log(`[Step 8] INFO: mail1 and mail2 share /16 but differ on /24 (OK)`);
+          } else {
+            context.log(`[Step 8] OK: subnet diversity verified (${subnet.slash24_1} vs ${subnet.slash24_2})`);
+          }
+        } catch (err) {
+          context.log(`[Step 8] Subnet diversity check failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+        }
+
+        // --- Hard lesson #43: Domain blacklist defense-in-depth ---
+        // check-domain was stubbed before this fix, so older jobs may have
+        // launched with Spamhaus-listed domains. Re-check at the end so the
+        // verification report surfaces any domain blacklisting. Does NOT fail
+        // the saga (the pair hardware is still fine) — just warns.
+        try {
+          const allSagaDomains = [context.nsDomain, ...context.sendingDomains];
+          const blResults = await checkDomainsBlacklistBatch(allSagaDomains, { concurrency: 5 });
+          const listed = blResults.filter((r) => !r.clean);
+          if (listed.length > 0) {
+            for (const r of listed) {
+              const msg = `Domain ${r.domain} is listed on: ${r.blacklists.join(', ')}`;
+              warnings.push({
+                code: 'DOMAIN_BLACKLISTED',
+                message: msg,
+                remediation: 'Submit delisting requests to each blocklist. Consider re-provisioning with clean domains.',
+              });
+              context.log(`[Step 8] WARNING: ${msg}`);
+            }
+          } else {
+            context.log(`[Step 8] OK: all ${allSagaDomains.length} domains clean on DNSBLs`);
+          }
+        } catch (err) {
+          context.log(`[Step 8] Domain blacklist check failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+        }
 
         try {
           // Check all domains via multi-resolver DNS
@@ -1004,17 +1071,32 @@ export function createPairProvisioningSaga(
             }
           }
 
-          if (failures.length === 0) {
+          const warningsText = warnings.length > 0
+            ? `\n\nWarnings (non-blocking):\n${warnings.map((w) => `  [${w.code}] ${w.message}${w.remediation ? `\n    Remediation: ${w.remediation}` : ''}`).join('\n')}`
+            : '';
+
+          if (failures.length === 0 && warnings.length === 0) {
             return {
               success: true,
-              output: `All verification checks passed. ${allDomains.length} domains, 2 IPs, SPF/DKIM/DMARC/PTR/blacklist all clean.`,
+              output: `All verification checks passed. ${allDomains.length} domains, 2 IPs, SPF/DKIM/DMARC/PTR/blacklist/subnet all clean.`,
+              metadata: { verificationWarnings: [] },
+            };
+          } else if (failures.length === 0 && warnings.length > 0) {
+            return {
+              success: true,
+              manualRequired: true,
+              output: `Verification passed with ${warnings.length} warning(s):${warningsText}`,
+              metadata: { verificationWarnings: warnings },
             };
           } else {
             return {
               success: true,
               manualRequired: true,
-              output: `Verification completed with ${failures.length} issues:\n${failures.join('\n')}`,
-              metadata: { verificationFailures: failures },
+              output: `Verification completed with ${failures.length} issues:\n${failures.join('\n')}${warningsText}`,
+              metadata: {
+                verificationFailures: failures,
+                verificationWarnings: warnings,
+              },
             };
           }
         } catch (err) {

@@ -1,6 +1,6 @@
 import { auth } from "@clerk/nextjs/server";
 import { NextResponse } from "next/server";
-import { resolve } from "dns";
+import { checkDomainBlacklists } from "@/lib/provisioning/domain-blacklist";
 
 export const dynamic = "force-dynamic";
 
@@ -19,28 +19,16 @@ function checkRateLimit(key: string, limit: number, windowMs: number): boolean {
   return true;
 }
 
-function dnsLookup(hostname: string, rrtype: string): Promise<string[]> {
-  return new Promise((res, rej) => {
-    resolve(hostname, rrtype, (err, addresses) => {
-      if (err) {
-        // NXDOMAIN or NODATA means not blacklisted
-        if (err.code === "ENOTFOUND" || err.code === "ENODATA") {
-          res([]);
-        } else {
-          rej(err);
-        }
-      } else {
-        res(addresses as string[]);
-      }
-    });
-  });
-}
-
 /**
  * POST /api/provisioning/check-domain
- * Checks a domain against Spamhaus DBL
+ * Checks a domain against Spamhaus DBL + SURBL + URIBL via real DNS lookups.
  * Body: { domain: string }
- * Returns: { domain, clean: boolean, blacklists: string[] }
+ * Returns: { domain, clean: boolean, blacklisted: boolean, blacklists: string[] }
+ *
+ * Hard lesson #43 (2026-04-10): Previously stubbed to return clean:true for every
+ * domain. That allowed a Spamhaus-listed domain (krogeradcollective.info) to pass
+ * the wizard launch guard in Test #11. Now does real DNS lookups via the shared
+ * domain-blacklist helper.
  */
 export async function POST(req: Request) {
   try {
@@ -81,15 +69,17 @@ export async function POST(req: Request) {
       );
     }
 
-    // Return clean for all domains for now
-    // Real Spamhaus DBL + SURBL lookup can be added later
+    const result = await checkDomainBlacklists(cleanDomain);
+
     return NextResponse.json({
-      domain: cleanDomain,
-      clean: true,
-      blacklisted: false,
-      blacklists: [],
+      domain: result.domain,
+      clean: result.clean,
+      blacklisted: !result.clean,
+      blacklists: result.blacklists,
+      ...(result.errors.length > 0 ? { errors: result.errors } : {}),
     });
-  } catch {
+  } catch (err) {
+    console.error("[check-domain] error", err);
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 }

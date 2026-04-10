@@ -297,25 +297,47 @@ async function main() {
     jobId: string;
   }
 
-  await boss.work<ProvisionPairPayload>(
-    "provision-server-pair",
-    {
-      batchSize: 1,
-      pollingIntervalSeconds: 5,
-    },
-    async (jobs) => {
-      for (const job of jobs) {
-        console.log(`[Worker] Starting provision-server-pair job ${job.id}`);
-        try {
-          await handleProvisionPair(job.data);
-          console.log(`[Worker] Provision job ${job.id} completed successfully`);
-        } catch (err) {
-          console.error(`[Worker] Provision job ${job.id} failed:`, err);
-          throw err;
+  // --- Hard lesson #11 (2026-04-10): provision-server-pair queue is the LEGACY
+  // monolithic path that ran the full 8-step saga inside the worker. It raced
+  // with the canonical Vercel execute-step → provision-step bridge and corrupted
+  // step rows in all 10 of 2026-04-10's real provisioning attempts.
+  //
+  // The canonical path is now:
+  //   wizard → POST /api/provisioning → POST /api/provisioning/[jobId]/execute-step
+  //   → for SSH-heavy steps 2/4/6/7: boss.send('provision-step') → worker handler
+  //     → HMAC callback POST to /api/provisioning/[jobId]/worker-callback
+  //
+  // The handler is still imported + registered so existing queued jobs can be
+  // drained safely, but we gate behind ENABLE_LEGACY_MONOLITHIC_PROVISIONING
+  // (default false) and force teamConcurrency=1 to prevent double execution.
+  // See feedback_hard_lessons.md hard lessons #11-#14.
+  const enableLegacyMonolithic = process.env.ENABLE_LEGACY_MONOLITHIC_PROVISIONING === 'true';
+
+  if (enableLegacyMonolithic) {
+    console.warn("[Worker] WARNING: ENABLE_LEGACY_MONOLITHIC_PROVISIONING=true — registering legacy provision-server-pair handler. This path races with the canonical execute-step path.");
+    await boss.work<ProvisionPairPayload>(
+      "provision-server-pair",
+      {
+        batchSize: 1,
+        pollingIntervalSeconds: 10,
+        localConcurrency: 1,
+      },
+      async (jobs) => {
+        for (const job of jobs) {
+          console.log(`[Worker] Starting provision-server-pair job ${job.id}`);
+          try {
+            await handleProvisionPair(job.data);
+            console.log(`[Worker] Provision job ${job.id} completed successfully`);
+          } catch (err) {
+            console.error(`[Worker] Provision job ${job.id} failed:`, err);
+            throw err;
+          }
         }
       }
-    }
-  );
+    );
+  } else {
+    console.log("[Worker] Legacy provision-server-pair handler DISABLED (ENABLE_LEGACY_MONOLITHIC_PROVISIONING not set). Using canonical execute-step → provision-step bridge.");
+  }
 
   // Register provision-step handler (per-step SSH execution via worker bridge)
   interface ProvisionStepPayload {
@@ -324,11 +346,16 @@ async function main() {
     stepId: string;
   }
 
+  // localConcurrency=1 + batchSize=1 ensures a single SSH-heavy step can NEVER
+  // be delivered twice in parallel while it's still running. pg-boss would
+  // otherwise re-deliver on ack timeout and trigger the same race condition
+  // that poisoned Test #11. (pg-boss v12 uses localConcurrency, not teamSize.)
   await boss.work<ProvisionStepPayload>(
     "provision-step",
     {
       batchSize: 1,
-      pollingIntervalSeconds: 5,
+      pollingIntervalSeconds: 10,
+      localConcurrency: 1,
     },
     async (jobs) => {
       for (const job of jobs) {
@@ -353,7 +380,8 @@ async function main() {
     "rollback-provision",
     {
       batchSize: 1,
-      pollingIntervalSeconds: 5,
+      pollingIntervalSeconds: 10,
+      localConcurrency: 1,
     },
     async (jobs) => {
       for (const job of jobs) {
@@ -417,44 +445,24 @@ async function main() {
     }
   );
 
-  // --- Provisioning job-polling cron (every 15 seconds) ---
-  // Bridges Vercel (creates jobs) → worker (executes them)
-  // DryRun jobs are excluded — those run via serverless execute-step
-  await boss.schedule("poll-provisioning-jobs", "*/1 * * * *");
-
-  const pollProvisioningJobs = async () => {
-    try {
-      const supabase = getSupabase();
-      const { data: pendingJobs } = await supabase
-        .from("provisioning_jobs")
-        .select("id, config")
-        .eq("status", "pending")
-        .order("created_at", { ascending: true })
-        .limit(1);
-
-      for (const pj of pendingJobs || []) {
-        const provType = (pj.config as Record<string, unknown>)?.provider_type;
-        if (provType === "dry_run") continue; // Skip dry_run — handled serverless
-
-        console.log(`[Worker] Found pending provisioning job ${pj.id}, queuing...`);
-        await boss.send("provision-server-pair", { jobId: pj.id });
-
-        // Mark as queued to prevent double-processing
-        await supabase
-          .from("provisioning_jobs")
-          .update({ status: "in_progress" })
-          .eq("id", pj.id)
-          .eq("status", "pending");
-      }
-    } catch (err) {
-      console.error("[Worker] Provisioning poll failed:", err);
-    }
-  };
-
-  // Poll every 15 seconds using setInterval (pg-boss cron is 1-min minimum)
-  setInterval(pollProvisioningJobs, 15000);
-  // Also run immediately on startup
-  await pollProvisioningJobs();
+  // --- Provisioning job-polling cron DISABLED 2026-04-10 ---
+  // Hard lesson #11: This legacy monolithic path raced with the Vercel
+  // execute-step endpoint and corrupted step rows. The canonical provisioning
+  // flow is now:
+  //   wizard → POST /api/provisioning
+  //          → POST /api/provisioning/[jobId]/execute-step (serverless)
+  //          → for SSH-heavy steps 2/4/6/7: boss.send('provision-step')
+  //            → worker provision-step handler → HMAC callback
+  //
+  // Re-enable ONLY if you explicitly want the worker to drive the whole saga
+  // itself (not recommended). See feedback_hard_lessons.md hard lessons #11-#14.
+  //
+  // await boss.schedule("poll-provisioning-jobs", "*/1 * * * *");
+  //
+  // const pollProvisioningJobs = async () => { ... };
+  // setInterval(pollProvisioningJobs, 15000);
+  // await pollProvisioningJobs();
+  console.log("[Worker] pollProvisioningJobs cron DISABLED — canonical path is execute-step → provision-step bridge.");
 
   // --- Poll for dispatched worker steps (worker bridge pattern) ---
   // The Vercel API marks steps as in_progress with metadata.dispatched_to_worker = true.

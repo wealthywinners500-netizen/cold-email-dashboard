@@ -773,3 +773,37 @@ export class DNSVerifier {
     };
   }
 }
+
+// ============================================
+// Subnet diversity check (hard lesson #44)
+// Both servers in a pair should live in different /24 networks to avoid
+// MXToolbox "same subnet" warnings and to insulate reputation. Linode
+// assigns IPs from the same regional pool, so identical region = near-
+// guaranteed shared /24. We warn (non-fatal) so Dean can decide whether
+// to rollback and reprovision in a different region.
+// ============================================
+
+export interface SubnetDiversityResult {
+  ip1: string;
+  ip2: string;
+  sameSlash24: boolean;
+  sameSlash16: boolean;
+  slash24_1: string;
+  slash24_2: string;
+}
+
+export function checkSubnetDiversity(
+  ip1: string,
+  ip2: string
+): SubnetDiversityResult {
+  const [a1, b1, c1] = ip1.split('.');
+  const [a2, b2, c2] = ip2.split('.');
+  return {
+    ip1,
+    ip2,
+    sameSlash24: a1 === a2 && b1 === b2 && c1 === c2,
+    sameSlash16: a1 === a2 && b1 === b2,
+    slash24_1: `${a1}.${b1}.${c1}.0/24`,
+    slash24_2: `${a2}.${b2}.${c2}.0/24`,
+  };
+}

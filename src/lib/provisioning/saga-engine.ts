@@ -66,6 +66,33 @@ export class SagaEngine {
   ): Promise<{ success: boolean; error?: string }> {
     const supabase = await createAdminClient();
 
+    // --- Hard lesson #11/#12 (2026-04-10): Terminal-state guard ---
+    // Previously, two execution paths (Vercel execute-step + worker
+    // pollProvisioningJobs) could both drive the same saga for the same job
+    // and corrupt each other's step rows. Refuse re-entry on any non-pending
+    // state so only one path claims the job.
+    const { data: currentJob } = await supabase
+      .from('provisioning_jobs')
+      .select('status')
+      .eq('id', this.jobId)
+      .single();
+
+    if (currentJob) {
+      const status = currentJob.status as string;
+      if (['completed', 'failed', 'rolled_back', 'cancelled'].includes(status)) {
+        context.log(
+          `[saga] Job ${this.jobId} already terminal (${status}), skipping execute()`
+        );
+        return { success: status === 'completed' };
+      }
+      if (status === 'in_progress') {
+        context.log(
+          `[saga] Job ${this.jobId} already in_progress — another executor is running, skipping`
+        );
+        return { success: false, error: 'already_in_progress' };
+      }
+    }
+
     // Load existing step rows (for idempotent retry)
     const existingSteps = await getProvisioningSteps(this.jobId);
     const stepMap = new Map(
@@ -87,14 +114,25 @@ export class SagaEngine {
       }
     }
 
-    // Update job to in_progress
-    await supabase
+    // Update job to in_progress — use conditional update so a concurrent
+    // executor can't re-enter between the guard above and this line.
+    const { data: claimed, error: claimError } = await supabase
       .from('provisioning_jobs')
       .update({
         status: 'in_progress',
         started_at: new Date().toISOString(),
       })
-      .eq('id', this.jobId);
+      .eq('id', this.jobId)
+      .eq('status', 'pending')
+      .select('id')
+      .maybeSingle();
+
+    if (claimError || !claimed) {
+      context.log(
+        `[saga] Job ${this.jobId} could not be claimed (already in_progress by another executor). Skipping.`
+      );
+      return { success: false, error: 'claim_failed' };
+    }
 
     const completedStepIndices: number[] = [];
 

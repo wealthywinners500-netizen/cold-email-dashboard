@@ -76,6 +76,9 @@ export default function NewProvisioningPage() {
   const [selectedProvider, setSelectedProvider] = useState<string>("");
   const [regions, setRegions] = useState<Region[]>([]);
   const [selectedRegion, setSelectedRegion] = useState<string>("");
+  // Hard lesson #45 (2026-04-10): Secondary region must differ from primary for
+  // MXToolbox reputation (/24 subnet diversity). Empty string = same as primary.
+  const [selectedSecondaryRegion, setSelectedSecondaryRegion] = useState<string>("");
   const [selectedSize, setSelectedSize] = useState<string>("small");
   const [loadingProviders, setLoadingProviders] = useState(true);
   const [loadingRegions, setLoadingRegions] = useState(false);
@@ -133,6 +136,7 @@ export default function NewProvisioningPage() {
 
     setLoadingRegions(true);
     setSelectedRegion("");
+    setSelectedSecondaryRegion("");
     fetch(`/api/vps-providers/${selectedProvider}/regions`)
       .then((r) => r.ok ? r.json() : [])
       .then((data) => setRegions(data))
@@ -184,6 +188,7 @@ export default function NewProvisioningPage() {
         admin_email: adminEmail || null,
         config: {
           region: selectedRegion,
+          secondaryRegion: selectedSecondaryRegion || selectedRegion,
           size: selectedSize,
           custom_prefixes: mailAccountStyle === "custom" ? customPrefixes.split("\n").filter(Boolean) : undefined,
         },
@@ -339,6 +344,33 @@ export default function NewProvisioningPage() {
                             </button>
                           ))}
                         </div>
+                      )}
+                    </div>
+                  )}
+
+                  {selectedRegion && regions.length > 1 && (
+                    <div>
+                      <label className="text-sm text-gray-400 mb-2 block">
+                        Secondary Region <span className="text-gray-500">(for server 2 — different subnet = better reputation)</span>
+                      </label>
+                      <select
+                        value={selectedSecondaryRegion}
+                        onChange={(e) => setSelectedSecondaryRegion(e.target.value)}
+                        className="w-full p-3 rounded-lg border border-gray-700 bg-gray-800/50 text-sm text-white focus:border-blue-500 focus:outline-none"
+                      >
+                        <option value="">Same as primary (not recommended for production)</option>
+                        {regions
+                          .filter((r) => r.available && r.id !== selectedRegion)
+                          .map((r) => (
+                            <option key={r.id} value={r.id}>
+                              {r.name}
+                            </option>
+                          ))}
+                      </select>
+                      {!selectedSecondaryRegion && (
+                        <p className="text-xs text-amber-400 mt-2">
+                          ⚠ Both servers will likely share a /24 subnet. For production deliverability, pick a different region.
+                        </p>
                       )}
                     </div>
                   )}
@@ -635,8 +667,16 @@ export default function NewProvisioningPage() {
                     <span className="text-white">{selectedProviderObj?.name}</span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-gray-400">Region</span>
+                    <span className="text-gray-400">Primary Region (server 1)</span>
                     <span className="text-white">{regions.find((r) => r.id === selectedRegion)?.name}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-400">Secondary Region (server 2)</span>
+                    <span className={selectedSecondaryRegion ? "text-white" : "text-amber-400"}>
+                      {selectedSecondaryRegion
+                        ? regions.find((r) => r.id === selectedSecondaryRegion)?.name
+                        : "Same as primary ⚠"}
+                    </span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-gray-400">Server Size</span>

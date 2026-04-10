@@ -171,12 +171,17 @@ async function executeServerlessStep(
       const provider = await getVPSProvider(vpsRow.provider_type as VPSProviderType, vpsConfig);
 
       // Read region and size from JOB config (set by wizard), NOT vpsRow config
+      // Hard lesson #44 (2026-04-10): secondaryRegion defaults to primary region but
+      // the wizard now exposes it so pairs can land on different subnets for
+      // MXToolbox reputation. Honor it here so the serverless path matches the
+      // worker's handleProvisionPair path.
       const jobConfig = (job.config || {}) as Record<string, string>;
       const region = jobConfig.region || "us-east";
+      const secondaryRegion = jobConfig.secondaryRegion || region;
       const sizeLabel = jobConfig.size || "small";
       const providerPlan = resolveProviderPlan(vpsRow.provider_type, sizeLabel);
 
-      // Create two servers
+      // Create two servers — server2 may live in a different region for subnet diversity
       const server1 = await provider.createServer({
         name: `mail1-${job.ns_domain.replace(/\./g, "-")}`,
         region,
@@ -185,7 +190,7 @@ async function executeServerlessStep(
 
       const server2 = await provider.createServer({
         name: `mail2-${job.ns_domain.replace(/\./g, "-")}`,
-        region,
+        region: secondaryRegion,
         size: providerPlan,
       });
 
@@ -225,12 +230,14 @@ async function executeServerlessStep(
         .eq("id", job.id);
 
       return {
-        output: `VPS pair created: ${server1.ip} + ${server2.ip} (${vpsRow.provider_type})`,
+        output: `VPS pair created: ${server1.ip} (${region}) + ${server2.ip} (${secondaryRegion}) (${vpsRow.provider_type})`,
         metadata: {
           server1IP: server1.ip,
           server2IP: server2.ip,
           server1ProviderId: server1.id,
           server2ProviderId: server2.id,
+          server1Region: region,
+          server2Region: secondaryRegion,
         },
       };
     }
