@@ -1,8 +1,10 @@
 import { auth } from "@clerk/nextjs/server";
 import { createAdminClient } from "@/lib/supabase/server";
 import { NextResponse } from "next/server";
+import { isProvisioningAllowed } from "@/lib/plan-enforcement";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 async function getInternalOrgId(): Promise<string | null> {
   const { orgId } = await auth();
@@ -92,6 +94,42 @@ export async function POST(req: Request) {
       return NextResponse.json(
         { error: "sending_domains must be a non-empty array" },
         { status: 400 }
+      );
+    }
+
+    // Billing + plan limit gate (hard lesson: control-plane must block
+    // before any Linode API call, otherwise an authenticated user with no
+    // subscription can spin up unlimited real VPSes).
+    const decision = await isProvisioningAllowed(orgId);
+    if (decision.status === "org_not_found") {
+      return NextResponse.json(
+        { error: "Organization not found" },
+        { status: 404 }
+      );
+    }
+    if (decision.status === "billing_required") {
+      return NextResponse.json(
+        {
+          error: "billing_required",
+          message:
+            "An active subscription is required to provision servers. Please subscribe on the Billing page.",
+          plan: decision.plan,
+          upgrade_url: "/dashboard/settings#billing",
+        },
+        { status: 402 }
+      );
+    }
+    if (decision.status === "limit_exceeded") {
+      return NextResponse.json(
+        {
+          error: "plan_limit_exceeded",
+          message: `Your ${decision.plan} plan allows ${decision.limit} server pair${decision.limit === 1 ? "" : "s"} — you currently have ${decision.current}. Upgrade to add more.`,
+          plan: decision.plan,
+          current: decision.current,
+          limit: decision.limit,
+          upgrade_url: "/dashboard/settings#billing",
+        },
+        { status: 402 }
       );
     }
 

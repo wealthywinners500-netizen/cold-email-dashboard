@@ -14,8 +14,14 @@ export enum PlanResource {
 
 /**
  * Plan tier definitions
+ *
+ * 'comped' is an admin-granted free access tier with same limits as starter.
+ * It bypasses the Stripe subscription requirement in POST /api/provisioning,
+ * so an operator can grant a specific org free access via:
+ *   UPDATE organizations SET plan_tier='comped' WHERE clerk_org_id='<friend>';
+ * Everyone else needs a real Stripe subscription to provision.
  */
-export type PlanTier = 'starter' | 'pro' | 'enterprise';
+export type PlanTier = 'starter' | 'pro' | 'enterprise' | 'comped';
 
 /**
  * Plan limits structure
@@ -47,6 +53,17 @@ export interface PlanLimitCheckResult {
  */
 const PLAN_TIERS: Record<PlanTier, PlanLimits> = {
   starter: {
+    server_pairs: 2,
+    email_accounts: 20,
+    campaigns: 5,
+    daily_sends: 500,
+    lead_contacts: 1000,
+    team_members: 1,
+  },
+  comped: {
+    // Matches starter limits — admin-granted free access for beta / friend test / support cases.
+    // The billing bypass (no stripe_subscription_id required) is enforced by isProvisioningAllowed
+    // in POST /api/provisioning, not here. This record only sets the resource ceilings.
     server_pairs: 2,
     email_accounts: 20,
     campaigns: 5,
@@ -270,6 +287,64 @@ export async function checkMultiplePlanLimits(
   }
 
   return results;
+}
+
+/**
+ * Combined billing + plan check for provisioning.
+ *
+ * Returns one of three outcomes:
+ *   - { status: 'allowed' } — org may provision
+ *   - { status: 'billing_required' } — org has no active Stripe subscription and is not comped
+ *   - { status: 'limit_exceeded', current, limit, plan } — org is at plan cap
+ *
+ * Billing is bypassed for `plan_tier='comped'`. Everyone else needs a
+ * non-null `stripe_subscription_id` on the organizations row.
+ *
+ * This is the single authoritative gate for POST /api/provisioning.
+ */
+export type ProvisioningDecision =
+  | { status: 'allowed'; plan: PlanTier }
+  | { status: 'billing_required'; plan: PlanTier }
+  | { status: 'limit_exceeded'; plan: PlanTier; current: number; limit: number }
+  | { status: 'org_not_found' };
+
+export async function isProvisioningAllowed(
+  orgId: string
+): Promise<ProvisioningDecision> {
+  const supabase = getSupabase();
+
+  // Step 1: fetch org + billing state
+  const { data: org, error: orgError } = await supabase
+    .from('organizations')
+    .select('plan_tier, stripe_subscription_id')
+    .eq('id', orgId)
+    .single();
+
+  if (orgError || !org) {
+    console.error(`[isProvisioningAllowed] Organization not found: ${orgId}`, orgError);
+    return { status: 'org_not_found' };
+  }
+
+  const plan = ((org.plan_tier as PlanTier) || 'starter') as PlanTier;
+  const hasSubscription = Boolean(org.stripe_subscription_id);
+
+  // Step 2: billing gate. Comped bypasses. Everyone else needs a subscription.
+  if (plan !== 'comped' && !hasSubscription) {
+    return { status: 'billing_required', plan };
+  }
+
+  // Step 3: plan resource cap
+  const check = await checkPlanLimit(orgId, PlanResource.SERVER_PAIRS);
+  if (!check.allowed) {
+    return {
+      status: 'limit_exceeded',
+      plan,
+      current: check.current,
+      limit: check.limit,
+    };
+  }
+
+  return { status: 'allowed', plan };
 }
 
 /**
