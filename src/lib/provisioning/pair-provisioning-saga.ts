@@ -29,6 +29,7 @@ import {
   hardenSecurity,
   issueSSLCert,
   setHostname,
+  HESTIA_PATH_PREFIX,
 } from './hestia-scripts';
 import { generateAccountNamesForPair } from './name-generator';
 import type {
@@ -540,12 +541,12 @@ export function createPairProvisioningSaga(
         const allDomains = [context.nsDomain, ...context.sendingDomains];
         for (const domain of allDomains) {
           try {
-            await ssh1.exec(`v-delete-dns-domain admin ${domain}`, {
+            await ssh1.exec(`${HESTIA_PATH_PREFIX}v-delete-dns-domain admin ${domain}`, {
               timeout: 10000,
             });
           } catch { /* ignore */ }
           try {
-            await ssh2.exec(`v-delete-dns-domain admin ${domain}`, {
+            await ssh2.exec(`${HESTIA_PATH_PREFIX}v-delete-dns-domain admin ${domain}`, {
               timeout: 10000,
             });
           } catch { /* ignore */ }
@@ -787,12 +788,12 @@ export function createPairProvisioningSaga(
       async compensate(context: ProvisioningContext): Promise<void> {
         for (const domain of context.sendingDomains) {
           try {
-            await ssh1.exec(`v-delete-mail-domain admin ${domain}`, {
+            await ssh1.exec(`${HESTIA_PATH_PREFIX}v-delete-mail-domain admin ${domain}`, {
               timeout: 10000,
             });
           } catch { /* ignore */ }
           try {
-            await ssh2.exec(`v-delete-mail-domain admin ${domain}`, {
+            await ssh2.exec(`${HESTIA_PATH_PREFIX}v-delete-mail-domain admin ${domain}`, {
               timeout: 10000,
             });
           } catch { /* ignore */ }

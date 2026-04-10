@@ -26,7 +26,7 @@ import type { DNSRecord } from './hestia-parsers';
  * is NOT in $PATH for non-login SSH sessions. All v-* commands must
  * be prefixed with this PATH export.
  */
-const HESTIA_PATH_PREFIX = 'export PATH=/usr/local/hestia/bin:$PATH && ';
+export const HESTIA_PATH_PREFIX = 'export PATH=/usr/local/hestia/bin:$PATH && ';
 
 // ============================================
 // Types
@@ -353,8 +353,23 @@ export async function createMailDomain(
   // Create mail domain
   await ssh.exec(`${HESTIA_PATH_PREFIX}v-add-mail-domain admin ${domain}`, { timeout: 15000 });
 
-  // Generate DKIM
-  await ssh.exec(`${HESTIA_PATH_PREFIX}v-add-mail-domain-dkim admin ${domain}`, { timeout: 15000 });
+  // Wait for HestiaCP to fully commit the mail domain before generating DKIM
+  // Without this delay, v-add-mail-domain-dkim fails with exit code 4 (object doesn't exist)
+  await new Promise((resolve) => setTimeout(resolve, 3000));
+
+  // Generate DKIM (retry once after additional delay if HestiaCP still hasn't committed)
+  try {
+    await ssh.exec(`${HESTIA_PATH_PREFIX}v-add-mail-domain-dkim admin ${domain}`, { timeout: 15000 });
+  } catch (dkimError: unknown) {
+    const errMsg = dkimError instanceof Error ? dkimError.message : String(dkimError);
+    if (errMsg.includes('exit code 4') || errMsg.includes('code 4')) {
+      // HestiaCP still hasn't committed — wait longer and retry
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+      await ssh.exec(`${HESTIA_PATH_PREFIX}v-add-mail-domain-dkim admin ${domain}`, { timeout: 15000 });
+    } else {
+      throw dkimError;
+    }
+  }
 
   // Add SPF TXT record
   await ssh.exec(
