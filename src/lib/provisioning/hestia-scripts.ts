@@ -941,6 +941,90 @@ export async function replicateSSLCertToSecondary(
 }
 
 // ============================================
+// g.2) Replicate DKIM private/public keys S1 -> S2
+// ============================================
+/**
+ * Hard Lesson #66 (Test #15, 2026-04-11): HestiaCP's v-add-mail-domain-dkim
+ * generates a FRESH RSA keypair on each server it's run on. When createMailDomain
+ * runs on both s1 and s2, each server ends up with a DIFFERENT private key
+ * under /etc/exim4/domains/<domain>/dkim.private.pem, but the DNS TXT record
+ * mail._domainkey.<domain> only contains s1's public key. Any outbound mail
+ * that Exim on s2 signs will fail DKIM validation at the receiving MTA
+ * because the receiver compares s2's signature against s1's published public key.
+ *
+ * Fix: after createMailDomain has run on both servers, copy s1's dkim.private.pem
+ * AND dkim.public.pem to s2 via the same base64-over-SSH pattern used for
+ * replicateSSLCertToSecondary, chown to Debian-exim:Debian-exim, chmod 640,
+ * then v-rebuild-mail-domain on s2 so Exim re-reads the replicated keys.
+ *
+ * This helper is best-effort: if s1's key file is missing (createMailDomain
+ * silently failed to enable DKIM on s1), we log a warning and return. The
+ * worst case is that s2 keeps its own fresh key and we eat a DKIM mismatch
+ * on s2-signed mail, but the pair still ships.
+ *
+ * Ownership note: on Debian/Hestia stacks, /etc/exim4/domains/<d>/dkim.*.pem
+ * is owned by Debian-exim:Debian-exim (NOT mail:mail and NOT root:root).
+ */
+export async function replicateDKIMKeysToSecondary(
+  ssh1: SSHManager,
+  ssh2: SSHManager,
+  domain: string
+): Promise<void> {
+  const dkimDir = `/etc/exim4/domains/${domain}`;
+  const keyFiles = ['dkim.private.pem', 'dkim.public.pem'];
+
+  for (const keyFile of keyFiles) {
+    const srcPath = `${dkimDir}/${keyFile}`;
+    let b64Content: string;
+    try {
+      const { stdout } = await ssh1.exec(
+        `if [ -f ${srcPath} ]; then base64 -w0 ${srcPath}; else echo MISSING; fi`,
+        { timeout: 15000 }
+      );
+      b64Content = (stdout || '').trim();
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[replicateDKIMKeysToSecondary] read ${srcPath} on S1 failed for ${domain}: ${err instanceof Error ? err.message : String(err)}`
+      );
+      continue;
+    }
+
+    if (b64Content === 'MISSING' || !b64Content) {
+      // DKIM not enabled on s1 for this domain (createMailDomain's DKIM step
+      // may have been skipped by the 1.8+ auto-enable check). Nothing to
+      // replicate — let v-rebuild-mail-domain on s2 carry on with whatever
+      // key s2 has.
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[replicateDKIMKeysToSecondary] ${srcPath} not present on S1 for ${domain} — skipping`
+      );
+      continue;
+    }
+
+    try {
+      await ssh2.exec(
+        `mkdir -p ${dkimDir} && echo '${b64Content}' | base64 -d > ${dkimDir}/${keyFile} && chown Debian-exim:Debian-exim ${dkimDir}/${keyFile} && chmod 640 ${dkimDir}/${keyFile}`,
+        { timeout: 15000 }
+      );
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[replicateDKIMKeysToSecondary] write ${dkimDir}/${keyFile} on S2 failed for ${domain}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  // Rebuild the mail domain on s2 so Exim reloads with the replicated keys.
+  await ssh2
+    .exec(
+      `bash -lc "${HESTIA_FULL_PATH} && v-rebuild-mail-domain admin ${domain}"`,
+      { timeout: 60000 }
+    )
+    .catch(() => { /* tolerate — s2 will keep its own key if rebuild fails */ });
+}
+
+// ============================================
 // h) Set server hostname
 // ============================================
 

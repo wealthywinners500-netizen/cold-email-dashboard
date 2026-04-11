@@ -29,6 +29,7 @@ import {
   hardenSecurity,
   issueSSLCert,
   replicateSSLCertToSecondary,
+  replicateDKIMKeysToSecondary,
   setHostname,
   HESTIA_PATH_PREFIX,
 } from './hestia-scripts';
@@ -800,6 +801,23 @@ export function createPairProvisioningSaga(
             } catch (err) {
               context.log(
                 `[Step 6] Warning: Server 2 mail setup for ${domain}: ${err}`
+              );
+            }
+
+            // Hard Lesson #66 (Test #15): HestiaCP generates a FRESH DKIM
+            // keypair on every server it runs v-add-mail-domain-dkim on.
+            // After createMailDomain on both s1 and s2, the two servers
+            // hold different private keys while the DNS TXT only has s1's.
+            // Replicate s1's dkim.private.pem + dkim.public.pem to s2 so
+            // both Exim instances sign with the same key the DNS publishes.
+            try {
+              await replicateDKIMKeysToSecondary(ssh1, ssh2, domain);
+              context.log(
+                `[Step 6] Replicated DKIM keys for ${domain} from S1 to S2 (Hard Lesson #66).`
+              );
+            } catch (dkimErr) {
+              context.log(
+                `[Step 6] Warning: DKIM key replication for ${domain}: ${dkimErr instanceof Error ? dkimErr.message : String(dkimErr)}`
               );
             }
           }
