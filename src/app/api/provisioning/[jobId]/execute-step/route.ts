@@ -261,7 +261,8 @@ async function executeServerlessStep(
         throw new Error("Server IPs not available — create_vps step must complete first");
       }
 
-      // Set nameservers
+      // Set nameservers on the ns_domain itself (with glue, since the
+      // nameserver hostnames live INSIDE the same domain).
       await registrar.setNameservers(job.ns_domain, [
         `ns1.${job.ns_domain}`,
         `ns2.${job.ns_domain}`,
@@ -273,8 +274,40 @@ async function executeServerlessStep(
         { hostname: `ns2.${job.ns_domain}`, ip: server2IP },
       ]);
 
+      // Hard Lesson #62 (2026-04-11): Test #14 left pair 10's two sending
+      // domains delegated to whatever NS they had before — the wizard's
+      // canonical execute-step driver only updated the ns_domain itself.
+      // The legacy monolithic saga (pair-provisioning-saga.ts:434-451) had a
+      // sendingDomains delegation loop using updateNameserversOnly() but
+      // this serverless handler skipped it, so all mail from new pairs would
+      // fail SPF/reverse-DNS alignment until manually fixed at Ionos. Mirror
+      // the saga loop verbatim. Use updateNameserversOnly (NOT setNameservers)
+      // because Ionos's setNameservers is a stash that only fires inside
+      // setGlueRecords, and sending domains don't take glue (Hard Lesson #54).
+      const ns1Host = `ns1.${job.ns_domain}`;
+      const ns2Host = `ns2.${job.ns_domain}`;
+      const sendingDelegation: Array<{ domain: string; ok: boolean; error?: string }> = [];
+      for (const sendingDomain of (job.sending_domains as string[] | null) || []) {
+        try {
+          await registrar.updateNameserversOnly(sendingDomain, [ns1Host, ns2Host]);
+          sendingDelegation.push({ domain: sendingDomain, ok: true });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          sendingDelegation.push({ domain: sendingDomain, ok: false, error: msg });
+        }
+      }
+      const failedDelegations = sendingDelegation.filter((d) => !d.ok);
+      if (failedDelegations.length > 0) {
+        throw new Error(
+          `Sending domain NS delegation failed for: ${failedDelegations
+            .map((d) => `${d.domain} (${d.error})`)
+            .join("; ")}`
+        );
+      }
+
+      const okList = sendingDelegation.map((d) => d.domain).join(", ") || "(none)";
       return {
-        output: `DNS configured for ${job.ns_domain}: NS → ns1/ns2, glue → ${server1IP}/${server2IP} (${dnsRow.registrar_type})`,
+        output: `DNS configured for ${job.ns_domain}: NS → ns1/ns2, glue → ${server1IP}/${server2IP} (${dnsRow.registrar_type}). Sending domains delegated to ${ns1Host}/${ns2Host}: ${okList}`,
       };
     }
 
@@ -323,10 +356,20 @@ async function executeServerlessStep(
 
       const output = [...results, ...failures].join("\n");
       if (failures.length > 0) {
-        return {
-          output: `Verification completed with ${failures.length} issue(s):\n${output}`,
-          metadata: { failures, manualRequired: true },
-        };
+        // Hard Lesson #62 (2026-04-11): Test #14 finished with 4 DNS failures
+        // here, but the previous handler RETURNED success metadata instead
+        // of throwing — so the step row + job row both transitioned to
+        // 'completed' and the wizard reported a successful provision while
+        // the pair was deliverability-broken. The verification gate is the
+        // only thing standing between a half-provisioned pair and the
+        // resale customer's first send. Throw on any failure so the catch
+        // block at the bottom of POST() marks step + job as 'failed'.
+        const err = new Error(
+          `Verification gate failed (${failures.length} issue(s)):\n${output}`
+        );
+        // Attach the structured failures for the caller to log/diagnose.
+        (err as Error & { failures?: string[] }).failures = failures;
+        throw err;
       }
 
       return { output: `All verification checks passed:\n${output}` };
@@ -669,6 +712,11 @@ export async function POST(
 
         const nextPairNumber = ((maxPairRow?.pair_number as number) || 0) + 1;
 
+        // Hard Lesson #62 (2026-04-11): include provisioning_job_id on the
+        // server_pairs INSERT so future readers can hop server_pairs →
+        // provisioning_jobs → provisioning_steps without going through the
+        // ssh_credentials side door. Pair 10 (Test #14) was created without
+        // this FK and had to be backfilled by hand.
         const { data: serverPair, error: serverPairError } = await supabase
           .from("server_pairs")
           .insert({
@@ -680,6 +728,7 @@ export async function POST(
             s2_ip: server2IP,
             s2_hostname: `mail2.${job.ns_domain}`,
             status: "complete",
+            provisioning_job_id: jobId,
           })
           .select()
           .single();
