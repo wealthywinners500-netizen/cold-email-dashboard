@@ -2,8 +2,55 @@ import { auth } from "@clerk/nextjs/server";
 import { createAdminClient } from "@/lib/supabase/server";
 import { NextResponse } from "next/server";
 import { getVPSProvider, getDNSRegistrar } from "@/lib/provisioning/provider-registry";
-import { decrypt } from "@/lib/provisioning/encryption";
+import { decrypt, encrypt } from "@/lib/provisioning/encryption";
+import { createSSHCredentials } from "@/lib/supabase/queries";
 import type { StepType, ProvisioningJobRow, VPSProviderType, DNSRegistrarType } from "@/lib/provisioning/types";
+import crypto from "crypto";
+
+// ============================================
+// Hard Lesson #58 (2026-04-10): SSH credential persistence MUST happen
+// inside Step 1 (create_vps) at the moment the provider returns, BEFORE any
+// SSH is even attempted. Previously the per-step wizard path had no
+// createSSHCredentials call at all — only the legacy monolithic handler
+// (provision-pair.ts, now gated off) persisted credentials. Pair 9 shipped
+// complete with an empty ssh_credentials table and s1/s2 passwords lost to
+// Linode's internal state. Resale blocker. If persistence fails, we throw
+// and the saga fails — a pair is NOT complete if we can't SSH back into it.
+// ============================================
+async function persistPairCredentials(params: {
+  orgId: string;
+  jobId: string;
+  nsDomain: string;
+  server1IP: string;
+  server2IP: string;
+  rootPassword: string;
+}): Promise<void> {
+  const { orgId, jobId, nsDomain, server1IP, server2IP, rootPassword } =
+    params;
+
+  // encrypt() is AES-256-GCM over the ENCRYPTION_KEY env var — will throw
+  // "ENCRYPTION_KEY environment variable is not set" if the key is missing
+  // on Vercel. Lazy-init per Hard Lesson #34, so the throw surfaces here.
+  const passwordEncrypted = encrypt(rootPassword);
+
+  await createSSHCredentials(orgId, {
+    server_ip: server1IP,
+    hostname: `mail1.${nsDomain}`,
+    username: "root",
+    password_encrypted: passwordEncrypted,
+    port: 22,
+    provisioning_job_id: jobId,
+  });
+
+  await createSSHCredentials(orgId, {
+    server_ip: server2IP,
+    hostname: `mail2.${nsDomain}`,
+    username: "root",
+    password_encrypted: passwordEncrypted,
+    port: 22,
+    provisioning_job_id: jobId,
+  });
+}
 
 export const dynamic = "force-dynamic";
 // Vercel Hobby plan supports up to 60s per serverless function. Step 1
@@ -87,7 +134,13 @@ async function getInternalOrgId(): Promise<string | null> {
 // ============================================
 async function executeDryRunStep(
   stepType: StepType,
-  context: { nsDomain: string; sendingDomains: string[]; mailAccountsPerDomain: number }
+  context: {
+    jobId: string;
+    orgId: string;
+    nsDomain: string;
+    sendingDomains: string[];
+    mailAccountsPerDomain: number;
+  }
 ): Promise<{ output: string; metadata?: Record<string, unknown> }> {
   const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -96,9 +149,28 @@ async function executeDryRunStep(
       await delay(2000);
       const ip1 = `10.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
       const ip2 = `10.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
+
+      // Hard Lesson #58 — even in dry-run, exercise the credential
+      // persistence path so the wizard's Step 1 regression-tests SSH
+      // credential write end-to-end without spending real VPS dollars.
+      const rootPassword = crypto.randomBytes(16).toString("base64url");
+      await persistPairCredentials({
+        orgId: context.orgId,
+        jobId: context.jobId,
+        nsDomain: context.nsDomain,
+        server1IP: ip1,
+        server2IP: ip2,
+        rootPassword,
+      });
+
       return {
-        output: `[DryRun] VPS pair created: ${ip1} + ${ip2}`,
-        metadata: { server1IP: ip1, server2IP: ip2, server1ProviderId: `dry-${Date.now()}-s1`, server2ProviderId: `dry-${Date.now()}-s2` },
+        output: `[DryRun] VPS pair created: ${ip1} + ${ip2} (credentials persisted)`,
+        metadata: {
+          server1IP: ip1,
+          server2IP: ip2,
+          server1ProviderId: `dry-${Date.now()}-s1`,
+          server2ProviderId: `dry-${Date.now()}-s2`,
+        },
       };
     }
     case "set_ptr": {
@@ -168,10 +240,20 @@ async function executeServerlessStep(
 
   switch (stepType) {
     case "create_vps": {
+      // Hard Lesson #58 (2026-04-10): Generate a single root password up
+      // front, pass it to the provider so both servers get the SAME
+      // credential, and persist it via createSSHCredentials the moment both
+      // servers report active. Previously this path never set
+      // vpsConfig.rootPassword — Linode then generated its own internal
+      // password that was never returned in createServer's response, so the
+      // saga could complete with passwords lost to Linode's internal state.
+      const rootPassword = crypto.randomBytes(16).toString("base64url");
+
       const vpsConfig: Record<string, unknown> = {
         ...vpsRow.config,
         apiKey: vpsRow.api_key_encrypted ? decrypt(vpsRow.api_key_encrypted) : undefined,
         apiSecret: vpsRow.api_secret_encrypted ? decrypt(vpsRow.api_secret_encrypted) : undefined,
+        rootPassword, // <-- consumed by LinodeProvider.createServer as root_pass
       };
       const provider = await getVPSProvider(vpsRow.provider_type as VPSProviderType, vpsConfig);
 
@@ -234,8 +316,28 @@ async function executeServerlessStep(
         })
         .eq("id", job.id);
 
+      // Hard Lesson #58: persist SSH credentials BEFORE returning success.
+      // If encrypt() throws (ENCRYPTION_KEY missing/malformed) or Supabase
+      // insert fails, the exception bubbles up and the saga step is marked
+      // failed — a pair is NOT complete if we cannot SSH back into it.
+      // Do this AFTER the job row has the IPs so a debugger can cross-
+      // reference, but BEFORE the subsequent SSH steps depend on the
+      // credential existing. DO NOT silently swallow errors here.
+      await persistPairCredentials({
+        orgId: job.org_id,
+        jobId: job.id,
+        nsDomain: job.ns_domain,
+        server1IP: server1.ip,
+        server2IP: server2.ip,
+        rootPassword,
+      });
+
+      // NOTE: rootPassword is intentionally NOT returned in the step
+      // metadata JSONB — provisioning_steps.metadata is read by the
+      // dashboard UI and would leak the secret. The encrypted copy lives
+      // in ssh_credentials.password_encrypted only.
       return {
-        output: `VPS pair created: ${server1.ip} (${region}) + ${server2.ip} (${secondaryRegion}) (${vpsRow.provider_type})`,
+        output: `VPS pair created: ${server1.ip} (${region}) + ${server2.ip} (${secondaryRegion}) (${vpsRow.provider_type}). SSH credentials persisted.`,
         metadata: {
           server1IP: server1.ip,
           server2IP: server2.ip,
@@ -243,6 +345,7 @@ async function executeServerlessStep(
           server2ProviderId: server2.id,
           server1Region: region,
           server2Region: secondaryRegion,
+          credentialsPersisted: true,
         },
       };
     }
@@ -555,6 +658,8 @@ export async function POST(
       if (isDryRun) {
         // DryRun path — simulate all steps inline
         result = await executeDryRunStep(stepType, {
+          jobId,
+          orgId,
           nsDomain: job.ns_domain,
           sendingDomains: job.sending_domains || [],
           mailAccountsPerDomain: job.mail_accounts_per_domain || 3,
@@ -629,21 +734,45 @@ export async function POST(
         const server1IP = (createVpsStep?.metadata as Record<string, unknown>)?.server1IP as string || "10.0.0.1";
         const server2IP = (createVpsStep?.metadata as Record<string, unknown>)?.server2IP as string || "10.0.0.2";
 
-        // Create server_pair record
-        const { data: serverPair } = await supabase
+        // Hard Lesson #50 (2026-04-10): this insert was using the LEGACY
+        // server1_ip/server2_ip/server1_hostname/server2_hostname column
+        // names that don't exist on the server_pairs table (actual schema
+        // uses s1_ip, s2_ip, s1_hostname, s2_hostname). The legacy monolithic
+        // handler got patched but THIS per-step path was missed, so every
+        // completed wizard job silently left server_pair_id=NULL on
+        // provisioning_jobs. Also: pair_number is NOT NULL on the table and
+        // must be computed per-org (UNIQUE (org_id, pair_number)). Never
+        // swallow the insert error — throw to fail the saga.
+        const { data: maxPairRow } = await supabase
+          .from("server_pairs")
+          .select("pair_number")
+          .eq("org_id", orgId)
+          .order("pair_number", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        const nextPairNumber = ((maxPairRow?.pair_number as number) || 0) + 1;
+
+        const { data: serverPair, error: serverPairError } = await supabase
           .from("server_pairs")
           .insert({
             org_id: orgId,
+            pair_number: nextPairNumber,
             ns_domain: job.ns_domain,
-            server1_ip: server1IP,
-            server2_ip: server2IP,
-            server1_hostname: `mail1.${job.ns_domain}`,
-            server2_hostname: `mail2.${job.ns_domain}`,
-            status: "active",
-            health_status: "healthy",
+            s1_ip: server1IP,
+            s1_hostname: `mail1.${job.ns_domain}`,
+            s2_ip: server2IP,
+            s2_hostname: `mail2.${job.ns_domain}`,
+            status: "complete",
           })
           .select()
           .single();
+
+        if (serverPairError || !serverPair) {
+          throw new Error(
+            `Failed to insert server_pairs row: ${serverPairError?.message || "unknown"}`
+          );
+        }
 
         // Mark job as completed
         await supabase
@@ -652,11 +781,19 @@ export async function POST(
             status: "completed",
             progress_pct: 100,
             completed_at: new Date().toISOString(),
-            server_pair_id: serverPair?.id || null,
+            server_pair_id: serverPair.id,
             server1_ip: server1IP,
             server2_ip: server2IP,
           })
           .eq("id", jobId);
+
+        // NOTE: ssh_credentials rows were already inserted in Step 1
+        // (create_vps) and linked to the job via provisioning_job_id. The
+        // job row now has server_pair_id, so any reader can hop:
+        //   ssh_credentials.provisioning_job_id → provisioning_jobs.id
+        //   → provisioning_jobs.server_pair_id → server_pairs.id
+        // Migration 010 deliberately did not add server_pair_id to
+        // ssh_credentials — leave it that way to keep the schema tight.
 
         return NextResponse.json({
           jobId,
