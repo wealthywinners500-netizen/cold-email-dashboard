@@ -1,7 +1,15 @@
 // ============================================
-// Worker handler for individual provisioning steps (4-7)
-// Receives a single step, executes it via SSH, then
-// POSTs results back to the Vercel API worker-callback endpoint.
+// Worker handler for individual provisioning steps.
+// Receives a single step, executes it (via SSH for Hestia steps, or
+// directly via provider API for create_vps), then POSTs results back
+// to the Vercel API worker-callback endpoint.
+//
+// Hard Lesson #59 (Test #14, 2026-04-10): `create_vps` moved here from
+// the Vercel execute-step route because Linode boot polling routinely
+// exceeds Vercel Hobby's 60s maxDuration, stranding Step 1 `in_progress`
+// with orphan VPS + lost credentials. The worker VPS has no time cap,
+// so the full createServer × 2 + poll + persistPairCredentials chain
+// can run in one shot.
 // ============================================
 
 import { createAdminClient } from '@/lib/supabase/server';
@@ -9,7 +17,8 @@ import { SSHManager } from '@/lib/provisioning/ssh-manager';
 import { createPairProvisioningSaga } from '@/lib/provisioning/pair-provisioning-saga';
 import { getVPSProvider, getDNSRegistrar } from '@/lib/provisioning/provider-registry';
 import { decrypt } from '@/lib/provisioning/encryption';
-import { createHmac } from 'crypto';
+import { persistPairCredentials } from '@/lib/provisioning/persist-credentials';
+import { createHmac, randomBytes } from 'crypto';
 import type {
   ProvisioningContext,
   ProvisioningJobRow,
@@ -25,13 +34,56 @@ interface ProvisionStepPayload {
   stepId: string;
 }
 
-// SSH steps that this handler processes
+// All step types this handler processes. create_vps is handled by
+// `handleCreateVpsStep` (provider-API path, no SSH). The rest are
+// Hestia/SSH steps handled by the saga path.
 const WORKER_STEP_TYPES: StepType[] = [
+  'create_vps',
   'install_hestiacp',
   'setup_dns_zones',
   'setup_mail_domains',
   'security_hardening',
 ];
+
+// Wizard size label → provider plan ID. Mirrors the same table that
+// used to live in execute-step/route.ts (now deleted — create_vps is a
+// worker step, so the map moved with it).
+const PLAN_TYPE_MAP: Record<string, Record<string, string>> = {
+  linode: {
+    small: 'g6-nanode-1',
+    medium: 'g6-standard-1',
+    large: 'g6-standard-2',
+  },
+  digitalocean: {
+    small: 's-1vcpu-2gb',
+    medium: 's-2vcpu-4gb',
+    large: 's-4vcpu-8gb',
+  },
+  hetzner: {
+    small: 'cx22',
+    medium: 'cx32',
+    large: 'cx42',
+  },
+  vultr: {
+    small: 'vc2-1c-2gb',
+    medium: 'vc2-2c-4gb',
+    large: 'vc2-4c-8gb',
+  },
+  clouding: {
+    small: '0.5C-1G',
+    medium: '1C-2G',
+    large: '2C-4G',
+  },
+};
+
+function resolveProviderPlan(providerType: string, sizeLabel: string): string {
+  const providerPlans = PLAN_TYPE_MAP[providerType];
+  if (providerPlans && providerPlans[sizeLabel]) {
+    return providerPlans[sizeLabel];
+  }
+  // Already a provider-specific plan ID — pass through.
+  return sizeLabel;
+}
 
 /**
  * Sign a callback request with HMAC-SHA256.
@@ -93,6 +145,202 @@ async function postCallback(
 }
 
 /**
+ * Handle `create_vps` specifically — the provider-API path that does
+ * NOT use the saga and NOT use SSH. Generates a shared root password,
+ * creates both Linodes (us-east + secondary), polls until active,
+ * writes IPs back to provisioning_jobs, and persists the encrypted
+ * credentials via the shared persist-credentials module before
+ * calling back to Vercel.
+ *
+ * Hard Lesson #58: credential persistence MUST succeed before the step
+ * is reported completed. If encrypt() or the Supabase insert throws,
+ * we throw — the pair is not "created" if we cannot SSH back into it.
+ *
+ * Hard Lesson #59: this used to live on the Vercel side but boot
+ * polling blew past the 60s serverless cap. The worker VPS has no
+ * such cap, so the whole chain runs in one handler call.
+ */
+async function handleCreateVpsStep(
+  jobId: string,
+  stepType: StepType,
+  startTime: number
+): Promise<void> {
+  const supabase = await createAdminClient();
+
+  // 1. Load job
+  const { data: job, error: jobError } = await supabase
+    .from('provisioning_jobs')
+    .select('*')
+    .eq('id', jobId)
+    .single();
+
+  if (jobError || !job) {
+    await postCallback(jobId, stepType, {
+      status: 'failed',
+      error_message: `Job ${jobId} not found: ${jobError?.message}`,
+    });
+    return;
+  }
+
+  const provJob = job as ProvisioningJobRow;
+
+  // 2. Load VPS provider config
+  const { data: vpsRow } = await supabase
+    .from('vps_providers')
+    .select('*')
+    .eq('id', provJob.vps_provider_id)
+    .single();
+
+  if (!vpsRow) {
+    await postCallback(jobId, stepType, {
+      status: 'failed',
+      error_message: 'VPS provider config not found',
+    });
+    return;
+  }
+
+  try {
+    // 3. Generate shared root password and pass it to the provider
+    // so both servers accept the SAME credential. This password is
+    // ONLY ever stored encrypted — never returned via step metadata
+    // (the dashboard UI reads that) and never logged.
+    const rootPassword = randomBytes(16).toString('base64url');
+
+    const vpsConfig: Record<string, unknown> = {
+      ...vpsRow.config,
+      apiKey: vpsRow.api_key_encrypted
+        ? decrypt(vpsRow.api_key_encrypted)
+        : undefined,
+      apiSecret: vpsRow.api_secret_encrypted
+        ? decrypt(vpsRow.api_secret_encrypted)
+        : undefined,
+      rootPassword, // consumed by LinodeProvider.createServer as root_pass
+    };
+    const provider = await getVPSProvider(
+      vpsRow.provider_type as VPSProviderType,
+      vpsConfig
+    );
+
+    const jobConfig = (provJob.config || {}) as Record<string, string>;
+    const region = jobConfig.region || 'us-east';
+    const secondaryRegion = jobConfig.secondaryRegion || region;
+    const sizeLabel = jobConfig.size || 'small';
+    const providerPlan = resolveProviderPlan(vpsRow.provider_type, sizeLabel);
+
+    console.log(
+      `[ProvisionStep][create_vps] job=${jobId} region=${region} secondary=${secondaryRegion} size=${sizeLabel} plan=${providerPlan}`
+    );
+
+    // 4. Create both servers
+    const server1 = await provider.createServer({
+      name: `mail1-${provJob.ns_domain.replace(/\./g, '-')}`,
+      region,
+      size: providerPlan,
+    });
+    console.log(`[ProvisionStep][create_vps] server1 created: ${server1.id}`);
+
+    const server2 = await provider.createServer({
+      name: `mail2-${provJob.ns_domain.replace(/\./g, '-')}`,
+      region: secondaryRegion,
+      size: providerPlan,
+    });
+    console.log(`[ProvisionStep][create_vps] server2 created: ${server2.id}`);
+
+    // 5. Poll until both are active (10 min max — worker has no 60s cap)
+    const POLL_TIMEOUT = 10 * 60 * 1000;
+    const pollStart = Date.now();
+    let s1Active = server1.status === 'active';
+    let s2Active = server2.status === 'active';
+
+    while (
+      (!s1Active || !s2Active) &&
+      Date.now() - pollStart < POLL_TIMEOUT
+    ) {
+      await new Promise((r) => setTimeout(r, 15000));
+      if (!s1Active) {
+        const info = await provider.getServer(server1.id);
+        s1Active = info.status === 'active' || info.status === 'running';
+        if (s1Active && !server1.ip) Object.assign(server1, { ip: info.ip });
+      }
+      if (!s2Active) {
+        const info = await provider.getServer(server2.id);
+        s2Active = info.status === 'active' || info.status === 'running';
+        if (s2Active && !server2.ip) Object.assign(server2, { ip: info.ip });
+      }
+    }
+
+    if (!s1Active || !s2Active) {
+      throw new Error(
+        `Timed out waiting for VPS servers to become active (s1Active=${s1Active}, s2Active=${s2Active})`
+      );
+    }
+
+    console.log(
+      `[ProvisionStep][create_vps] both active: ${server1.ip} + ${server2.ip}`
+    );
+
+    // 6. Write IPs back to the job row so downstream steps can read
+    // them. Do this BEFORE persistPairCredentials — if persistence
+    // fails, a debugger can still cross-reference the IPs.
+    await supabase
+      .from('provisioning_jobs')
+      .update({
+        server1_ip: server1.ip,
+        server2_ip: server2.ip,
+        server1_provider_id: server1.id,
+        server2_provider_id: server2.id,
+      })
+      .eq('id', provJob.id);
+
+    // 7. Persist credentials (Hard Lesson #58). Throws on failure, and
+    // the outer catch marks the step failed — the pair is NOT complete
+    // if we can't SSH back into it.
+    await persistPairCredentials({
+      orgId: provJob.org_id,
+      jobId: provJob.id,
+      nsDomain: provJob.ns_domain,
+      server1IP: server1.ip,
+      server2IP: server2.ip,
+      rootPassword,
+    });
+
+    console.log(
+      `[ProvisionStep][create_vps] credentials persisted for job ${jobId}`
+    );
+
+    const durationMs = Date.now() - startTime;
+
+    // 8. Callback success. rootPassword is NOT in metadata — the
+    // dashboard UI reads step metadata JSONB and would leak it.
+    await postCallback(jobId, stepType, {
+      status: 'completed',
+      output: `VPS pair created: ${server1.ip} (${region}) + ${server2.ip} (${secondaryRegion}) (${vpsRow.provider_type}). SSH credentials persisted.`,
+      duration_ms: durationMs,
+      metadata: {
+        server1IP: server1.ip,
+        server2IP: server2.ip,
+        server1ProviderId: server1.id,
+        server2ProviderId: server2.id,
+        server1Region: region,
+        server2Region: secondaryRegion,
+        credentialsPersisted: true,
+      },
+    });
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    const durationMs = Date.now() - startTime;
+    console.error(
+      `[ProvisionStep][create_vps] FAILED for job ${jobId}: ${errorMsg}`
+    );
+    await postCallback(jobId, stepType, {
+      status: 'failed',
+      error_message: errorMsg,
+      duration_ms: durationMs,
+    });
+  }
+}
+
+/**
  * Execute a single provisioning step that requires SSH.
  * Called by pg-boss when the Vercel API dispatches a step to the worker.
  */
@@ -112,6 +360,13 @@ export async function handleProvisionStep(
 
   console.log(`[ProvisionStep] Starting ${stepType} for job ${jobId}`);
   const startTime = Date.now();
+
+  // Route create_vps to the dedicated provider-API handler — it does
+  // not use the saga or SSH managers (Hard Lesson #59).
+  if (stepType === 'create_vps') {
+    await handleCreateVpsStep(jobId, stepType, startTime);
+    return;
+  }
 
   const supabase = await createAdminClient();
 
