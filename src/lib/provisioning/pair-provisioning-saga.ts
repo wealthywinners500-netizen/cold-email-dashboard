@@ -28,6 +28,7 @@ import {
   replicateZone,
   hardenSecurity,
   issueSSLCert,
+  replicateSSLCertToSecondary,
   setHostname,
   HESTIA_PATH_PREFIX,
 } from './hestia-scripts';
@@ -899,17 +900,38 @@ export function createPairProvisioningSaga(
             context.log(`[Step 7] Server 2 hostname SSL failed (DNS may not have propagated). Mail works with self-signed cert.`);
           }
 
-          // Issue SSL for all sending domains on both servers
+          // Issue SSL for all sending domains.
+          //
+          // Hard Lesson #65 (Test #15, 2026-04-11): in a HestiaCP DNS
+          // cluster the sending domain's A record points to BOTH server
+          // IPs. If S1 and S2 each call v-add-letsencrypt-domain
+          // independently they generate different ACME account keys and
+          // different challenge files. LE's validator round-robins
+          // between the two A targets and one of the requests will
+          // always fail with "key authorization file did not match".
+          // Result on Test #15: S1 issued cleanly, S2 returned 400 for
+          // both krogerconsumermedia.info and krogergrowthpartners.info.
+          //
+          // Fix: issue ONCE on S1, then replicate the cert files
+          // (.crt/.key/.ca/.pem) from S1 → S2 via SSH base64 transfer
+          // and v-rebuild-{web,mail}-domain on S2 to pick them up. S2
+          // never talks to Let's Encrypt for sending domains.
           for (const domain of context.sendingDomains) {
+            let s1IssueOk = false;
             try {
               await issueSSLCert(ssh1, { domain, isHostname: false });
+              s1IssueOk = true;
+              context.log(`[Step 7] LE cert issued on S1 for ${domain}`);
             } catch (err) {
               sslErrors.push(`S1 ${domain}: ${err}`);
+              context.log(`[Step 7] S1 LE failed for ${domain} — skipping S2 replication`);
             }
+            if (!s1IssueOk) continue;
             try {
-              await issueSSLCert(ssh2, { domain, isHostname: false });
+              await replicateSSLCertToSecondary(ssh1, ssh2, domain);
+              context.log(`[Step 7] Replicated ${domain} cert from S1 → S2`);
             } catch (err) {
-              sslErrors.push(`S2 ${domain}: ${err}`);
+              sslErrors.push(`S2 ${domain} (replication): ${err}`);
             }
           }
 

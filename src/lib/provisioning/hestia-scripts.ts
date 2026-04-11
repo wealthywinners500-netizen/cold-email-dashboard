@@ -408,22 +408,93 @@ export async function createMailDomain(
     if (lastErr) throw lastErr;
   }
 
-  // Add SPF TXT record
-  await ssh.exec(
-    `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ TXT '"v=spf1 +a +mx -all"'`,
-    { timeout: 10000 }
-  ).catch(() => {
-    // May already exist from zone creation
-  });
-
-  // Add DMARC TXT record
+  // Hard Lesson #67 (Test #15, 2026-04-11): Hestia auto-generated
+  // SPF/DMARC duplication.
+  //
+  // The ORDER OF OPERATIONS in this saga is:
+  //   Step 5: setup_dns_zones → v-add-dns-domain admin <domain>
+  //   Step 6: setup_mail_domains → v-add-mail-domain admin <domain>
+  //
+  // BOTH of these commands implicitly create SPF (v=spf1...) and DMARC
+  // (v=DMARC1...) TXT records on the zone. v-add-dns-domain uses a
+  // generic template; v-add-mail-domain layers a mail-aware template
+  // on top WITHOUT removing the first one. Result: every sending
+  // domain ends up with TWO SPF records and TWO DMARC records, which
+  // MXToolbox flags as "Multiple SPF Records" and DMARC as malformed.
+  //
+  // Fix: list TXT records on the @ name and on _dmarc, and delete any
+  // duplicates (keep one). v-list-dns-records admin <domain> json
+  // gives us record IDs; v-delete-dns-record admin <domain> <id>
+  // removes them.
   const dmarcEmail = adminEmail || `postmaster@${domain}`;
-  await ssh.exec(
-    `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100; rua=mailto:${dmarcEmail}"'`,
-    { timeout: 10000 }
-  ).catch(() => {
-    // May already exist
-  });
+
+  try {
+    const { stdout } = await ssh.exec(
+      `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} json 2>/dev/null || echo '{}'`,
+      { timeout: 10000 }
+    );
+    interface DnsRec {
+      RECORD: string;
+      TYPE: string;
+      VALUE: string;
+    }
+    let recs: Record<string, DnsRec> = {};
+    try {
+      recs = JSON.parse(stdout) as Record<string, DnsRec>;
+    } catch {
+      recs = {};
+    }
+    const spfIds: string[] = [];
+    const dmarcIds: string[] = [];
+    for (const [id, rec] of Object.entries(recs)) {
+      if (rec.TYPE === "TXT" && rec.RECORD === "@" && /v=spf1/i.test(rec.VALUE)) {
+        spfIds.push(id);
+      }
+      if (
+        rec.TYPE === "TXT" &&
+        rec.RECORD === "_dmarc" &&
+        /v=DMARC1/i.test(rec.VALUE)
+      ) {
+        dmarcIds.push(id);
+      }
+    }
+    // Delete EVERY existing SPF then add ONE canonical SPF.
+    for (const id of spfIds) {
+      await ssh
+        .exec(
+          `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${id}`,
+          { timeout: 10000 }
+        )
+        .catch(() => { /* ignore */ });
+    }
+    // Same for DMARC.
+    for (const id of dmarcIds) {
+      await ssh
+        .exec(
+          `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${id}`,
+          { timeout: 10000 }
+        )
+        .catch(() => { /* ignore */ });
+    }
+  } catch {
+    // Listing failed — fall through to add path which is idempotent.
+  }
+
+  // Add canonical SPF TXT record (single source of truth).
+  await ssh
+    .exec(
+      `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ TXT '"v=spf1 +a +mx -all"'`,
+      { timeout: 10000 }
+    )
+    .catch(() => { /* tolerate idempotent re-add */ });
+
+  // Add canonical DMARC TXT record.
+  await ssh
+    .exec(
+      `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100; rua=mailto:${dmarcEmail}"'`,
+      { timeout: 10000 }
+    )
+    .catch(() => { /* tolerate */ });
 
   // Create mail accounts
   await ensureMailAccounts(ssh, domain, accounts, escapedPassword);
@@ -753,6 +824,120 @@ export async function issueSSLCert(
   }
 
   return { success: true, cn };
+}
+
+/**
+ * Hard Lesson #65 (Test #15, 2026-04-11): cluster cert race.
+ *
+ * When both servers in a HestiaCP DNS cluster try to issue a Let's
+ * Encrypt cert for the same sending domain via HTTP-01, they each
+ * generate a DIFFERENT ACME account key and write a DIFFERENT challenge
+ * file. The sending domain's A record points to BOTH server IPs, so
+ * Let's Encrypt's validator round-robins. Whichever request lands on
+ * the "wrong" server returns 403 with:
+ *
+ *   "The key authorization file from the server did not match this
+ *    challenge. Expected ... (got ...)"
+ *
+ * The cleanest fix is to issue ONCE on the primary (S1), then
+ * replicate the cert files from S1 → S2 over SSH and rebuild S2's
+ * mail/web domain so it picks them up. S2 doesn't need to talk to
+ * Let's Encrypt at all for sending domains.
+ *
+ * This function is called from the security_hardening saga step
+ * AFTER `issueSSLCert(ssh1, { domain, isHostname: false })` succeeds.
+ *
+ * It expects the cert to live at the canonical Hestia paths on S1:
+ *   /home/admin/conf/web/{domain}/ssl/{domain}.{crt,key,ca,pem}
+ * and writes them to the same paths on S2 (creating the dir tree if
+ * v-add-web-domain hasn't created it yet on S2 — which we trigger
+ * defensively before the copy).
+ */
+export async function replicateSSLCertToSecondary(
+  ssh1: SSHManager,
+  ssh2: SSHManager,
+  domain: string
+): Promise<void> {
+  // 1. Make sure the web domain exists on S2 so Hestia knows where to
+  //    drop the cert files. Exit code 4 = already exists, ignore.
+  try {
+    await ssh2.exec(
+      `bash -lc "${HESTIA_FULL_PATH} && v-add-web-domain admin ${domain}"`,
+      { timeout: 60000 }
+    );
+  } catch (err: unknown) {
+    const exitCode = (err as { code?: number })?.code;
+    if (exitCode !== 4) {
+      throw new Error(
+        `replicateSSLCertToSecondary: v-add-web-domain failed on S2 for ${domain}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  // 2. Read each cert file from S1 as base64. base64 dodges all the
+  //    quoting / newline / heredoc grief that bites real-world cert
+  //    transfer scripts.
+  const certDir = `/home/admin/conf/web/${domain}/ssl`;
+  const files = [`${domain}.crt`, `${domain}.key`, `${domain}.ca`, `${domain}.pem`];
+
+  // Make sure the dest directory exists on S2 (v-add-web-domain
+  // usually creates it, but be paranoid).
+  await ssh2.exec(`mkdir -p ${certDir} && chown admin:admin ${certDir}`, {
+    timeout: 10000,
+  });
+
+  for (const file of files) {
+    const srcPath = `${certDir}/${file}`;
+    let b64Content: string;
+    try {
+      const { stdout } = await ssh1.exec(
+        `if [ -f ${srcPath} ]; then base64 -w0 ${srcPath}; else echo MISSING; fi`,
+        { timeout: 15000 }
+      );
+      b64Content = stdout.trim();
+    } catch (err) {
+      throw new Error(
+        `replicateSSLCertToSecondary: failed reading ${srcPath} on S1: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    if (b64Content === "MISSING" || !b64Content) {
+      // .ca / .pem may not exist if Hestia version doesn't generate
+      // them — skip those, but .crt / .key are mandatory.
+      if (file.endsWith(".crt") || file.endsWith(".key")) {
+        throw new Error(
+          `replicateSSLCertToSecondary: required cert file ${srcPath} missing on S1 — issueSSLCert must have failed silently`
+        );
+      }
+      continue;
+    }
+    // Write to S2 via tee, then chown to admin so Hestia can read it.
+    try {
+      await ssh2.exec(
+        `echo '${b64Content}' | base64 -d > ${certDir}/${file} && chown admin:admin ${certDir}/${file} && chmod 600 ${certDir}/${file}`,
+        { timeout: 15000 }
+      );
+    } catch (err) {
+      throw new Error(
+        `replicateSSLCertToSecondary: failed writing ${certDir}/${file} on S2: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  // 3. Rebuild the web + mail domain on S2 so it picks up the new
+  //    cert files. v-rebuild-web-domain regenerates nginx/apache
+  //    confs; v-rebuild-mail-domain regenerates exim's TLS config.
+  await ssh2
+    .exec(
+      `bash -lc "${HESTIA_FULL_PATH} && v-rebuild-web-domain admin ${domain}"`,
+      { timeout: 60000 }
+    )
+    .catch(() => { /* tolerate if web wasn't web-enabled */ });
+  await ssh2
+    .exec(
+      `bash -lc "${HESTIA_FULL_PATH} && v-rebuild-mail-domain admin ${domain}"`,
+      { timeout: 60000 }
+    )
+    .catch(() => { /* tolerate */ });
 }
 
 // ============================================

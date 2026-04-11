@@ -40,6 +40,10 @@ import { DNSVerifier } from "@/lib/provisioning/verification";
 import { checkPort25 } from "@/lib/provisioning/checks/port25";
 import { checkSSLCert } from "@/lib/provisioning/checks/ssl-cn";
 import { promises as dnsPromises } from "dns";
+import { exec as execCb } from "child_process";
+import { promisify } from "util";
+
+const execAsync = promisify(execCb);
 
 export interface StepRunResult {
   output: string;
@@ -302,15 +306,111 @@ const PROPAGATION_RESOLVERS = ["8.8.8.8", "1.1.1.1", "9.9.9.9"];
 const PROPAGATION_MAX_MS = 75 * 60 * 1000; // 75 minutes
 const PROPAGATION_POLL_INTERVAL_MS = 60 * 1000; // 60 seconds
 
-async function resolveNS(
-  domain: string,
-  resolverIP: string
+/**
+ * Hard Lesson #64 (Test #15, 2026-04-11): the previous implementation
+ * polled recursive resolvers (8.8.8.8/1.1.1.1/9.9.9.9) for the
+ * `ns_domain`'s NS records. This created a chicken-and-egg deadlock
+ * because:
+ *   1. The recursive resolver follows the .info parent's delegation,
+ *      which (after configure_registrar) points to ns1.<ns_domain> /
+ *      ns2.<ns_domain> living on the brand-new VPS pair.
+ *   2. setup_dns_zones (the next step) hasn't run yet, so BIND on the
+ *      new pair has NO zones loaded — every query gets REFUSED.
+ *   3. The recursive resolver then returns SERVFAIL, never sees the
+ *      delegation, and `await_dns_propagation` waits the full 75 min
+ *      and throws.
+ *
+ * Fix: query the TLD parent's authoritative nameservers DIRECTLY for
+ * the child delegation. Parent NS responses contain the NS records
+ * (and glue) in the AUTHORITY/ADDITIONAL sections without ever touching
+ * the child BIND. This proves "the registrar update has propagated to
+ * the parent zone", which is the actual condition we care about — once
+ * the parent has the new delegation, every recursive resolver in the
+ * world will start following it as soon as we put zones on BIND.
+ *
+ * Implementation uses `dig` (already on the worker VPS) for two reasons:
+ *   - Node's dnsPromises.Resolver always recurses; it can't be told to
+ *     stop after a referral.
+ *   - dig +norecurse against a TLD NS gives us exactly the referral
+ *     we want, parseable from the AUTHORITY section.
+ */
+const TLD_PARENT_NS: Record<string, string[]> = {
+  // .info — Afilias (Identity Digital). 6 IPv4 NS, picked deterministically
+  // for cache-friendliness.
+  info: [
+    "199.254.31.1", // a0.info.afilias-nst.info
+    "199.254.48.1", // a2.info.afilias-nst.info
+    "199.249.112.1", // b0.info.afilias-nst.org
+    "199.249.119.1", // b2.info.afilias-nst.org
+    "199.253.59.1", // c0.info.afilias-nst.info
+    "199.254.63.1", // d0.info.afilias-nst.org
+  ],
+  // .com / .net — Verisign. Stable for 25 years.
+  com: [
+    "192.5.6.30", // a.gtld-servers.net
+    "192.33.14.30", // b.gtld-servers.net
+    "192.26.92.30", // c.gtld-servers.net
+    "192.31.80.30", // d.gtld-servers.net
+    "192.12.94.30", // e.gtld-servers.net
+  ],
+  net: [
+    "192.5.6.30",
+    "192.33.14.30",
+    "192.26.92.30",
+    "192.31.80.30",
+    "192.12.94.30",
+  ],
+  // .io — IO TLD (Identity Digital).
+  io: [
+    "194.0.1.1", // a0.nic.io
+    "194.0.2.1", // a2.nic.io
+    "199.249.119.1",
+  ],
+  // .co — .CO Internet (GoDaddy Registry).
+  co: [
+    "156.154.124.65", // a0.cctld.afilias-nst.info
+    "156.154.125.65",
+    "156.154.127.65",
+  ],
+};
+
+function getTldParentNs(domain: string): string[] | null {
+  const tld = domain.split(".").pop()?.toLowerCase();
+  if (!tld) return null;
+  return TLD_PARENT_NS[tld] || null;
+}
+
+/**
+ * Query a TLD parent NS for the child delegation. Returns the list of
+ * NS hostnames the parent says are authoritative for `domain`, or null
+ * on error.
+ *
+ * dig output we parse (AUTHORITY section):
+ *   krogerengage.info.   86400 IN NS ns1.krogerengage.info.
+ *   krogerengage.info.   86400 IN NS ns2.krogerengage.info.
+ */
+async function queryParentForChildNs(
+  parentNsIp: string,
+  childDomain: string
 ): Promise<string[] | null> {
   try {
-    const resolver = new dnsPromises.Resolver();
-    resolver.setServers([resolverIP]);
-    const records = await resolver.resolveNs(domain);
-    return records.map((r) => r.toLowerCase());
+    // +norecurse → don't ask the parent to recurse, just give us the referral.
+    // +noall +authority → only print the AUTHORITY section.
+    // +time=5 +tries=2 → fast fail on dead NS.
+    const cmd = `dig @${parentNsIp} ${childDomain} NS +norecurse +noall +authority +time=5 +tries=2`;
+    const { stdout } = await execAsync(cmd, { timeout: 15000 });
+    const lines = stdout.split("\n");
+    const nsRecords: string[] = [];
+    for (const line of lines) {
+      // Match `<domain>. <ttl> IN NS <nshost>.`
+      const m = line.match(
+        /^\s*\S+\.\s+\d+\s+IN\s+NS\s+(\S+?)\.?\s*$/i
+      );
+      if (m) {
+        nsRecords.push(m[1].toLowerCase());
+      }
+    }
+    return nsRecords;
   } catch {
     return null;
   }
@@ -324,42 +424,55 @@ export async function runAwaitDnsPropagation(
 
   const expectedNs1 = `ns1.${job.ns_domain}`.toLowerCase();
   const expectedNs2 = `ns2.${job.ns_domain}`.toLowerCase();
+
+  // Pick the TLD parent NS list. If the TLD isn't in our table, fall
+  // back to the (deadlocked) recursive-resolver path with a 5-min cap
+  // — better to surface than to silently spin for 75 min.
+  const parentNsList = getTldParentNs(job.ns_domain);
+  if (!parentNsList) {
+    throw new Error(
+      `await_dns_propagation: no TLD parent NS table entry for ${job.ns_domain} (TLD=${job.ns_domain.split(".").pop()}). Add to TLD_PARENT_NS in serverless-steps.ts.`
+    );
+  }
+
   const start = Date.now();
   const pollHistory: Array<{
     elapsedSec: number;
-    resolverHits: Record<string, string[]>;
+    parentNsHits: Record<string, string[]>;
     converged: boolean;
   }> = [];
 
-  let lastConverged = false;
   while (Date.now() - start < PROPAGATION_MAX_MS) {
-    const resolverHits: Record<string, string[]> = {};
+    const parentNsHits: Record<string, string[]> = {};
     let convergedCount = 0;
 
-    for (const resolver of PROPAGATION_RESOLVERS) {
-      const ns = await resolveNS(job.ns_domain, resolver);
-      resolverHits[resolver] = ns || [];
+    for (const parentNsIp of parentNsList) {
+      const ns = await queryParentForChildNs(parentNsIp, job.ns_domain);
+      parentNsHits[parentNsIp] = ns || [];
       if (
         ns &&
-        ns.some((n) => n === expectedNs1 || n === expectedNs1 + ".") &&
-        ns.some((n) => n === expectedNs2 || n === expectedNs2 + ".")
+        ns.some((n) => n === expectedNs1) &&
+        ns.some((n) => n === expectedNs2)
       ) {
         convergedCount += 1;
       }
     }
 
     const elapsedSec = Math.round((Date.now() - start) / 1000);
-    const converged = convergedCount >= 2; // 2 of 3 resolvers
-    pollHistory.push({ elapsedSec, resolverHits, converged });
-    lastConverged = converged;
+    // Need majority (≥ ceil(N/2)+1 of N) of TLD NS to confirm — guards
+    // against a single stale NS in the cluster.
+    const required = Math.floor(parentNsList.length / 2) + 1;
+    const converged = convergedCount >= required;
+    pollHistory.push({ elapsedSec, parentNsHits, converged });
 
     if (converged) {
       return {
-        output: `DNS NS delegation converged after ${elapsedSec}s. ${convergedCount}/${PROPAGATION_RESOLVERS.length} resolvers see ns1+ns2.${job.ns_domain}.`,
+        output: `DNS NS delegation converged after ${elapsedSec}s at the .${job.ns_domain.split(".").pop()} parent zone. ${convergedCount}/${parentNsList.length} parent NS see ns1+ns2.${job.ns_domain}.`,
         metadata: {
           converged_at: new Date().toISOString(),
           elapsed_sec: elapsedSec,
-          resolverHits,
+          parentNsHits,
+          method: "tld_parent_referral",
         },
       };
     }
@@ -367,15 +480,13 @@ export async function runAwaitDnsPropagation(
     await delay(PROPAGATION_POLL_INTERVAL_MS);
   }
 
-  // 75 minutes elapsed without convergence — fail loudly. Better to surface
-  // this than to start step 4 (BIND zones) and have LE cert issuance fail
-  // with a confusing ACME error 5 steps later.
+  // 75 minutes elapsed without convergence — fail loudly.
   throw new Error(
-    `DNS NS delegation for ${job.ns_domain} did not converge after ${Math.round(
+    `DNS NS delegation for ${job.ns_domain} did not converge at the .${job.ns_domain.split(".").pop()} parent zone after ${Math.round(
       PROPAGATION_MAX_MS / 60000
     )} minutes. Last poll: ${JSON.stringify(
       pollHistory[pollHistory.length - 1] || {}
-    )}. lastConverged=${lastConverged}.`
+    )}.`
   );
 }
 
