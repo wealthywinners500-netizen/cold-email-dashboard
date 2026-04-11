@@ -482,6 +482,44 @@ export async function handleProvisionStep(
     (context as unknown as Record<string, unknown>).server2IP = provJob.server2_ip;
   }
 
+  // Hard Lesson #60 (Test #14, 2026-04-11): saga steps 2 + 6 (install_hestiacp,
+  // setup_mail_domains) read the root password from `ctx.serverPassword` for
+  // SSH auth, but the Hard Lesson #59 refactor intentionally omits
+  // `rootPassword` from create_vps step metadata ("never logged, never
+  // returned via metadata"). Result: SSH falls back to 'changeme123' and
+  // every step that needs SSH fails with "authentication methods failed".
+  //
+  // Fix: load the encrypted password from ssh_credentials (written by
+  // persistPairCredentials during Step 1), decrypt via ENCRYPTION_KEY,
+  // and inject into ctx.serverPassword before the saga step executes.
+  // The password lives ONLY in memory for the duration of the step call
+  // and is never written to metadata. (create_vps returned earlier, so
+  // stepType here is narrowed to the SSH-using step set.)
+  {
+    const { data: sshCred } = await supabase
+      .from('ssh_credentials')
+      .select('password_encrypted')
+      .eq('provisioning_job_id', jobId)
+      .limit(1)
+      .maybeSingle();
+    if (sshCred?.password_encrypted) {
+      try {
+        const plaintext = decrypt(sshCred.password_encrypted);
+        (context as unknown as Record<string, unknown>).serverPassword =
+          plaintext;
+      } catch (decErr) {
+        const msg = decErr instanceof Error ? decErr.message : String(decErr);
+        console.error(
+          `[ProvisionStep] Failed to decrypt ssh_credentials password for job ${jobId}: ${msg}`
+        );
+      }
+    } else {
+      console.warn(
+        `[ProvisionStep] No ssh_credentials row found for job ${jobId} — saga step will fall back to default password and likely fail`
+      );
+    }
+  }
+
   // 5. Build saga steps and find the one we need
   const sagaSteps = createPairProvisioningSaga(
     vpsProvider,
