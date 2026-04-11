@@ -946,35 +946,54 @@ export async function replicateSSLCertToSecondary(
 /**
  * Hard Lesson #66 (Test #15, 2026-04-11): HestiaCP's v-add-mail-domain-dkim
  * generates a FRESH RSA keypair on each server it's run on. When createMailDomain
- * runs on both s1 and s2, each server ends up with a DIFFERENT private key
- * under /etc/exim4/domains/<domain>/dkim.private.pem, but the DNS TXT record
- * mail._domainkey.<domain> only contains s1's public key. Any outbound mail
- * that Exim on s2 signs will fail DKIM validation at the receiving MTA
- * because the receiver compares s2's signature against s1's published public key.
+ * runs on both s1 and s2, each server ends up with a DIFFERENT private key,
+ * but the DNS TXT record mail._domainkey.<domain> only contains s1's public key.
+ * Any outbound mail that Exim on s2 signs will fail DKIM validation at the
+ * receiving MTA because the receiver compares s2's signature against s1's
+ * published public key.
  *
- * Fix: after createMailDomain has run on both servers, copy s1's dkim.private.pem
- * AND dkim.public.pem to s2 via the same base64-over-SSH pattern used for
- * replicateSSLCertToSecondary, chown to Debian-exim:Debian-exim, chmod 640,
- * then v-rebuild-mail-domain on s2 so Exim re-reads the replicated keys.
+ * Hard Lesson #68 (Test #16 canary, 2026-04-11): The ORIGINAL PATCH 4 shipped
+ * with the WRONG PATHS. It looked for /etc/exim4/domains/<d>/dkim.private.pem
+ * and /etc/exim4/domains/<d>/dkim.public.pem — but HestiaCP doesn't use those
+ * filenames. The actual paths HestiaCP writes are:
+ *   1. /home/admin/conf/mail/<d>/dkim.pem          ← the Exim-readable private key
+ *      (same file visible as /etc/exim4/domains/<d>/dkim.pem via Hestia's
+ *      symlink/bind-mount; Exim's exim4.conf.template: DKIM_FILE = /etc/exim4/domains/${...}/dkim.pem)
+ *   2. /usr/local/hestia/data/users/admin/mail/<d>.pem   ← Hestia metadata (private)
+ *   3. /usr/local/hestia/data/users/admin/mail/<d>.pub   ← Hestia metadata (public)
  *
- * This helper is best-effort: if s1's key file is missing (createMailDomain
- * silently failed to enable DKIM on s1), we log a warning and return. The
+ * PATCH 5 (this function) writes ALL THREE on s2 so both (a) Exim signs with
+ * the same key s1 published in DNS and (b) v-rebuild-mail-domain doesn't
+ * overwrite from stale Hestia metadata. Ownership: dkim.pem is
+ * Debian-exim:mail 660; the hestia metadata files are root:root 660.
+ *
+ * After replication we v-rebuild-mail-domain on s2 then restart exim4 so the
+ * new key is loaded into Exim's DKIM_FILE cache.
+ *
+ * Best-effort: if s1's dkim.pem is missing, log a warning and return. The
  * worst case is that s2 keeps its own fresh key and we eat a DKIM mismatch
  * on s2-signed mail, but the pair still ships.
- *
- * Ownership note: on Debian/Hestia stacks, /etc/exim4/domains/<d>/dkim.*.pem
- * is owned by Debian-exim:Debian-exim (NOT mail:mail and NOT root:root).
  */
 export async function replicateDKIMKeysToSecondary(
   ssh1: SSHManager,
   ssh2: SSHManager,
   domain: string
 ): Promise<void> {
-  const dkimDir = `/etc/exim4/domains/${domain}`;
-  const keyFiles = ['dkim.private.pem', 'dkim.public.pem'];
+  // (1) Exim-readable private key — THIS is what Exim actually signs with.
+  const eximDkimPath = `/home/admin/conf/mail/${domain}/dkim.pem`;
+  // (2) + (3) Hestia metadata so v-rebuild doesn't overwrite from stale source.
+  const hestiaPrivPath = `/usr/local/hestia/data/users/admin/mail/${domain}.pem`;
+  const hestiaPubPath = `/usr/local/hestia/data/users/admin/mail/${domain}.pub`;
 
-  for (const keyFile of keyFiles) {
-    const srcPath = `${dkimDir}/${keyFile}`;
+  // Files to replicate: [src_path, dst_path, chown, chmod]
+  const files: Array<[string, string, string, string]> = [
+    [eximDkimPath, eximDkimPath, 'Debian-exim:mail', '660'],
+    [hestiaPrivPath, hestiaPrivPath, 'root:root', '660'],
+    [hestiaPubPath, hestiaPubPath, 'root:root', '660'],
+  ];
+
+  let replicated = 0;
+  for (const [srcPath, dstPath, own, mode] of files) {
     let b64Content: string;
     try {
       const { stdout } = await ssh1.exec(
@@ -991,37 +1010,83 @@ export async function replicateDKIMKeysToSecondary(
     }
 
     if (b64Content === 'MISSING' || !b64Content) {
-      // DKIM not enabled on s1 for this domain (createMailDomain's DKIM step
-      // may have been skipped by the 1.8+ auto-enable check). Nothing to
-      // replicate — let v-rebuild-mail-domain on s2 carry on with whatever
-      // key s2 has.
+      // Expected for the hestia .pub sometimes; only critical if dkim.pem is missing.
+      if (srcPath === eximDkimPath) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[replicateDKIMKeysToSecondary] CRITICAL: ${srcPath} not present on S1 for ${domain} — DKIM mismatch will occur. Skipping replication.`
+        );
+        return;
+      }
       // eslint-disable-next-line no-console
       console.warn(
-        `[replicateDKIMKeysToSecondary] ${srcPath} not present on S1 for ${domain} — skipping`
+        `[replicateDKIMKeysToSecondary] ${srcPath} not present on S1 for ${domain} — skipping (non-critical)`
       );
       continue;
     }
 
+    const dstDir = dstPath.substring(0, dstPath.lastIndexOf('/'));
     try {
       await ssh2.exec(
-        `mkdir -p ${dkimDir} && echo '${b64Content}' | base64 -d > ${dkimDir}/${keyFile} && chown Debian-exim:Debian-exim ${dkimDir}/${keyFile} && chmod 640 ${dkimDir}/${keyFile}`,
+        `mkdir -p ${dstDir} && echo '${b64Content}' | base64 -d > ${dstPath} && chown ${own} ${dstPath} && chmod ${mode} ${dstPath}`,
         { timeout: 15000 }
       );
+      replicated += 1;
     } catch (err) {
       // eslint-disable-next-line no-console
       console.warn(
-        `[replicateDKIMKeysToSecondary] write ${dkimDir}/${keyFile} on S2 failed for ${domain}: ${err instanceof Error ? err.message : String(err)}`
+        `[replicateDKIMKeysToSecondary] write ${dstPath} on S2 failed for ${domain}: ${err instanceof Error ? err.message : String(err)}`
       );
     }
   }
 
-  // Rebuild the mail domain on s2 so Exim reloads with the replicated keys.
+  // eslint-disable-next-line no-console
+  console.log(
+    `[replicateDKIMKeysToSecondary] ${domain}: ${replicated}/${files.length} files replicated S1→S2`
+  );
+
+  // Rebuild the mail domain on s2 so Hestia reconciles the metadata,
+  // then restart exim4 so the new DKIM_FILE is picked up.
   await ssh2
     .exec(
       `bash -lc "${HESTIA_FULL_PATH} && v-rebuild-mail-domain admin ${domain}"`,
       { timeout: 60000 }
     )
-    .catch(() => { /* tolerate — s2 will keep its own key if rebuild fails */ });
+    .catch(() => { /* tolerate */ });
+  await ssh2
+    .exec(`systemctl restart exim4`, { timeout: 30000 })
+    .catch(() => { /* tolerate */ });
+
+  // Verification — sha256sum s1 vs s2 on the Exim-readable path. Log the
+  // result so Test #16+ forensics can grep for "DKIM match" or "DKIM mismatch".
+  try {
+    const { stdout: h1raw } = await ssh1.exec(
+      `sha256sum ${eximDkimPath} | cut -d' ' -f1`,
+      { timeout: 10000 }
+    );
+    const { stdout: h2raw } = await ssh2.exec(
+      `sha256sum ${eximDkimPath} | cut -d' ' -f1`,
+      { timeout: 10000 }
+    );
+    const h1 = (h1raw || '').trim();
+    const h2 = (h2raw || '').trim();
+    if (h1 && h1 === h2) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[replicateDKIMKeysToSecondary] ${domain}: DKIM match S1↔S2 (${h1})`
+      );
+    } else {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[replicateDKIMKeysToSecondary] ${domain}: DKIM mismatch S1↔S2 (s1=${h1}, s2=${h2})`
+      );
+    }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[replicateDKIMKeysToSecondary] ${domain}: verification sha256sum failed: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
 }
 
 // ============================================
