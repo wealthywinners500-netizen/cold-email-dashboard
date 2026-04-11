@@ -33,16 +33,21 @@ export type ProvisioningStatus =
   | "rolled_back"
   | "cancelled";
 
-// Order matches the corrected provisioning saga (April 2026 deep research)
+// Order matches the corrected provisioning saga (April 2026 deep research).
+// Test #15 (2026-04-11) added `await_dns_propagation` between
+// configure_registrar and setup_dns_zones because LE cert issuance in
+// step 7 (security_hardening) was failing intermittently when the
+// nameserver delegation hadn't yet propagated to LE's resolvers.
 export type StepType =
-  | "create_vps"           // Step 1: Get IPs first
-  | "install_hestiacp"     // Step 2: No DNS needed, bare server
-  | "configure_registrar"  // Step 3: NS/glue early for propagation
-  | "setup_dns_zones"      // Step 4: A records on BIND
-  | "set_ptr"              // Step 5: Requires forward A to resolve
-  | "setup_mail_domains"   // Step 6: DKIM/SPF/DMARC/accounts
-  | "security_hardening"   // Step 7: Kill services + SSL certs
-  | "verification_gate";   // Step 8: PTR↔A↔HELO + blacklists
+  | "create_vps"             // Step 1: Get IPs first
+  | "install_hestiacp"       // Step 2: No DNS needed, bare server
+  | "configure_registrar"    // Step 3: NS/glue early for propagation
+  | "await_dns_propagation"  // Step 4: Wait for NS to propagate (worker only, up to 75 min)
+  | "setup_dns_zones"        // Step 5: A records on BIND
+  | "set_ptr"                // Step 6: Requires forward A to resolve
+  | "setup_mail_domains"     // Step 7: DKIM/SPF/DMARC/accounts
+  | "security_hardening"     // Step 8: Kill services + SSL certs
+  | "verification_gate";     // Step 9: PTR↔A↔HELO + blacklists + port 25 + SSL CN
 
 export type StepStatus =
   | "pending"

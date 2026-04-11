@@ -18,6 +18,7 @@ import { createPairProvisioningSaga } from '@/lib/provisioning/pair-provisioning
 import { getVPSProvider, getDNSRegistrar } from '@/lib/provisioning/provider-registry';
 import { decrypt } from '@/lib/provisioning/encryption';
 import { persistPairCredentials } from '@/lib/provisioning/persist-credentials';
+import { SERVERLESS_STEP_RUNNERS } from '@/lib/provisioning/serverless-steps';
 import { createHmac, randomBytes } from 'crypto';
 import type {
   ProvisioningContext,
@@ -34,15 +35,30 @@ interface ProvisionStepPayload {
   stepId: string;
 }
 
-// All step types this handler processes. create_vps is handled by
-// `handleCreateVpsStep` (provider-API path, no SSH). The rest are
-// Hestia/SSH steps handled by the saga path.
+// All step types this handler processes.
+//   - create_vps              → handleCreateVpsStep (provider API, no SSH)
+//   - configure_registrar     → SERVERLESS_STEP_RUNNERS (registrar API only)
+//   - await_dns_propagation   → SERVERLESS_STEP_RUNNERS (DNS poll, ~1-75 min)
+//   - set_ptr                 → SERVERLESS_STEP_RUNNERS (provider API, retry)
+//   - verification_gate       → SERVERLESS_STEP_RUNNERS (DNS + port 25 + SSL,
+//                                outer 30-min retry; needs non-cloud egress)
+//   - install_hestiacp / setup_dns_zones / setup_mail_domains
+//     / security_hardening    → saga path with SSH pre-connect
+//
+// Test #15 (2026-04-11): the 4 non-SSH steps moved here so the worker
+// can drive jobs autonomously via pollAdvanceableJobs without any
+// wizard polling, AND so verification_gate can do a TCP banner check
+// against port 25 (Vercel egress is blocked).
 const WORKER_STEP_TYPES: StepType[] = [
   'create_vps',
   'install_hestiacp',
+  'configure_registrar',
+  'await_dns_propagation',
   'setup_dns_zones',
+  'set_ptr',
   'setup_mail_domains',
   'security_hardening',
+  'verification_gate',
 ];
 
 // Wizard size label → provider plan ID. Mirrors the same table that
@@ -365,6 +381,42 @@ export async function handleProvisionStep(
   // not use the saga or SSH managers (Hard Lesson #59).
   if (stepType === 'create_vps') {
     await handleCreateVpsStep(jobId, stepType, startTime);
+    return;
+  }
+
+  // Test #15 (2026-04-11): non-SSH steps that the worker now drives via
+  // pollAdvanceableJobs. These don't need the saga, SSH managers, or any
+  // password decrypt — they call the same pure functions that the Vercel
+  // execute-step route uses for wizard-driven jobs. verification_gate
+  // specifically MUST run from the worker because Vercel egress on port
+  // 25 is blocked by GCP/AWS, and a TCP banner check is item 10 of 12
+  // in the Test #15 success bar.
+  const serverlessRunner = SERVERLESS_STEP_RUNNERS[stepType];
+  if (serverlessRunner) {
+    try {
+      const result = await serverlessRunner(jobId);
+      const durationMs = Date.now() - startTime;
+      console.log(
+        `[ProvisionStep] ${stepType} (serverless-runner) completed in ${durationMs}ms for job ${jobId}`
+      );
+      await postCallback(jobId, stepType, {
+        status: 'completed',
+        output: result.output,
+        duration_ms: durationMs,
+        metadata: result.metadata,
+      });
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      const durationMs = Date.now() - startTime;
+      console.error(
+        `[ProvisionStep] ${stepType} (serverless-runner) threw for job ${jobId}: ${errorMsg}`
+      );
+      await postCallback(jobId, stepType, {
+        status: 'failed',
+        error_message: errorMsg,
+        duration_ms: durationMs,
+      });
+    }
     return;
   }
 

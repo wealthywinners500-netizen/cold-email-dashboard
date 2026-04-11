@@ -1,10 +1,12 @@
 import { auth } from "@clerk/nextjs/server";
 import { createAdminClient } from "@/lib/supabase/server";
 import { NextResponse } from "next/server";
-import { getVPSProvider, getDNSRegistrar } from "@/lib/provisioning/provider-registry";
-import { decrypt } from "@/lib/provisioning/encryption";
 import { persistPairCredentials } from "@/lib/provisioning/persist-credentials";
-import type { StepType, ProvisioningJobRow, VPSProviderType, DNSRegistrarType } from "@/lib/provisioning/types";
+import {
+  runConfigureRegistrar,
+  runSetPtr,
+} from "@/lib/provisioning/serverless-steps";
+import type { StepType } from "@/lib/provisioning/types";
 import crypto from "crypto";
 
 export const dynamic = "force-dynamic";
@@ -19,34 +21,44 @@ export const maxDuration = 60;
 // of bug from silently advancing to the next pending step — which was
 // the Test #14 failure mode (Hard Lesson #59).
 //
-// Budget: worker create_vps + HestiaCP install can legitimately take
-// 15-20 min in the worst case. 25 min gives comfortable headroom while
-// still catching genuinely wedged steps before a human would notice.
-const STRANDED_STEP_TIMEOUT_MS = 25 * 60 * 1000;
+// Budget: the longest legitimate step is `await_dns_propagation` at 75
+// minutes (Ionos NS can take 30-60 min on a cold cache), followed by
+// `verification_gate` at 30 minutes (60s × 30 retries while LE issues).
+// 90 min gives comfortable headroom on those two while still catching
+// genuinely wedged steps before a human would notice. (Test #15 bumped
+// from 25 → 90 min after Test #14's 25-min cap proved too aggressive.)
+const STRANDED_STEP_TIMEOUT_MS = 90 * 60 * 1000;
 
-// Steps that can run in serverless (API calls only, <60s each)
-// Order: configure_registrar(3), set_ptr(5), verification_gate(8)
+// Steps that can run in serverless (API calls only, <60s each).
+// configure_registrar (3) + set_ptr (6) hit Ionos / Linode APIs and
+// finish in seconds. Everything else exceeds the 60s cap.
 const SERVERLESS_STEPS: StepType[] = [
   "configure_registrar",
   "set_ptr",
-  "verification_gate",
 ];
 
-// Steps that run on the worker VPS (SSH OR long-running provider polls)
-// Order: create_vps(1), install_hestiacp(2), setup_dns_zones(4),
-//        setup_mail_domains(6), security_hardening(7)
+// Steps that run on the worker VPS (SSH, long-running provider polls,
+// long-running DNS propagation polls, port 25 reachability checks).
 //
 // Hard Lesson #59 (Test #14, 2026-04-10): `create_vps` was previously
-// here on the serverless side, but Linode boot polling routinely blows
+// on the serverless side, but Linode boot polling routinely blows
 // past Vercel's 60s function cap → step stranded `in_progress` with
 // orphan VPS + lost credentials. Moved to the worker, which has no
 // time cap.
+//
+// Test #15 (2026-04-11): `verification_gate` and `await_dns_propagation`
+// also moved here. The verification gate now runs port 25 banner checks
+// (Vercel egress is blocked on 25) and a 30-min retry loop for LE
+// issuance settling. await_dns_propagation polls public resolvers for
+// up to 75 min waiting for NS delegation to converge.
 const WORKER_STEPS: StepType[] = [
   "create_vps",
   "install_hestiacp",
+  "await_dns_propagation",
   "setup_dns_zones",
   "setup_mail_domains",
   "security_hardening",
+  "verification_gate",
 ];
 
 // Plan type mapping lives in the worker's provision-step handler now
@@ -147,234 +159,19 @@ async function executeDryRunStep(
 }
 
 // ============================================
-// Real serverless step execution (steps 1-3, 8)
+// Real serverless step execution (configure_registrar, set_ptr).
+// Bodies live in src/lib/provisioning/serverless-steps.ts so the worker
+// can call them too via pollAdvanceableJobs (Test #15 hands-off path).
 // ============================================
 async function executeServerlessStep(
   stepType: StepType,
-  job: ProvisioningJobRow,
-  allSteps: Array<{ id: string; step_type: string; status: string; metadata: Record<string, unknown> }>
+  jobId: string
 ): Promise<{ output: string; metadata?: Record<string, unknown> }> {
-  // Lazy-init Supabase for provider lookups (Hard Lesson #34)
-  const supabase = await createAdminClient();
-
-  // Load provider configs
-  const { data: vpsRow } = await supabase
-    .from("vps_providers")
-    .select("*")
-    .eq("id", job.vps_provider_id)
-    .single();
-
-  const { data: dnsRow } = await supabase
-    .from("dns_registrars")
-    .select("*")
-    .eq("id", job.dns_registrar_id)
-    .single();
-
-  if (!vpsRow || !dnsRow) {
-    throw new Error("VPS provider or DNS registrar config not found");
-  }
-
   switch (stepType) {
-    // NOTE: `create_vps` is deliberately NOT handled here. Hard Lesson #59
-    // (Test #14, 2026-04-10): Linode boot polling regularly exceeds Vercel
-    // Hobby's 60s maxDuration, leaving the step stranded `in_progress`
-    // with orphan VPS instances. Moved to WORKER_STEPS — handled inline
-    // by the worker's provision-step handler (no time cap).
-    case "set_ptr": {
-      // CRITICAL: Linode/Hetzner/Vultr validate forward A record resolves BEFORE accepting rDNS.
-      // This step MUST come AFTER setup_dns_zones (Step 4) so A records exist.
-      // Implements exponential backoff retry for DNS propagation delay.
-      const vpsConfig: Record<string, unknown> = {
-        ...vpsRow.config,
-        apiKey: vpsRow.api_key_encrypted ? decrypt(vpsRow.api_key_encrypted) : undefined,
-        apiSecret: vpsRow.api_secret_encrypted ? decrypt(vpsRow.api_secret_encrypted) : undefined,
-      };
-      const provider = await getVPSProvider(vpsRow.provider_type as VPSProviderType, vpsConfig);
-
-      // Get IPs from create_vps step metadata or job row
-      const createVpsStep = allSteps.find((s) => s.step_type === "create_vps");
-      const meta = createVpsStep?.metadata || {};
-      const server1IP = (meta.server1IP as string) || job.server1_ip || "";
-      const server2IP = (meta.server2IP as string) || job.server2_ip || "";
-
-      if (!server1IP || !server2IP) {
-        throw new Error("Server IPs not available — create_vps step must complete first");
-      }
-
-      // Retry with exponential backoff (DNS propagation may not be instant)
-      const retryDelays = [0, 60_000, 180_000, 300_000]; // 0s, 1min, 3min, 5min
-      let lastError = "";
-
-      for (let attempt = 0; attempt < retryDelays.length; attempt++) {
-        if (attempt > 0) {
-          await new Promise((r) => setTimeout(r, retryDelays[attempt]));
-        }
-
-        try {
-          await provider.setPTR({ ip: server1IP, hostname: `mail1.${job.ns_domain}` });
-          await provider.setPTR({ ip: server2IP, hostname: `mail2.${job.ns_domain}` });
-          return { output: `PTR records set: mail1.${job.ns_domain} → ${server1IP}, mail2.${job.ns_domain} → ${server2IP}` };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          lastError = msg;
-
-          // Provider doesn't support PTR via API (e.g., Clouding) — no retry
-          if (msg.includes("not supported") || msg.includes("not implemented")) {
-            return {
-              output: `PTR via API not supported by ${vpsRow.provider_type} — manual PTR required`,
-              metadata: { manualRequired: true },
-            };
-          }
-
-          // DNS lookup failure — retry (forward DNS not yet propagated)
-          if (msg.includes("unable to perform a lookup") || msg.includes("Unable to look up") || msg.includes("400")) {
-            continue;
-          }
-
-          // Unknown error — don't retry
-          throw err;
-        }
-      }
-
-      // All retries exhausted — mark as manual required
-      return {
-        output: `PTR could not be set automatically after ${retryDelays.length} attempts (DNS propagation pending). Last error: ${lastError}. Manual setup: ${server1IP} → mail1.${job.ns_domain}, ${server2IP} → mail2.${job.ns_domain}`,
-        metadata: { manualRequired: true },
-      };
-    }
-
-    case "configure_registrar": {
-      const dnsConfig: Record<string, unknown> = {
-        ...dnsRow.config,
-        apiKey: dnsRow.api_key_encrypted ? decrypt(dnsRow.api_key_encrypted) : undefined,
-        apiSecret: dnsRow.api_secret_encrypted ? decrypt(dnsRow.api_secret_encrypted) : undefined,
-      };
-      const registrar = await getDNSRegistrar(dnsRow.registrar_type as DNSRegistrarType, dnsConfig);
-
-      // Get IPs from create_vps step metadata or job row
-      const createVpsStep = allSteps.find((s) => s.step_type === "create_vps");
-      const meta = createVpsStep?.metadata || {};
-      const server1IP = (meta.server1IP as string) || job.server1_ip || "";
-      const server2IP = (meta.server2IP as string) || job.server2_ip || "";
-
-      if (!server1IP || !server2IP) {
-        throw new Error("Server IPs not available — create_vps step must complete first");
-      }
-
-      // Set nameservers on the ns_domain itself (with glue, since the
-      // nameserver hostnames live INSIDE the same domain).
-      await registrar.setNameservers(job.ns_domain, [
-        `ns1.${job.ns_domain}`,
-        `ns2.${job.ns_domain}`,
-      ]);
-
-      // Set glue records
-      await registrar.setGlueRecords(job.ns_domain, [
-        { hostname: `ns1.${job.ns_domain}`, ip: server1IP },
-        { hostname: `ns2.${job.ns_domain}`, ip: server2IP },
-      ]);
-
-      // Hard Lesson #62 (2026-04-11): Test #14 left pair 10's two sending
-      // domains delegated to whatever NS they had before — the wizard's
-      // canonical execute-step driver only updated the ns_domain itself.
-      // The legacy monolithic saga (pair-provisioning-saga.ts:434-451) had a
-      // sendingDomains delegation loop using updateNameserversOnly() but
-      // this serverless handler skipped it, so all mail from new pairs would
-      // fail SPF/reverse-DNS alignment until manually fixed at Ionos. Mirror
-      // the saga loop verbatim. Use updateNameserversOnly (NOT setNameservers)
-      // because Ionos's setNameservers is a stash that only fires inside
-      // setGlueRecords, and sending domains don't take glue (Hard Lesson #54).
-      const ns1Host = `ns1.${job.ns_domain}`;
-      const ns2Host = `ns2.${job.ns_domain}`;
-      const sendingDelegation: Array<{ domain: string; ok: boolean; error?: string }> = [];
-      for (const sendingDomain of (job.sending_domains as string[] | null) || []) {
-        try {
-          await registrar.updateNameserversOnly(sendingDomain, [ns1Host, ns2Host]);
-          sendingDelegation.push({ domain: sendingDomain, ok: true });
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          sendingDelegation.push({ domain: sendingDomain, ok: false, error: msg });
-        }
-      }
-      const failedDelegations = sendingDelegation.filter((d) => !d.ok);
-      if (failedDelegations.length > 0) {
-        throw new Error(
-          `Sending domain NS delegation failed for: ${failedDelegations
-            .map((d) => `${d.domain} (${d.error})`)
-            .join("; ")}`
-        );
-      }
-
-      const okList = sendingDelegation.map((d) => d.domain).join(", ") || "(none)";
-      return {
-        output: `DNS configured for ${job.ns_domain}: NS → ns1/ns2, glue → ${server1IP}/${server2IP} (${dnsRow.registrar_type}). Sending domains delegated to ${ns1Host}/${ns2Host}: ${okList}`,
-      };
-    }
-
-    case "verification_gate": {
-      // DNS-only verification checks — no SSH required
-      // Check A records, PTR, SPF/DKIM/DMARC via dig
-      const { execSync } = await import("child_process");
-      const results: string[] = [];
-      const failures: string[] = [];
-
-      const createVpsStep = allSteps.find((s) => s.step_type === "create_vps");
-      const meta = createVpsStep?.metadata || {};
-      const server1IP = (meta.server1IP as string) || job.server1_ip || "";
-      const server2IP = (meta.server2IP as string) || job.server2_ip || "";
-
-      // Check A records for ns domain
-      for (const [hostname, expectedIP] of [
-        [`mail1.${job.ns_domain}`, server1IP],
-        [`mail2.${job.ns_domain}`, server2IP],
-      ]) {
-        try {
-          const result = execSync(`dig +short A ${hostname} @8.8.8.8`, { timeout: 10000 }).toString().trim();
-          if (result.includes(expectedIP)) {
-            results.push(`✓ A record ${hostname} → ${expectedIP}`);
-          } else {
-            failures.push(`✗ A record ${hostname}: expected ${expectedIP}, got ${result || "NXDOMAIN"}`);
-          }
-        } catch {
-          failures.push(`✗ A record lookup failed for ${hostname}`);
-        }
-      }
-
-      // Check SPF on sending domains
-      for (const domain of job.sending_domains || []) {
-        try {
-          const result = execSync(`dig +short TXT ${domain} @8.8.8.8`, { timeout: 10000 }).toString().trim();
-          if (result.includes("v=spf1")) {
-            results.push(`✓ SPF found for ${domain}`);
-          } else {
-            failures.push(`✗ No SPF record for ${domain}`);
-          }
-        } catch {
-          failures.push(`✗ SPF lookup failed for ${domain}`);
-        }
-      }
-
-      const output = [...results, ...failures].join("\n");
-      if (failures.length > 0) {
-        // Hard Lesson #62 (2026-04-11): Test #14 finished with 4 DNS failures
-        // here, but the previous handler RETURNED success metadata instead
-        // of throwing — so the step row + job row both transitioned to
-        // 'completed' and the wizard reported a successful provision while
-        // the pair was deliverability-broken. The verification gate is the
-        // only thing standing between a half-provisioned pair and the
-        // resale customer's first send. Throw on any failure so the catch
-        // block at the bottom of POST() marks step + job as 'failed'.
-        const err = new Error(
-          `Verification gate failed (${failures.length} issue(s)):\n${output}`
-        );
-        // Attach the structured failures for the caller to log/diagnose.
-        (err as Error & { failures?: string[] }).failures = failures;
-        throw err;
-      }
-
-      return { output: `All verification checks passed:\n${output}` };
-    }
-
+    case "configure_registrar":
+      return runConfigureRegistrar(jobId);
+    case "set_ptr":
+      return runSetPtr(jobId);
     default:
       throw new Error(`Step ${stepType} is not a serverless step`);
   }
@@ -642,12 +439,8 @@ export async function POST(
           output: result.output,
         });
       } else if (SERVERLESS_STEPS.includes(stepType)) {
-        // API-only steps → execute inline with real providers
-        result = await executeServerlessStep(
-          stepType,
-          job as unknown as ProvisioningJobRow,
-          steps as Array<{ id: string; step_type: string; status: string; metadata: Record<string, unknown> }>
-        );
+        // API-only steps → execute inline (delegates to serverless-steps.ts)
+        result = await executeServerlessStep(stepType, jobId);
       } else {
         throw new Error(`Unknown step type: ${stepType}`);
       }

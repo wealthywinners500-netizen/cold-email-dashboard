@@ -562,6 +562,126 @@ async function main() {
   setInterval(pollDispatchedSteps, 10000);
   await pollDispatchedSteps();
 
+  // --- Poll for advanceable provisioning jobs (Test #15, hands-off driver) ---
+  // The wizard-driven flow has Vercel's execute-step route choose the next
+  // pending step and atomically claim it (status='pending' → 'in_progress'
+  // with metadata.dispatched_to_worker=true), at which point pollDispatchedSteps
+  // picks it up. For hands-off jobs (inserted directly via service role,
+  // bypassing the Clerk POST), nothing drives that step transition.
+  //
+  // pollAdvanceableJobs fills that gap: find jobs in (pending, in_progress),
+  // verify no step is currently in_progress, find the lowest-step_order pending
+  // step, and atomically claim it. The conditional UPDATE on status='pending'
+  // (Hard Lesson #42 atomic claim) prevents two poller ticks or two worker
+  // instances from claiming the same step.
+  //
+  // This driver does NOT call boss.send directly — it just performs the
+  // atomic claim. pollDispatchedSteps then enqueues the provision-step job
+  // on its next tick (10s later, worst case). One source of truth, no races.
+  //
+  // Hard Lesson #11 redux: this is NOT a re-enable of pollProvisioningJobs.
+  // The old monolith ran the entire saga in one process. This driver only
+  // claims the next step and hands off to the existing dispatched-steps
+  // bridge — same canonical path as the wizard.
+  const pollAdvanceableJobs = async () => {
+    try {
+      const supabase = getSupabase();
+
+      // Find jobs that could potentially advance
+      const { data: jobs } = await supabase
+        .from("provisioning_jobs")
+        .select("id, status")
+        .in("status", ["pending", "in_progress"])
+        .order("created_at", { ascending: true })
+        .limit(20);
+
+      if (!jobs || jobs.length === 0) return;
+
+      for (const job of jobs) {
+        // Check if any step for this job is currently in_progress.
+        // If so, skip — we wait for that step's worker callback to
+        // mark it complete before claiming the next one.
+        const { data: inProgressSteps } = await supabase
+          .from("provisioning_steps")
+          .select("id, step_type")
+          .eq("job_id", job.id)
+          .eq("status", "in_progress")
+          .limit(1);
+
+        if (inProgressSteps && inProgressSteps.length > 0) {
+          continue;
+        }
+
+        // Find the lowest-step_order pending step
+        const { data: pendingSteps } = await supabase
+          .from("provisioning_steps")
+          .select("id, step_type, step_order")
+          .eq("job_id", job.id)
+          .eq("status", "pending")
+          .order("step_order", { ascending: true })
+          .limit(1);
+
+        if (!pendingSteps || pendingSteps.length === 0) {
+          continue;
+        }
+
+        const next = pendingSteps[0];
+
+        // Atomic claim: only succeed if the row is still 'pending'
+        // (Hard Lesson #42). If two pollers race, exactly one wins.
+        const { data: claimed, error: claimErr } = await supabase
+          .from("provisioning_steps")
+          .update({
+            status: "in_progress",
+            started_at: new Date().toISOString(),
+            metadata: {
+              dispatched_to_worker: true,
+              claimed_by: "pollAdvanceableJobs",
+              claimed_at: new Date().toISOString(),
+            },
+          })
+          .eq("id", next.id)
+          .eq("status", "pending")
+          .select("id")
+          .maybeSingle();
+
+        if (claimErr || !claimed) {
+          // Another poller tick claimed it. Move on.
+          continue;
+        }
+
+        // Promote job to in_progress if it was pending
+        if (job.status === "pending") {
+          await supabase
+            .from("provisioning_jobs")
+            .update({
+              status: "in_progress",
+              started_at: new Date().toISOString(),
+              current_step: next.step_type,
+            })
+            .eq("id", job.id)
+            .eq("status", "pending");
+        } else {
+          await supabase
+            .from("provisioning_jobs")
+            .update({ current_step: next.step_type })
+            .eq("id", job.id);
+        }
+
+        console.log(
+          `[Worker] pollAdvanceableJobs claimed ${next.step_type} (step_order=${next.step_order}) for job ${job.id}`
+        );
+      }
+    } catch (err) {
+      console.error("[Worker] pollAdvanceableJobs failed:", err);
+    }
+  };
+
+  // Poll every 15 seconds — slightly slower than pollDispatchedSteps so
+  // a freshly-claimed step gets dispatched in roughly one tick.
+  setInterval(pollAdvanceableJobs, 15000);
+  await pollAdvanceableJobs();
+
   // --- Poll for pending registrar domain-listing requests (worker bridge) ---
   // Vercel /api/dns-registrars/[id]/domains writes a 'fetching' cache entry
   // when a wizard user clicks Fetch from Registrar. This poller picks those

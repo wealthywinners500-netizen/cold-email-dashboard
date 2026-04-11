@@ -183,17 +183,22 @@ export async function POST(req: Request) {
       );
     }
 
-    // Create 8 provisioning step rows (order corrected April 2026 — deep research proved
-    // PTR must come AFTER DNS zones because Linode/Hetzner/Vultr validate forward A records)
+    // Create 9 provisioning step rows. Test #15 (2026-04-11) added
+    // `await_dns_propagation` between configure_registrar and setup_dns_zones
+    // because LE issuance in security_hardening was failing intermittently
+    // when the new nameservers hadn't yet propagated to LE's resolvers.
+    // The await step runs only on the worker (no Vercel cap) and polls
+    // 8.8.8.8/1.1.1.1/9.9.9.9 for NS convergence up to 75 minutes.
     const stepTypes = [
-      "create_vps",           // 1: Get IPs first
-      "install_hestiacp",     // 2: No DNS needed, bare server
-      "configure_registrar",  // 3: NS/glue early for propagation
-      "setup_dns_zones",      // 4: A records on BIND
-      "set_ptr",              // 5: Requires forward A to resolve
-      "setup_mail_domains",   // 6: DKIM/SPF/DMARC/accounts
-      "security_hardening",   // 7: Kill services + SSL certs
-      "verification_gate",    // 8: PTR↔A↔HELO + blacklists
+      "create_vps",             // 1: Get IPs first
+      "install_hestiacp",       // 2: No DNS needed, bare server
+      "configure_registrar",    // 3: NS/glue early for propagation
+      "await_dns_propagation",  // 4: Wait for NS to propagate (worker only)
+      "setup_dns_zones",        // 5: A records on BIND
+      "set_ptr",                // 6: Requires forward A to resolve
+      "setup_mail_domains",     // 7: DKIM/SPF/DMARC/accounts
+      "security_hardening",     // 8: Kill services + SSL certs
+      "verification_gate",      // 9: PTR↔A↔HELO + port 25 + SSL CN + blacklists
     ] as const;
 
     for (let i = 0; i < stepTypes.length; i++) {

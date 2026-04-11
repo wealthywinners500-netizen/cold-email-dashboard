@@ -209,21 +209,67 @@ export async function POST(
       const server2IP = (vpsMetadata.server2IP as string) || jobRow?.server2_ip || "";
 
       if (jobRow && server1IP && server2IP) {
-        // Create server_pair record
-        const { data: serverPair } = await supabase
+        // Hard Lesson #50 + #62 parity (2026-04-11): this insert was using
+        // the LEGACY server1_ip/server2_ip/server1_hostname/server2_hostname
+        // column names that don't exist on the server_pairs table. The
+        // execute-step finalization block was patched in commit 506a2a8
+        // but THIS callback path was missed — until now verification_gate
+        // ran serverless so this branch was unreachable, but Test #15 moves
+        // verification_gate to the worker, so the worker callback now hits
+        // this finalization branch on the last step. Use the same
+        // pair_number-from-MAX+1 logic and the same s1_/s2_ column names
+        // and the same provisioning_job_id FK.
+        const { data: maxPairRow } = await supabase
+          .from("server_pairs")
+          .select("pair_number")
+          .eq("org_id", jobRow.org_id)
+          .order("pair_number", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        const nextPairNumber =
+          ((maxPairRow?.pair_number as number) || 0) + 1;
+
+        const { data: serverPair, error: serverPairError } = await supabase
           .from("server_pairs")
           .insert({
             org_id: jobRow.org_id,
+            pair_number: nextPairNumber,
             ns_domain: jobRow.ns_domain,
-            server1_ip: server1IP,
-            server2_ip: server2IP,
-            server1_hostname: `mail1.${jobRow.ns_domain}`,
-            server2_hostname: `mail2.${jobRow.ns_domain}`,
-            status: "active",
-            health_status: "healthy",
+            s1_ip: server1IP,
+            s1_hostname: `mail1.${jobRow.ns_domain}`,
+            s2_ip: server2IP,
+            s2_hostname: `mail2.${jobRow.ns_domain}`,
+            status: "complete",
+            provisioning_job_id: jobId,
           })
           .select()
           .single();
+
+        if (serverPairError || !serverPair) {
+          // Don't silently swallow — the whole point of Hard Lesson #50
+          // was that this row HAS to land or downstream code can never
+          // hop job → pair.
+          await supabase
+            .from("provisioning_jobs")
+            .update({
+              status: "failed",
+              error_message: `Final server_pairs insert failed: ${
+                serverPairError?.message || "unknown"
+              }`,
+            })
+            .eq("id", jobId);
+
+          return NextResponse.json(
+            {
+              jobId,
+              stepType,
+              status: "failed",
+              error: `server_pairs insert failed: ${serverPairError?.message}`,
+            },
+            { status: 500 }
+          );
+        }
 
         // Mark job completed
         await supabase
@@ -232,7 +278,7 @@ export async function POST(
             status: "completed",
             progress_pct: 100,
             completed_at: new Date().toISOString(),
-            server_pair_id: serverPair?.id || null,
+            server_pair_id: serverPair.id,
             server1_ip: server1IP,
             server2_ip: server2IP,
           })
