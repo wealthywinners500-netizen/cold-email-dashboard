@@ -537,6 +537,62 @@ export async function handleProvisionStep(
     return;
   }
 
+  // Hard Lesson #61 (Test #14 attempt 2, 2026-04-11): saga steps 4, 6, 7
+  // (setup_dns_zones, setup_mail_domains, security_hardening) call
+  // `ssh1.exec()` / `ssh2.exec()` directly but never call `ssh1.connect()`.
+  // In the pre-#59 world the whole saga ran in one process and SSH was
+  // connected once at the top. After the per-step decomposition each step
+  // runs with fresh SSH managers, so the driver must open the SSH sessions
+  // before handing off to the step. Skipped for:
+  //   - create_vps: returned earlier (no SSH needed)
+  //   - install_hestiacp: has its own connect-with-backoff retry loop, must
+  //     handle SSH-not-yet-ready itself
+  //   - configure_registrar, set_ptr, verification_gate: never dispatched
+  //     to the worker — they run serverless on Vercel (API-only / DNS-only).
+  const sshRequiredSteps: StepType[] = [
+    'setup_dns_zones',
+    'setup_mail_domains',
+    'security_hardening',
+  ];
+  if (sshRequiredSteps.includes(stepType)) {
+    const ctxRec = context as unknown as Record<string, unknown>;
+    const server1IP = ctxRec.server1IP as string | undefined;
+    const server2IP = ctxRec.server2IP as string | undefined;
+    const rootPassword = ctxRec.serverPassword as string | undefined;
+    if (!server1IP || !server2IP) {
+      await postCallback(jobId, stepType, {
+        status: 'failed',
+        error_message: `SSH pre-connect failed: missing server IPs in context (server1IP=${server1IP}, server2IP=${server2IP})`,
+      });
+      return;
+    }
+    if (!rootPassword) {
+      await postCallback(jobId, stepType, {
+        status: 'failed',
+        error_message: `SSH pre-connect failed: no root password available (ssh_credentials decrypt failed?)`,
+      });
+      return;
+    }
+    try {
+      console.log(
+        `[ProvisionStep] Connecting SSH for ${stepType}: ${server1IP} + ${server2IP}`
+      );
+      await ssh1.connect(server1IP, 22, 'root', { password: rootPassword });
+      await ssh2.connect(server2IP, 22, 'root', { password: rootPassword });
+      console.log(`[ProvisionStep] SSH connected to both servers for ${stepType}`);
+    } catch (connErr) {
+      const msg = connErr instanceof Error ? connErr.message : String(connErr);
+      console.error(
+        `[ProvisionStep] SSH connect failed for ${stepType} job ${jobId}: ${msg}`
+      );
+      await postCallback(jobId, stepType, {
+        status: 'failed',
+        error_message: `SSH pre-connect failed: ${msg}`,
+      });
+      return;
+    }
+  }
+
   // 6. Execute the single step
   try {
     const result = await targetStep.execute(context);
