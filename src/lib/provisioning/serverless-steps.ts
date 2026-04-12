@@ -39,6 +39,7 @@ import type {
 import { DNSVerifier } from "@/lib/provisioning/verification";
 import { checkPort25 } from "@/lib/provisioning/checks/port25";
 import { checkSSLCert } from "@/lib/provisioning/checks/ssl-cn";
+import { SSHManager } from "@/lib/provisioning/ssh-manager";
 import { promises as dnsPromises } from "dns";
 import { exec as execCb } from "child_process";
 import { promisify } from "util";
@@ -517,6 +518,118 @@ export async function runAwaitDnsPropagation(
 const VG_RETRY_MAX_MS = 30 * 60 * 1000; // 30 minutes
 const VG_RETRY_INTERVAL_MS = 60 * 1000; // 60 seconds
 
+/**
+ * Hard Lesson #68 / #69 (Test #16 canary 11 forensics, 2026-04-11):
+ *
+ * The VG previously only checked DNS-visible DKIM state (the public TXT
+ * record at mail._domainkey.<domain>) which is published from S1 only.
+ * It had no way to detect that S2 was signing outbound mail with a
+ * DIFFERENT private key than the one S1 published. Result: PATCH 4's
+ * silent DKIM replication failure false-greened the entire test and
+ * the operator didn't discover the bug until independent SSH audit.
+ *
+ * This function SSHes to BOTH servers, reads sha256sum of the Exim
+ * private key at /home/admin/conf/mail/<domain>/dkim.pem, and compares
+ * them. This is the only source of truth for row 11 of the success bar.
+ *
+ * Uses the worker VPS's ssh_credentials row for the job. If the creds
+ * row is missing (Hard Lesson #58 failure), returns a hard failure.
+ */
+async function verifyDKIMCrossServerMatch(
+  jobId: string,
+  orgId: string,
+  sendingDomains: string[],
+  server1IP: string,
+  server2IP: string
+): Promise<{ ok: boolean; issues: string[] }> {
+  const issues: string[] = [];
+  const supabase = await createAdminClient();
+
+  // Load ssh_credentials — one row per server
+  const { data: creds, error: credsErr } = await supabase
+    .from("ssh_credentials")
+    .select("server_ip, password_encrypted")
+    .eq("org_id", orgId)
+    .eq("provisioning_job_id", jobId);
+  if (credsErr || !creds || creds.length < 2) {
+    issues.push(
+      `DKIM cross-check: ssh_credentials rows missing for job ${jobId} (found ${creds?.length ?? 0}) — Hard Lesson #58 regression?`
+    );
+    return { ok: false, issues };
+  }
+
+  const byIp = new Map<string, string>();
+  for (const row of creds) {
+    try {
+      byIp.set(row.server_ip, decrypt(row.password_encrypted));
+    } catch (err) {
+      issues.push(
+        `DKIM cross-check: decrypt failed for ${row.server_ip}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+  if (!byIp.has(server1IP) || !byIp.has(server2IP)) {
+    issues.push(
+      `DKIM cross-check: credentials incomplete (have=${[...byIp.keys()].join(',')}, need=${server1IP},${server2IP})`
+    );
+    return { ok: false, issues };
+  }
+
+  const ssh1 = new SSHManager();
+  const ssh2 = new SSHManager();
+  try {
+    await ssh1.connect(server1IP, 22, "root", { password: byIp.get(server1IP)! });
+    await ssh2.connect(server2IP, 22, "root", { password: byIp.get(server2IP)! });
+
+    for (const domain of sendingDomains) {
+      const dkimPath = `/home/admin/conf/mail/${domain}/dkim.pem`;
+      let h1 = "";
+      let h2 = "";
+      try {
+        const { stdout: r1 } = await ssh1.exec(
+          `sha256sum ${dkimPath} 2>/dev/null | cut -d' ' -f1`,
+          { timeout: 10000 }
+        );
+        h1 = (r1 || "").trim();
+      } catch {
+        issues.push(`${domain}: S1 sha256 failed (${dkimPath})`);
+        continue;
+      }
+      try {
+        const { stdout: r2 } = await ssh2.exec(
+          `sha256sum ${dkimPath} 2>/dev/null | cut -d' ' -f1`,
+          { timeout: 10000 }
+        );
+        h2 = (r2 || "").trim();
+      } catch {
+        issues.push(`${domain}: S2 sha256 failed (${dkimPath})`);
+        continue;
+      }
+      if (!h1) {
+        issues.push(`${domain}: DKIM key missing on S1 (${dkimPath})`);
+      } else if (!h2) {
+        issues.push(`${domain}: DKIM key missing on S2 (${dkimPath})`);
+      } else if (h1 !== h2) {
+        issues.push(
+          `${domain}: DKIM mismatch S1↔S2 (s1=${h1.slice(0, 8)}…, s2=${h2.slice(0, 8)}…)`
+        );
+      }
+    }
+  } catch (err) {
+    issues.push(
+      `DKIM cross-check: SSH error: ${err instanceof Error ? err.message : String(err)}`
+    );
+  } finally {
+    try {
+      await ssh1.disconnect();
+    } catch {}
+    try {
+      await ssh2.disconnect();
+    } catch {}
+  }
+  return { ok: issues.length === 0, issues };
+}
+
 async function runVerificationGateOnce(jobId: string): Promise<{
   ok: boolean;
   results: string[];
@@ -615,6 +728,34 @@ async function runVerificationGateOnce(jobId: string): Promise<{
   } else {
     failures.push(
       `✗ SSL mail2.${job.ns_domain}: ${ssl2.error} (subject=${ssl2.subjectCN}, issuer=${ssl2.issuerCN || ssl2.issuerO})`
+    );
+  }
+
+  // Item 11: DKIM sha256 cross-server match (Hard Lesson #68/#69).
+  // THIS IS THE CHECK TEST #16 LACKED AND THAT FALSE-GREENED PATCH 4.
+  // Every sending domain's /home/admin/conf/mail/<d>/dkim.pem must
+  // have identical sha256 on S1 and S2, otherwise S2-signed mail will
+  // fail DKIM validation at receiving MTAs.
+  try {
+    const dkimCross = await verifyDKIMCrossServerMatch(
+      jobId,
+      job.org_id,
+      job.sending_domains || [],
+      server1IP,
+      server2IP
+    );
+    if (dkimCross.ok) {
+      results.push(
+        `✓ DKIM keys match S1↔S2 across all ${job.sending_domains?.length || 0} sending domain(s)`
+      );
+    } else {
+      for (const issue of dkimCross.issues) {
+        failures.push(`✗ ${issue}`);
+      }
+    }
+  } catch (err) {
+    failures.push(
+      `✗ DKIM cross-server check threw: ${err instanceof Error ? err.message : String(err)}`
     );
   }
 

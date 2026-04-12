@@ -808,18 +808,17 @@ export function createPairProvisioningSaga(
             // keypair on every server it runs v-add-mail-domain-dkim on.
             // After createMailDomain on both s1 and s2, the two servers
             // hold different private keys while the DNS TXT only has s1's.
-            // Replicate s1's dkim.private.pem + dkim.public.pem to s2 so
+            // Replicate s1's dkim.pem + hestia metadata to s2 so
             // both Exim instances sign with the same key the DNS publishes.
-            try {
-              await replicateDKIMKeysToSecondary(ssh1, ssh2, domain);
-              context.log(
-                `[Step 6] Replicated DKIM keys for ${domain} from S1 to S2 (Hard Lesson #66).`
-              );
-            } catch (dkimErr) {
-              context.log(
-                `[Step 6] Warning: DKIM key replication for ${domain}: ${dkimErr instanceof Error ? dkimErr.message : String(dkimErr)}`
-              );
-            }
+            //
+            // Hard Lesson #68 (Test #16): PATCH 4 shipped with wrong paths
+            // and the error was swallowed here — unconditional "Replicated"
+            // log masked the silent failure. Now we RE-THROW so step 6 fails
+            // fast if DKIM replication cannot land. Do NOT add a catch here.
+            await replicateDKIMKeysToSecondary(ssh1, ssh2, domain);
+            context.log(
+              `[Step 6] Replicated DKIM keys for ${domain} from S1 to S2 (Hard Lesson #66/#68).`
+            );
           }
 
           // rndc reload on both servers
@@ -1108,30 +1107,122 @@ export function createPairProvisioningSaga(
             }
           }
 
-          // Check SPF/DKIM/DMARC on sending domains
+          // PATCH 6 / Hard Lesson #68: VG previously only checked "contains
+          // v=spf1" / "contains v=DMARC1" which false-greens when there are
+          // duplicates on the zone. The 12-row success bar requires EXACTLY
+          // ONE SPF and EXACTLY ONE DMARC TXT per sending domain. Also check
+          // DKIM TXT is publishable (row 9), port 25 banner (row 10), and
+          // the critical DKIM sha256 cross-server match (row 11).
           for (const domain of context.sendingDomains) {
+            // Row 7: SPF exactly 1
             try {
               const { stdout: spf } = await ssh1.exec(
                 `dig @8.8.8.8 ${domain} TXT +short 2>/dev/null`,
                 { timeout: 10000 }
               );
-              if (!spf.includes('v=spf1')) {
+              const spfCount = (spf.match(/v=spf1/gi) || []).length;
+              if (spfCount === 0) {
                 failures.push(`${domain}: missing SPF record`);
+              } else if (spfCount > 1) {
+                failures.push(`${domain}: ${spfCount} SPF records (expected exactly 1)`);
               }
             } catch {
               failures.push(`${domain}: SPF check failed`);
             }
 
+            // Row 8: DMARC exactly 1
             try {
               const { stdout: dmarc } = await ssh1.exec(
                 `dig @8.8.8.8 _dmarc.${domain} TXT +short 2>/dev/null`,
                 { timeout: 10000 }
               );
-              if (!dmarc.includes('v=DMARC1')) {
+              const dmarcCount = (dmarc.match(/v=DMARC1/gi) || []).length;
+              if (dmarcCount === 0) {
                 failures.push(`${domain}: missing DMARC record`);
+              } else if (dmarcCount > 1) {
+                failures.push(`${domain}: ${dmarcCount} DMARC records (expected exactly 1)`);
               }
             } catch {
               failures.push(`${domain}: DMARC check failed`);
+            }
+
+            // Row 9: DKIM TXT published and parseable
+            try {
+              const { stdout: dkimTxt } = await ssh1.exec(
+                `dig @8.8.8.8 mail._domainkey.${domain} TXT +short 2>/dev/null`,
+                { timeout: 10000 }
+              );
+              if (!/v=DKIM1/i.test(dkimTxt) || !/p=[A-Za-z0-9+/]{50,}/.test(dkimTxt.replace(/\s|"/g, ''))) {
+                failures.push(`${domain}: DKIM TXT missing or pubkey too short`);
+              }
+            } catch {
+              failures.push(`${domain}: DKIM TXT check failed`);
+            }
+
+            // Row 11: DKIM PRIVATE key sha256 match S1 ↔ S2. This is the
+            // check that Test #16 completely lacked — silent replication
+            // failure false-greened the test. See Hard Lesson #68.
+            try {
+              const dkimPath = `/home/admin/conf/mail/${domain}/dkim.pem`;
+              const { stdout: h1raw } = await ssh1.exec(
+                `sha256sum ${dkimPath} 2>/dev/null | cut -d' ' -f1 || echo NOT_FOUND`,
+                { timeout: 10000 }
+              );
+              const { stdout: h2raw } = await ssh2.exec(
+                `sha256sum ${dkimPath} 2>/dev/null | cut -d' ' -f1 || echo NOT_FOUND`,
+                { timeout: 10000 }
+              );
+              const h1 = (h1raw || '').trim();
+              const h2 = (h2raw || '').trim();
+              if (h1 === 'NOT_FOUND' || !h1) {
+                failures.push(`${domain}: DKIM key missing on S1 (${dkimPath})`);
+              } else if (h2 === 'NOT_FOUND' || !h2) {
+                failures.push(`${domain}: DKIM key missing on S2 (${dkimPath})`);
+              } else if (h1 !== h2) {
+                failures.push(
+                  `${domain}: DKIM mismatch S1↔S2 (s1=${h1.slice(0, 8)}… s2=${h2.slice(0, 8)}…)`
+                );
+              } else {
+                context.log(`[Step 8] OK: DKIM match S1↔S2 for ${domain} (${h1.slice(0, 8)}…)`);
+              }
+            } catch (err) {
+              failures.push(`${domain}: DKIM sha256 cross-check failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
+
+          // Row 10: Port 25 open + SMTP banner from both servers
+          for (const [ip, hostname] of [
+            [server1IP, `mail1.${context.nsDomain}`],
+            [server2IP, `mail2.${context.nsDomain}`],
+          ]) {
+            try {
+              const { stdout: banner } = await ssh1.exec(
+                `timeout 6 bash -c "exec 3<>/dev/tcp/${ip}/25; head -c 200 <&3; exec 3<&-" 2>/dev/null || echo TIMEOUT`,
+                { timeout: 10000 }
+              );
+              if (/TIMEOUT/.test(banner) || !/220[\s-]/.test(banner)) {
+                failures.push(`${hostname} (${ip}): port 25 no 220 banner`);
+              }
+            } catch {
+              failures.push(`${hostname} (${ip}): port 25 check failed`);
+            }
+          }
+
+          // Rows 4/5: LE cert CN on hostnames via SNI
+          for (const hostname of [
+            `mail1.${context.nsDomain}`,
+            `mail2.${context.nsDomain}`,
+          ]) {
+            try {
+              const { stdout: certCn } = await ssh1.exec(
+                `timeout 8 bash -lc "echo | openssl s_client -servername ${hostname} -connect ${hostname}:443 2>/dev/null | openssl x509 -noout -subject 2>/dev/null" || echo FAIL`,
+                { timeout: 15000 }
+              );
+              if (/FAIL/.test(certCn) || !certCn.includes(hostname)) {
+                failures.push(`${hostname}: LE cert CN does not match (got: ${certCn.trim().slice(0, 100)})`);
+              }
+            } catch {
+              failures.push(`${hostname}: LE cert check failed`);
             }
           }
 
@@ -1177,10 +1268,14 @@ export function createPairProvisioningSaga(
               metadata: { verificationWarnings: warnings },
             };
           } else {
+            // PATCH 6: bar failures are now FATAL. Previous behavior was
+            // success=true+manualRequired=true which caused Test #16 to
+            // false-green a broken DKIM pair. The saga still completes
+            // physically (servers are alive) but the job is marked failed
+            // so nobody pushes this pair into Snov.io without knowing.
             return {
-              success: true,
-              manualRequired: true,
-              output: `Verification completed with ${failures.length} issues:\n${failures.join('\n')}${warningsText}`,
+              success: false,
+              error: `Verification failed with ${failures.length} issue(s):\n${failures.join('\n')}${warningsText}`,
               metadata: {
                 verificationFailures: failures,
                 verificationWarnings: warnings,

@@ -63,6 +63,16 @@ write_files:
       127.0.1.1 ${hostname}
     append: false
 
+packages:
+  # Hard Lesson #67 (Test #16, 2026-04-11): dnsutils ships \`dig\`, which
+  # the worker bridge uses from the verification gate and the
+  # await_dns_propagation step. On a fresh Linode minimal image \`dig\`
+  # is not installed, causing execAsync to throw ENOENT. The catch
+  # silently returned null and Step 4 deadlocked for the 75-min timeout.
+  # Always pre-install dnsutils so later steps can rely on dig being
+  # available on the pair.
+  - dnsutils
+
 runcmd:
   # Set hostname using hostnamectl
   - hostnamectl set-hostname ${hostname}

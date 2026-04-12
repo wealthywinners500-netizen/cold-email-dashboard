@@ -496,6 +496,55 @@ export async function createMailDomain(
     )
     .catch(() => { /* tolerate */ });
 
+  // PATCH 6 (Hard Lesson #68 follow-up): verify the dedupe actually
+  // succeeded. If a delete failed and we still have >1 SPF or >1 DMARC
+  // after the canonical re-add, throw — MXToolbox will flag this as
+  // "Multiple SPF Records" on row #7 of the success bar.
+  try {
+    interface DnsRecRechecked {
+      RECORD: string;
+      TYPE: string;
+      VALUE: string;
+    }
+    const { stdout: recheckOut } = await ssh.exec(
+      `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} json 2>/dev/null || echo '{}'`,
+      { timeout: 10000 }
+    );
+    let rechecked: Record<string, DnsRecRechecked> = {};
+    try {
+      rechecked = JSON.parse(recheckOut) as Record<string, DnsRecRechecked>;
+    } catch {
+      rechecked = {};
+    }
+    const spfCount = Object.values(rechecked).filter(
+      (rec) =>
+        rec.TYPE === "TXT" && rec.RECORD === "@" && /v=spf1/i.test(rec.VALUE)
+    ).length;
+    const dmarcCount = Object.values(rechecked).filter(
+      (rec) =>
+        rec.TYPE === "TXT" &&
+        rec.RECORD === "_dmarc" &&
+        /v=DMARC1/i.test(rec.VALUE)
+    ).length;
+    if (spfCount > 1) {
+      throw new Error(
+        `createMailDomain: SPF dedupe failed for ${domain} — still ${spfCount} SPF records after cleanup`
+      );
+    }
+    if (dmarcCount > 1) {
+      throw new Error(
+        `createMailDomain: DMARC dedupe failed for ${domain} — still ${dmarcCount} DMARC records after cleanup`
+      );
+    }
+    // eslint-disable-next-line no-console
+    console.log(
+      `[createMailDomain] ${domain}: SPF=${spfCount} DMARC=${dmarcCount} (dedupe verified)`
+    );
+  } catch (err) {
+    if (err instanceof Error && /dedupe failed/.test(err.message)) throw err;
+    // Listing error is non-fatal — caller/VG will catch it.
+  }
+
   // Create mail accounts
   await ensureMailAccounts(ssh, domain, accounts, escapedPassword);
 
@@ -926,18 +975,52 @@ export async function replicateSSLCertToSecondary(
   // 3. Rebuild the web + mail domain on S2 so it picks up the new
   //    cert files. v-rebuild-web-domain regenerates nginx/apache
   //    confs; v-rebuild-mail-domain regenerates exim's TLS config.
-  await ssh2
-    .exec(
+  // PATCH 6: these were silently catching errors before. If the rebuild
+  // fails, the cert files are on disk but Exim/nginx never load them —
+  // a silent false-green. Fail fast instead.
+  try {
+    await ssh2.exec(
       `bash -lc "${HESTIA_FULL_PATH} && v-rebuild-web-domain admin ${domain}"`,
       { timeout: 60000 }
-    )
-    .catch(() => { /* tolerate if web wasn't web-enabled */ });
-  await ssh2
-    .exec(
+    );
+  } catch (err) {
+    throw new Error(
+      `replicateSSLCertToSecondary: v-rebuild-web-domain failed on S2 for ${domain}: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  try {
+    await ssh2.exec(
       `bash -lc "${HESTIA_FULL_PATH} && v-rebuild-mail-domain admin ${domain}"`,
       { timeout: 60000 }
-    )
-    .catch(() => { /* tolerate */ });
+    );
+  } catch (err) {
+    throw new Error(
+      `replicateSSLCertToSecondary: v-rebuild-mail-domain failed on S2 for ${domain}: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+
+  // 4. End-of-step verification: read cert CN from S2 and confirm it
+  //    matches the domain we just replicated. If openssl can't parse
+  //    the file, the write or rebuild broke something we need to know.
+  try {
+    const { stdout: certSubject } = await ssh2.exec(
+      `openssl x509 -in ${certDir}/${domain}.crt -noout -subject 2>/dev/null || echo "CN=UNVERIFIED"`,
+      { timeout: 10000 }
+    );
+    if (!certSubject || /UNVERIFIED/.test(certSubject)) {
+      throw new Error(
+        `replicateSSLCertToSecondary: openssl could not parse cert on S2 for ${domain}`
+      );
+    }
+    // eslint-disable-next-line no-console
+    console.log(
+      `[replicateSSLCertToSecondary] ${domain}: S2 cert loaded — ${certSubject.trim()}`
+    );
+  } catch (err) {
+    throw new Error(
+      `replicateSSLCertToSecondary: S2 cert verification failed for ${domain}: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
 }
 
 // ============================================
@@ -1002,25 +1085,29 @@ export async function replicateDKIMKeysToSecondary(
       );
       b64Content = (stdout || '').trim();
     } catch (err) {
+      // Read failure on S1 is fatal for the critical file, non-fatal
+      // for hestia metadata (which we can fix via v-rebuild-mail-domain).
+      if (srcPath === eximDkimPath) {
+        throw new Error(
+          `[replicateDKIMKeysToSecondary] CRITICAL: read ${srcPath} on S1 failed for ${domain}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
       // eslint-disable-next-line no-console
       console.warn(
-        `[replicateDKIMKeysToSecondary] read ${srcPath} on S1 failed for ${domain}: ${err instanceof Error ? err.message : String(err)}`
+        `[replicateDKIMKeysToSecondary] read ${srcPath} on S1 failed (non-critical, metadata): ${err instanceof Error ? err.message : String(err)}`
       );
       continue;
     }
 
     if (b64Content === 'MISSING' || !b64Content) {
-      // Expected for the hestia .pub sometimes; only critical if dkim.pem is missing.
       if (srcPath === eximDkimPath) {
-        // eslint-disable-next-line no-console
-        console.warn(
-          `[replicateDKIMKeysToSecondary] CRITICAL: ${srcPath} not present on S1 for ${domain} — DKIM mismatch will occur. Skipping replication.`
+        throw new Error(
+          `[replicateDKIMKeysToSecondary] CRITICAL: ${srcPath} not present on S1 for ${domain} — DKIM will mismatch. Fail fast (Hard Lesson #68).`
         );
-        return;
       }
       // eslint-disable-next-line no-console
       console.warn(
-        `[replicateDKIMKeysToSecondary] ${srcPath} not present on S1 for ${domain} — skipping (non-critical)`
+        `[replicateDKIMKeysToSecondary] ${srcPath} not present on S1 for ${domain} — skipping (non-critical metadata)`
       );
       continue;
     }
@@ -1033,11 +1120,24 @@ export async function replicateDKIMKeysToSecondary(
       );
       replicated += 1;
     } catch (err) {
+      // PATCH 6 (Hard Lesson #68 follow-up): write failures on S2 are
+      // fatal for the critical file — do NOT silently continue.
+      if (srcPath === eximDkimPath) {
+        throw new Error(
+          `[replicateDKIMKeysToSecondary] CRITICAL: write ${dstPath} on S2 failed for ${domain}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
       // eslint-disable-next-line no-console
       console.warn(
-        `[replicateDKIMKeysToSecondary] write ${dstPath} on S2 failed for ${domain}: ${err instanceof Error ? err.message : String(err)}`
+        `[replicateDKIMKeysToSecondary] write ${dstPath} on S2 failed (non-critical metadata): ${err instanceof Error ? err.message : String(err)}`
       );
     }
+  }
+
+  if (replicated === 0) {
+    throw new Error(
+      `[replicateDKIMKeysToSecondary] ${domain}: CRITICAL — no files replicated S1→S2.`
+    );
   }
 
   // eslint-disable-next-line no-console
@@ -1047,18 +1147,30 @@ export async function replicateDKIMKeysToSecondary(
 
   // Rebuild the mail domain on s2 so Hestia reconciles the metadata,
   // then restart exim4 so the new DKIM_FILE is picked up.
-  await ssh2
-    .exec(
+  // PATCH 6: rebuild failures are fatal — silent catch masked bugs previously.
+  try {
+    await ssh2.exec(
       `bash -lc "${HESTIA_FULL_PATH} && v-rebuild-mail-domain admin ${domain}"`,
       { timeout: 60000 }
-    )
-    .catch(() => { /* tolerate */ });
-  await ssh2
-    .exec(`systemctl restart exim4`, { timeout: 30000 })
-    .catch(() => { /* tolerate */ });
+    );
+  } catch (err) {
+    throw new Error(
+      `[replicateDKIMKeysToSecondary] v-rebuild-mail-domain failed on S2 for ${domain}: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  try {
+    await ssh2.exec(`systemctl restart exim4`, { timeout: 30000 });
+  } catch (err) {
+    throw new Error(
+      `[replicateDKIMKeysToSecondary] exim4 restart failed on S2 for ${domain}: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
 
-  // Verification — sha256sum s1 vs s2 on the Exim-readable path. Log the
-  // result so Test #16+ forensics can grep for "DKIM match" or "DKIM mismatch".
+  // Verification — sha256sum s1 vs s2 on the Exim-readable path.
+  // PATCH 6: mismatch is now FATAL (was warning-only). If this throws,
+  // step 6 fails and the job is marked failed instead of false-greened.
+  let h1 = '';
+  let h2 = '';
   try {
     const { stdout: h1raw } = await ssh1.exec(
       `sha256sum ${eximDkimPath} | cut -d' ' -f1`,
@@ -1068,25 +1180,22 @@ export async function replicateDKIMKeysToSecondary(
       `sha256sum ${eximDkimPath} | cut -d' ' -f1`,
       { timeout: 10000 }
     );
-    const h1 = (h1raw || '').trim();
-    const h2 = (h2raw || '').trim();
-    if (h1 && h1 === h2) {
-      // eslint-disable-next-line no-console
-      console.log(
-        `[replicateDKIMKeysToSecondary] ${domain}: DKIM match S1↔S2 (${h1})`
-      );
-    } else {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[replicateDKIMKeysToSecondary] ${domain}: DKIM mismatch S1↔S2 (s1=${h1}, s2=${h2})`
-      );
-    }
+    h1 = (h1raw || '').trim();
+    h2 = (h2raw || '').trim();
   } catch (err) {
-    // eslint-disable-next-line no-console
-    console.warn(
+    throw new Error(
       `[replicateDKIMKeysToSecondary] ${domain}: verification sha256sum failed: ${err instanceof Error ? err.message : String(err)}`
     );
   }
+  if (!h1 || !h2 || h1 !== h2) {
+    throw new Error(
+      `[replicateDKIMKeysToSecondary] ${domain}: DKIM mismatch S1↔S2 after replication (s1=${h1}, s2=${h2})`
+    );
+  }
+  // eslint-disable-next-line no-console
+  console.log(
+    `[replicateDKIMKeysToSecondary] ${domain}: DKIM match S1↔S2 (${h1})`
+  );
 }
 
 // ============================================
