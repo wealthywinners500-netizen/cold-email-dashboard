@@ -237,6 +237,14 @@ async function cleanupDNSZoneDefaults(
     if (record.type === 'NS' && !record.value.includes(nsDomain)) {
       await ssh.exec(`${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${record.id}`, { timeout: 10000 });
     }
+
+    // Hard Lesson #73: Remove HestiaCP auto-generated root SPF
+    // v-add-dns-domain creates a default SPF with only s1's IP.
+    // ensureDNSRecords will add the correct both-IP SPF for NS domains,
+    // and createMailDomain will add it for sending domains in Step 6.
+    if (record.type === 'TXT' && record.host === '@' && record.value.toLowerCase().includes('v=spf1')) {
+      await ssh.exec(`${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${record.id}`, { timeout: 10000 });
+    }
   }
 
   // Hard Lesson #13: Fix SOA MNAME to ns1.NSDOMAIN
@@ -284,6 +292,13 @@ async function ensureDNSRecords(
     requiredRecords.push(
       { type: 'A', host: 'ns1', value: server1IP },
       { type: 'A', host: 'ns2', value: server2IP }
+    );
+    // Hard Lesson #73: NS domain root SPF must include both server IPs.
+    // HestiaCP auto-generates a root SPF with only s1's IP during
+    // v-add-dns-domain. cleanupDNSZoneDefaults deletes it, and we add
+    // the correct one here with both IPs for HELO SPF alignment.
+    requiredRecords.push(
+      { type: 'TXT', host: '@', value: `"v=spf1 ip4:${server1IP} ip4:${server2IP} a mx -all"` }
     );
   }
 
