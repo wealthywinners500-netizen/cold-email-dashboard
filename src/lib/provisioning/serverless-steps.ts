@@ -219,6 +219,29 @@ export async function runConfigureRegistrar(
     );
   }
 
+  // Hard Lesson #72: Ionos 202 Accepted is async — the update can silently
+  // fail. Verify each delegation actually took effect by reading back the
+  // nameservers from the Ionos API after a short wait.
+  if (dnsRow.registrar_type === "ionos") {
+    await delay(5000); // Allow Ionos async processing
+    const { IonosRegistrar } = await import("./registrars/ionos");
+    if (registrar instanceof IonosRegistrar) {
+      for (const entry of sendingDelegation.filter((d) => d.ok)) {
+        const nsInfo = await registrar.getDomainNameservers(entry.domain);
+        const nsNames = nsInfo?.nameservers?.map((ns: { name: string }) => ns.name?.toLowerCase()) || [];
+        const hasNs1 = nsNames.some((n: string) => n?.includes(`ns1.${job.ns_domain}`));
+        const hasNs2 = nsNames.some((n: string) => n?.includes(`ns2.${job.ns_domain}`));
+        if (!hasNs1 || !hasNs2) {
+          throw new Error(
+            `Ionos NS verification failed for ${entry.domain}: expected ns1/ns2.${job.ns_domain}, ` +
+            `got [${nsNames.join(", ")}]. Ionos accepted the 202 but did not apply the update.`
+          );
+        }
+        console.log(`[configure_registrar] Ionos NS verified for ${entry.domain}: [${nsNames.join(", ")}]`);
+      }
+    }
+  }
+
   const okList =
     sendingDelegation.map((d) => d.domain).join(", ") || "(none)";
   return {
@@ -801,6 +824,17 @@ export async function runVerificationGate(
   while (Date.now() - start < VG_RETRY_MAX_MS) {
     attempt += 1;
     lastResult = await runVerificationGateOnce(jobId);
+
+    // Hard Lesson #72: per-attempt logging so journalctl shows progress
+    // (27 attempts with zero output looks like a hang)
+    const failCount = lastResult.failures?.length || 0;
+    const passCount = lastResult.results?.length || 0;
+    const failNames = lastResult.failures?.map((f: string) => f.split(':')[0]).join(', ') || 'none';
+    console.log(
+      `[VG] attempt ${attempt}: ${passCount} passed, ${failCount} failing (${failNames}). ` +
+      `Elapsed ${Math.round((Date.now() - start) / 1000)}s / ${Math.round(VG_RETRY_MAX_MS / 1000)}s max.`
+    );
+
     if (lastResult.ok) {
       const duration = Math.round((Date.now() - start) / 1000);
       return {

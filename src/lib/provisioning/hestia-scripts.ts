@@ -67,6 +67,9 @@ export interface CreateMailDomainParams {
   accounts: string[];
   password: string;
   adminEmail?: string | null;
+  /** Both server IPs required for SPF — Hard Lesson #72 */
+  server1IP?: string;
+  server2IP?: string;
 }
 
 export interface CreateMailDomainResult {
@@ -343,7 +346,7 @@ export async function createMailDomain(
   ssh: SSHManager,
   params: CreateMailDomainParams
 ): Promise<CreateMailDomainResult> {
-  const { domain, accounts, password, adminEmail } = params;
+  const { domain, accounts, password, adminEmail, server1IP, server2IP } = params;
   const escapedPassword = password.replace(/'/g, "'\\''");
 
   // Check if mail domain already exists (idempotent)
@@ -481,9 +484,16 @@ export async function createMailDomain(
   }
 
   // Add canonical SPF TXT record (single source of truth).
+  // Hard Lesson #72: SPF must explicitly include ip4: for BOTH server IPs.
+  // The `a` mechanism only resolves to s1 (the A record), and `mx` covers
+  // mail1 (s1) but NOT mail2 (s2). Without explicit ip4: for s2, any mail
+  // sent from s2 fails SPF.
+  const spfValue = (server1IP && server2IP)
+    ? `v=spf1 ip4:${server1IP} ip4:${server2IP} a mx -all`
+    : `v=spf1 +a +mx -all`;
   await ssh
     .exec(
-      `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ TXT '"v=spf1 +a +mx -all"'`,
+      `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ TXT '"${spfValue}"'`,
       { timeout: 10000 }
     )
     .catch(() => { /* tolerate idempotent re-add */ });

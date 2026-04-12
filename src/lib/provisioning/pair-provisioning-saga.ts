@@ -751,6 +751,9 @@ export function createPairProvisioningSaga(
         context.log('[Step 6] Setting up mail domains...');
         const ctx = ctxMeta(context);
         const password = (ctx.serverPassword as string) || 'changeme123';
+        // Hard Lesson #72: both IPs needed for SPF records
+        const s1IP = (ctx.server1IP as string) || context.server1?.ip || '';
+        const s2IP = (ctx.server2IP as string) || context.server2?.ip || '';
 
         try {
           // Generate account names
@@ -783,6 +786,8 @@ export function createPairProvisioningSaga(
               accounts,
               password,
               adminEmail: context.adminEmail,
+              server1IP: s1IP,
+              server2IP: s2IP,
             });
 
             dkimRecords[domain] = result.dkimRecord;
@@ -797,6 +802,8 @@ export function createPairProvisioningSaga(
                 accounts,
                 password,
                 adminEmail: context.adminEmail,
+                server1IP: s1IP,
+                server2IP: s2IP,
               });
             } catch (err) {
               context.log(

@@ -4,6 +4,8 @@ const nextConfig: NextConfig = {
   // Use standalone output to disable static site generation
   // This prevents Clerk validation errors during builds with test keys
   output: 'standalone',
+  // Hard Lesson #72: ssh2 native .node binaries break webpack; externalize them
+  serverExternalPackages: ['ssh2', 'node-ssh', 'cpu-features'],
   async headers() {
     return [
       {
