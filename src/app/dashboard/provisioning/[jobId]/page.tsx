@@ -39,6 +39,7 @@ const STEP_NAMES: Record<StepType, string> = {
   create_vps: "Create VPS Pair",
   install_hestiacp: "Install HestiaCP",
   configure_registrar: "Configure DNS Registrar",
+  await_dns_propagation: "Await DNS Propagation",
   setup_dns_zones: "Setup DNS Zones",
   set_ptr: "Set PTR Records",
   setup_mail_domains: "Setup Mail Domains",

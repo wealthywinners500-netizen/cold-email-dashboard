@@ -18,11 +18,12 @@ const SERVERLESS_STEPS: StepType[] = [
   "verification_gate",
 ];
 
-// Steps that require SSH — dispatch to worker VPS
-// Order: create_vps(1), install_hestiacp(2), setup_dns_zones(4), setup_mail_domains(6), security_hardening(7)
+// Steps that require SSH or long-running polls — dispatch to worker VPS
+// Order: create_vps(1), install_hestiacp(2), await_dns_propagation(4), setup_dns_zones(5), setup_mail_domains(7), security_hardening(8)
 const WORKER_STEPS: StepType[] = [
   "create_vps",
   "install_hestiacp",
+  "await_dns_propagation",
   "setup_dns_zones",
   "setup_mail_domains",
   "security_hardening",
