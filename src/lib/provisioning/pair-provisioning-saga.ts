@@ -40,6 +40,8 @@ import type {
 import type { SagaStep, StepResult } from './saga-engine';
 import { checkSubnetDiversity } from './verification';
 import { checkDomainsBlacklistBatch } from './domain-blacklist';
+import { checkPort25 } from './checks/port25';
+import { checkMXToolboxHealth } from './checks/mxtoolbox-health';
 
 // Helper to access dynamic metadata on context safely
 function ctxMeta(context: ProvisioningContext): Record<string, unknown> {
@@ -1471,6 +1473,72 @@ export function createPairProvisioningSaga(
                 // Query failure means not listed — that's good
               }
             }
+          }
+
+          // --- PATCH 12: SMTP Port 25 checks (STARTTLS, banner, open relay) ---
+          context.log('[Step 8] Checking SMTP port 25 (STARTTLS, banner, open relay)...');
+          for (const [ip, hostname] of [
+            [server1IP, `mail1.${context.nsDomain}`],
+            [server2IP, `mail2.${context.nsDomain}`],
+          ] as [string, string][]) {
+            try {
+              const port25Result = await checkPort25(ip, hostname, 15_000);
+              if (!port25Result.ok) {
+                failures.push(`SMTP: Port 25 unreachable on ${hostname} (${ip}): ${port25Result.error}`);
+              } else {
+                context.log(`[Step 8] OK: Port 25 ${hostname} (${ip}) — banner: ${port25Result.banner?.slice(0, 60)}`);
+                if (!port25Result.starttls) {
+                  warnings.push({
+                    code: 'STARTTLS_MISSING',
+                    message: `STARTTLS not offered on ${hostname} (${ip}):25`,
+                    remediation: 'Check Exim4 TLS configuration — ensure tls_advertise_hosts = * in exim4.conf.template',
+                  });
+                }
+                if (!port25Result.bannerHostnameMatch) {
+                  warnings.push({
+                    code: 'BANNER_MISMATCH',
+                    message: `SMTP banner hostname mismatch on ${hostname} (${ip}) — banner: ${port25Result.banner}`,
+                    remediation: 'Check /etc/mailname and Exim4 primary_hostname config',
+                  });
+                }
+                if (port25Result.openRelay) {
+                  failures.push(`SMTP: ${hostname} (${ip}) is an OPEN RELAY — critical security issue`);
+                }
+              }
+            } catch (err) {
+              context.log(`[Step 8] SMTP check failed for ${hostname}: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
+
+          // --- PATCH 12: MXToolbox Domain Health (gold standard) ---
+          context.log('[Step 8] Running MXToolbox Domain Health check...');
+          try {
+            const mxReport = await checkMXToolboxHealth(
+              allDomains,
+              { server1IP, server2IP },
+              context.nsDomain
+            );
+            if (mxReport.ok) {
+              context.log(`[Step 8] ✓ MXToolbox Domain Health: ALL ${allDomains.length} domains clean [source: ${mxReport.source}]`);
+            } else {
+              for (const d of mxReport.domains) {
+                for (const detail of d.errorDetails) {
+                  failures.push(`MXToolbox ${d.domain}: ${detail}`);
+                }
+                for (const detail of d.warningDetails) {
+                  warnings.push({
+                    code: 'MXTOOLBOX_WARNING',
+                    message: `MXToolbox ${d.domain}: ${detail}`,
+                  });
+                }
+              }
+            }
+          } catch (err) {
+            // MXToolbox check failure is non-blocking
+            warnings.push({
+              code: 'MXTOOLBOX_UNAVAILABLE',
+              message: `MXToolbox check failed: ${err instanceof Error ? err.message : String(err)}`,
+            });
           }
 
           const warningsText = warnings.length > 0

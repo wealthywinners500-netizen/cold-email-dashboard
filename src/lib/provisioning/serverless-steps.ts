@@ -39,6 +39,7 @@ import type {
 import { DNSVerifier } from "@/lib/provisioning/verification";
 import { checkPort25 } from "@/lib/provisioning/checks/port25";
 import { checkSSLCert } from "@/lib/provisioning/checks/ssl-cn";
+import { checkMXToolboxHealth } from "@/lib/provisioning/checks/mxtoolbox-health";
 import { SSHManager } from "@/lib/provisioning/ssh-manager";
 import { promises as dnsPromises } from "dns";
 import { exec as execCb } from "child_process";
@@ -775,6 +776,22 @@ async function runVerificationGateOnce(jobId: string): Promise<{
     results.push(
       `✓ Port 25 mail1 (${server1IP}): ${port25s1.banner?.slice(0, 80)}`
     );
+    // PATCH 12: STARTTLS, banner hostname, open relay checks
+    if (!port25s1.starttls) {
+      warnings.push(`⚠ STARTTLS not offered on mail1 (${server1IP}):25`);
+    } else {
+      results.push(`✓ STARTTLS offered on mail1 (${server1IP})`);
+    }
+    if (!port25s1.bannerHostnameMatch) {
+      warnings.push(`⚠ SMTP banner hostname mismatch on mail1 — expected mail1.${job.ns_domain}`);
+    } else {
+      results.push(`✓ SMTP banner hostname matches mail1.${job.ns_domain}`);
+    }
+    if (port25s1.openRelay) {
+      failures.push(`✗ OPEN RELAY on mail1 (${server1IP}) — critical security issue`);
+    } else {
+      results.push(`✓ Open relay test PASSED on mail1 (${server1IP}) — relay denied`);
+    }
   } else {
     failures.push(`✗ Port 25 mail1 (${server1IP}): ${port25s1.error}`);
   }
@@ -784,6 +801,22 @@ async function runVerificationGateOnce(jobId: string): Promise<{
     results.push(
       `✓ Port 25 mail2 (${server2IP}): ${port25s2.banner?.slice(0, 80)}`
     );
+    // PATCH 12: STARTTLS, banner hostname, open relay checks
+    if (!port25s2.starttls) {
+      warnings.push(`⚠ STARTTLS not offered on mail2 (${server2IP}):25`);
+    } else {
+      results.push(`✓ STARTTLS offered on mail2 (${server2IP})`);
+    }
+    if (!port25s2.bannerHostnameMatch) {
+      warnings.push(`⚠ SMTP banner hostname mismatch on mail2 — expected mail2.${job.ns_domain}`);
+    } else {
+      results.push(`✓ SMTP banner hostname matches mail2.${job.ns_domain}`);
+    }
+    if (port25s2.openRelay) {
+      failures.push(`✗ OPEN RELAY on mail2 (${server2IP}) — critical security issue`);
+    } else {
+      results.push(`✓ Open relay test PASSED on mail2 (${server2IP}) — relay denied`);
+    }
   } else {
     failures.push(`✗ Port 25 mail2 (${server2IP}): ${port25s2.error}`);
   }
@@ -900,6 +933,46 @@ async function runVerificationGateOnce(jobId: string): Promise<{
         `✓ /24 subnet diverse: ${s1Octets.slice(0, 3).join(".")}.0/24 vs ${s2Octets.slice(0, 3).join(".")}.0/24`
       );
     }
+  }
+
+  // === FINAL CHECK: MXToolbox Domain Health (the gold standard) ===
+  // This runs AFTER all our internal checks pass. If MXToolbox disagrees
+  // with our assessment, the VG fails — MXToolbox is always right.
+  // Uses MXToolbox API if MXTOOLBOX_API_KEY is set, otherwise runs our
+  // own comprehensive internal checks that mirror MXToolbox's categories.
+  try {
+    const allDomains = [job.ns_domain, ...(job.sending_domains || [])];
+    const mxReport = await checkMXToolboxHealth(
+      allDomains,
+      { server1IP, server2IP },
+      job.ns_domain
+    );
+
+    if (mxReport.ok) {
+      results.push(
+        `✓ MXToolbox Domain Health: ALL ${allDomains.length} domains clean (0 errors, 0 warnings) [source: ${mxReport.source}]`
+      );
+    } else {
+      for (const d of mxReport.domains) {
+        if (d.errors > 0) {
+          for (const detail of d.errorDetails) {
+            failures.push(`✗ MXToolbox ${d.domain}: ${detail}`);
+          }
+        }
+        if (d.warnings > 0) {
+          for (const detail of d.warningDetails) {
+            warnings.push(`⚠ MXToolbox ${d.domain}: ${detail}`);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    // MXToolbox check failure is a WARNING, not a hard fail —
+    // we don't want MXToolbox being down to block provisioning.
+    // Our internal checks already passed above.
+    warnings.push(
+      `⚠ MXToolbox check failed (non-blocking): ${err instanceof Error ? err.message : String(err)}`
+    );
   }
 
   return {
