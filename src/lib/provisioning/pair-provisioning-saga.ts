@@ -875,6 +875,59 @@ export function createPairProvisioningSaga(
             }
           }
 
+          // PATCH 10c: Fix @ A record and MX for S2 domains
+          // ensureDNSRecords (Step 4) sets ALL domains' @ A → server1IP.
+          // S2 domains need @ A → server2IP so LE HTTP-01 validation hits S2
+          // (where the ACME challenge file lives). MX also needs to point to
+          // mail2.domain (S2's mail handler) instead of mail1.domain (S1).
+          // Fix on BOTH servers since both serve DNS (ns1/ns2 authoritative).
+          context.log('[Step 6] Fixing @ A and MX records for S2 domains on both DNS servers...');
+          for (const domain of server2Domains) {
+            for (const [sshConn, label] of [[ssh1, 'S1'], [ssh2, 'S2']] as [typeof ssh1, string][]) {
+              try {
+                const { stdout: records } = await sshConn.exec(
+                  `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+                  { timeout: 15000 }
+                );
+                const lines = records.split('\n');
+                for (const line of lines) {
+                  const cols = line.trim().split(/\s+/);
+                  if (cols.length < 4) continue;
+                  const [recordId, type, host, value] = cols;
+                  if (!/^\d+$/.test(recordId)) continue;
+
+                  // Delete @ A record pointing to server1IP (wrong for S2 domains)
+                  if (type === 'A' && host === '@' && value === server1IP) {
+                    await sshConn.exec(
+                      `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${recordId}`,
+                      { timeout: 10000 }
+                    ).catch(() => {});
+                  }
+                  // Delete MX record pointing to mail1 (wrong for S2 domains)
+                  if (type === 'MX' && host === '@' && value.startsWith('mail1.')) {
+                    await sshConn.exec(
+                      `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${recordId}`,
+                      { timeout: 10000 }
+                    ).catch(() => {});
+                  }
+                }
+                // Add correct @ A → server2IP
+                await sshConn.exec(
+                  `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ A ${server2IP}`,
+                  { timeout: 10000 }
+                );
+                // Add correct MX → mail2.domain
+                await sshConn.exec(
+                  `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ MX mail2.${domain} 10`,
+                  { timeout: 10000 }
+                );
+              } catch (err) {
+                context.log(`[Step 6] Warning: A/MX fix for ${domain} on ${label}: ${err}`);
+              }
+            }
+            context.log(`[Step 6] A/MX fixed for ${domain}: @ A → ${server2IP}, MX → mail2.${domain}`);
+          }
+
           // rndc reload on both servers
           await ssh1.exec('rndc reload', { timeout: 10000 }).catch(() => {});
           await ssh2.exec('rndc reload', { timeout: 10000 }).catch(() => {});
@@ -1134,6 +1187,42 @@ export function createPairProvisioningSaga(
             }
           }
 
+          // PATCH 10c: Verify per-server A record IP assignment
+          // S1 domains should resolve to server1IP, S2 domains to server2IP
+          const ctx8 = ctxMeta(context);
+          const s1Domains = (ctx8.server1Domains as string[]) || [];
+          const s2Domains = (ctx8.server2Domains as string[]) || [];
+          context.log(`[Step 8] Verifying per-server A record assignment: S1=${s1Domains.length}, S2=${s2Domains.length}`);
+
+          for (const domain of s1Domains) {
+            try {
+              const { stdout } = await ssh1.exec(
+                `dig @8.8.8.8 ${domain} A +short 2>/dev/null`,
+                { timeout: 10000 }
+              );
+              const ip = stdout.trim().split('\n')[0];
+              if (ip && ip !== server1IP) {
+                failures.push(`${domain}: @ A → ${ip} (expected S1 ${server1IP})`);
+              } else if (ip === server1IP) {
+                context.log(`[Step 8] OK: ${domain} @ A → ${server1IP} (S1)`);
+              }
+            } catch { /* already checked above */ }
+          }
+          for (const domain of s2Domains) {
+            try {
+              const { stdout } = await ssh1.exec(
+                `dig @8.8.8.8 ${domain} A +short 2>/dev/null`,
+                { timeout: 10000 }
+              );
+              const ip = stdout.trim().split('\n')[0];
+              if (ip && ip !== server2IP) {
+                failures.push(`${domain}: @ A → ${ip} (expected S2 ${server2IP})`);
+              } else if (ip === server2IP) {
+                context.log(`[Step 8] OK: ${domain} @ A → ${server2IP} (S2)`);
+              }
+            } catch { /* already checked above */ }
+          }
+
           // Verify PTR ↔ A ↔ HELO alignment
           for (const [ip, hostname] of [
             [server1IP, `mail1.${context.nsDomain}`],
@@ -1182,11 +1271,8 @@ export function createPairProvisioningSaga(
             }
           }
 
-          // --- PATCH 10: Per-server domain assignment verification ---
-          const ctx8 = ctxMeta(context);
-          const s1Domains = (ctx8.server1Domains as string[]) || [];
-          const s2Domains = (ctx8.server2Domains as string[]) || [];
-          context.log(`[Step 8] Verifying per-server domain split: S1=${s1Domains.length}, S2=${s2Domains.length}`);
+          // --- PATCH 10: Per-server SPF verification ---
+          // (ctx8, s1Domains, s2Domains already declared above in A-record check)
 
           // Verify SPF per-server: each sending domain's SPF should only authorize its assigned server IP
           for (const domain of s1Domains) {
