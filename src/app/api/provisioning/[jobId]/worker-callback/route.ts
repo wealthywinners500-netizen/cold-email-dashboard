@@ -284,14 +284,33 @@ export async function POST(
         const s1Domains = (mailMeta.server1Domains as string[]) || [];
 
         if (allAccounts && Object.keys(allAccounts).length > 0) {
+          // Read mail password from ssh_credentials
+          let mailPassword = "";
+          try {
+            const { data: sshCreds } = await supabase
+              .from("ssh_credentials")
+              .select("password_encrypted")
+              .eq("provisioning_job_id", jobId)
+              .limit(1)
+              .maybeSingle();
+
+            if (sshCreds?.password_encrypted) {
+              const { decrypt } = await import("@/lib/provisioning/encryption");
+              mailPassword = decrypt(sshCreds.password_encrypted);
+            }
+          } catch (decryptErr) {
+            console.error(`[WorkerCallback] Failed to decrypt mail password: ${decryptErr}`);
+          }
+
           const accountRows = [];
           for (const [domain, names] of Object.entries(allAccounts)) {
             const isS1 = s1Domains.includes(domain);
             const serverIP = isS1 ? server1IP : server2IP;
             for (const name of names) {
+              const email = `${name}@${domain}`;
               accountRows.push({
                 org_id: jobRow.org_id,
-                email: `${name}@${domain}`,
+                email,
                 display_name: name
                   .split(".")
                   .map((n: string) => n.charAt(0).toUpperCase() + n.slice(1))
@@ -299,12 +318,12 @@ export async function POST(
                 server_pair_id: serverPair.id,
                 smtp_host: serverIP,
                 smtp_port: 587,
+                smtp_user: email,
+                smtp_pass: mailPassword,
                 imap_host: serverIP,
                 imap_port: 993,
                 status: "active",
-                warmup_status: "not_started",
                 daily_send_limit: 50,
-                sends_today: 0,
               });
             }
           }

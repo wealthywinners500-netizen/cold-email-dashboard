@@ -121,7 +121,7 @@ export async function GET(
 
     const mailAccounts = accounts.map((acc) => {
       const isServer1 =
-        acc.smtp_host === serverPair.server1_ip ||
+        acc.smtp_host === serverPair.s1_ip ||
         acc.smtp_host?.includes('mail1');
       return {
         email: acc.email,
@@ -132,8 +132,8 @@ export async function GET(
 
     const csv = generateSnovioCSV({
       serverPair: {
-        server1IP: serverPair.server1_ip,
-        server2IP: serverPair.server2_ip,
+        server1IP: serverPair.s1_ip,
+        server2IP: serverPair.s2_ip,
         nsDomain: provJob.ns_domain,
       },
       sendingDomains: provJob.sending_domains,
