@@ -629,15 +629,16 @@ async function main() {
 
         // Atomic claim: only succeed if the row is still 'pending'
         // (Hard Lesson #42). If two pollers race, exactly one wins.
+        const claimTime = new Date().toISOString();
         const { data: claimed, error: claimErr } = await supabase
           .from("provisioning_steps")
           .update({
             status: "in_progress",
-            started_at: new Date().toISOString(),
+            started_at: claimTime,
             metadata: {
               dispatched_to_worker: true,
               claimed_by: "pollAdvanceableJobs",
-              claimed_at: new Date().toISOString(),
+              claimed_at: claimTime,
             },
           })
           .eq("id", next.id)
@@ -650,13 +651,46 @@ async function main() {
           continue;
         }
 
+        // Hard Lesson #77: Queue the pg-boss job directly instead of
+        // relying on pollDispatchedSteps to read metadata.dispatched_to_worker.
+        // A Supabase Realtime trigger or race condition was reproducibly
+        // clobbering metadata to {}, leaving the step stuck in in_progress
+        // with no worker pickup. Direct enqueue eliminates the two-step handoff.
+        try {
+          await boss.send("provision-step", {
+            jobId: job.id,
+            stepType: next.step_type,
+            stepId: next.id,
+          });
+
+          // Mark worker_queued so pollDispatchedSteps skips it
+          await supabase
+            .from("provisioning_steps")
+            .update({
+              metadata: {
+                dispatched_to_worker: true,
+                claimed_by: "pollAdvanceableJobs",
+                claimed_at: claimTime,
+                worker_queued: true,
+                worker_queued_at: new Date().toISOString(),
+              },
+            })
+            .eq("id", next.id);
+        } catch (queueErr) {
+          console.error(
+            `[Worker] pollAdvanceableJobs failed to queue ${next.step_type} for job ${job.id}: ${queueErr}`
+          );
+          // Step is in_progress but not queued — pollDispatchedSteps
+          // will pick it up on next tick as a fallback.
+        }
+
         // Promote job to in_progress if it was pending
         if (job.status === "pending") {
           await supabase
             .from("provisioning_jobs")
             .update({
               status: "in_progress",
-              started_at: new Date().toISOString(),
+              started_at: claimTime,
               current_step: next.step_type,
             })
             .eq("id", job.id)
