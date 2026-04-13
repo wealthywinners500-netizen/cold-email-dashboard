@@ -598,21 +598,24 @@ export default function JobDetailPage() {
                 </button>
               )}
               <button
-                onClick={() => {
-                  // Generate CSV for Snov.io import
-                  const csvRows = ["Email,First Name,Last Name"];
-                  for (const domain of job.sending_domains || []) {
-                    for (let i = 0; i < job.mail_accounts_per_domain; i++) {
-                      csvRows.push(`account${i + 1}@${domain},Account,${i + 1}`);
+                onClick={async () => {
+                  try {
+                    const res = await fetch(`/api/provisioning/${job.id}/csv`);
+                    if (!res.ok) {
+                      const errBody = await res.json().catch(() => ({ error: res.statusText }));
+                      alert(`CSV download failed: ${errBody.error || res.statusText}`);
+                      return;
                     }
+                    const blob = await res.blob();
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `snovio-import-${job.ns_domain}.csv`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  } catch (err) {
+                    alert(`CSV download error: ${err instanceof Error ? err.message : String(err)}`);
                   }
-                  const blob = new Blob([csvRows.join("\n")], { type: "text/csv" });
-                  const url = URL.createObjectURL(blob);
-                  const a = document.createElement("a");
-                  a.href = url;
-                  a.download = `snovio-import-${job.ns_domain}.csv`;
-                  a.click();
-                  URL.revokeObjectURL(url);
                 }}
                 className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded-lg transition-colors"
               >

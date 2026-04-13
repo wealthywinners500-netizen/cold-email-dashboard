@@ -532,6 +532,60 @@ export async function POST(
           );
         }
 
+        // Create email_accounts from setup_mail_domains metadata
+        const { data: mailStep } = await supabase
+          .from("provisioning_steps")
+          .select("metadata")
+          .eq("job_id", jobId)
+          .eq("step_type", "setup_mail_domains")
+          .single();
+
+        const mailMeta = (mailStep?.metadata as Record<string, unknown>) || {};
+        const allAccounts = mailMeta.allAccountsCreated as Record<string, string[]> | undefined;
+        const s1Domains = (mailMeta.server1Domains as string[]) || [];
+
+        if (allAccounts && Object.keys(allAccounts).length > 0) {
+          const accountRows = [];
+          for (const [domain, names] of Object.entries(allAccounts)) {
+            const isS1 = s1Domains.includes(domain);
+            const serverIP = isS1 ? server1IP : server2IP;
+            for (const name of names) {
+              accountRows.push({
+                org_id: orgId,
+                email: `${name}@${domain}`,
+                display_name: name
+                  .split(".")
+                  .map((n: string) => n.charAt(0).toUpperCase() + n.slice(1))
+                  .join(" "),
+                server_pair_id: serverPair.id,
+                smtp_host: serverIP,
+                smtp_port: 587,
+                imap_host: serverIP,
+                imap_port: 993,
+                status: "active",
+                warmup_status: "not_started",
+                daily_send_limit: 50,
+                sends_today: 0,
+              });
+            }
+          }
+
+          if (accountRows.length > 0) {
+            const { error: emailInsertErr } = await supabase
+              .from("email_accounts")
+              .insert(accountRows);
+            if (emailInsertErr) {
+              console.error(
+                `[ExecuteStep] email_accounts insert failed: ${emailInsertErr.message}`
+              );
+            } else {
+              console.log(
+                `[ExecuteStep] Inserted ${accountRows.length} email accounts for pair ${serverPair.id}`
+              );
+            }
+          }
+        }
+
         // Mark job as completed
         await supabase
           .from("provisioning_jobs")
