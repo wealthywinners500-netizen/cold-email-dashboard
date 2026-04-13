@@ -144,13 +144,19 @@ const RESOLVERS = [
   { ip: '208.67.222.222', name: 'OpenDNS' },
 ];
 
-// PATCH 10d: Removed Barracuda — it lists ~80% of Linode IPs (see Hard Lesson #74
-// and ip-blacklist-check.ts PATCH 10b). Keeping Spamhaus, SORBS, UCEPROTECT only.
+// PATCH 10d.3: Barracuda re-added as WARN-only (not a hard FAIL).
+// Barracuda lists ~80% of Linode IPs but only 0.35% market share (enterprise
+// appliances only — Gmail/Outlook don't check it). Logged for visibility but
+// won't block provisioning. Spamhaus/SORBS/UCEPROTECT remain hard FAILs.
 const IP_BLACKLISTS = [
   { zone: 'zen.spamhaus.org', name: 'Spamhaus ZEN' },
   { zone: 'dnsbl.sorbs.net', name: 'SORBS' },
   { zone: 'dnsbl-1.uceprotect.net', name: 'UCEPROTECT L1' },
+  { zone: 'b.barracudacentral.org', name: 'Barracuda' },
 ];
+
+// Barracuda is WARN-only — not checked by Gmail/Outlook (Hard Lesson #76)
+const WARN_ONLY_BLACKLISTS = new Set(['Barracuda']);
 
 const DOMAIN_BLACKLISTS = [
   { zone: 'dbl.spamhaus.org', name: 'Spamhaus DBL' },
@@ -645,13 +651,20 @@ export class DNSVerifier {
       if (!alignment.a_ok) issues.push(`A record for ${hostname} does not resolve to ${ip}`);
       if (!alignment.helo_ok) issues.push(`HELO SPF on ${alignment.heloDomain} does not include ${ip}`);
       if (blacklist.listed) {
-        const listedOn = blacklist.blacklists.filter((b) => b.listed).map((b) => b.name);
-        issues.push(`IP listed on: ${listedOn.join(', ')}`);
+        const listedOn = blacklist.blacklists.filter((b) => b.listed);
+        const hardFails = listedOn.filter((b) => !WARN_ONLY_BLACKLISTS.has(b.name));
+        const softFails = listedOn.filter((b) => WARN_ONLY_BLACKLISTS.has(b.name));
+        if (hardFails.length > 0) issues.push(`IP listed on: ${hardFails.map((b) => b.name).join(', ')}`);
+        if (softFails.length > 0) issues.push(`IP listed on ${softFails.map((b) => b.name).join(', ')} (WARN — not checked by Gmail/Outlook)`);
       }
 
+      // Only hard-fail blacklists (non-Barracuda) cause FAIL status
+      const hardBlacklisted = blacklist.listed && blacklist.blacklists.some(
+        (b) => b.listed && !WARN_ONLY_BLACKLISTS.has(b.name)
+      );
       let overall: 'PASS' | 'FAIL' | 'WARN' = 'PASS';
-      if (blacklist.listed || !ptr.matches) overall = 'FAIL';
-      else if (!alignment.fully_aligned) overall = 'WARN';
+      if (hardBlacklisted || !ptr.matches) overall = 'FAIL';
+      else if (!alignment.fully_aligned || (blacklist.listed && !hardBlacklisted)) overall = 'WARN';
 
       return { ip, hostname, ptr, alignment, blacklist, overall, issues };
     };
