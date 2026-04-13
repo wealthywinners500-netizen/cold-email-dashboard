@@ -928,6 +928,54 @@ export function createPairProvisioningSaga(
             context.log(`[Step 6] A/MX fixed for ${domain}: @ A → ${server2IP}, MX → mail2.${domain}`);
           }
 
+          // PATCH 10c: Replicate SPF/DKIM/DMARC DNS records to the OTHER server.
+          // Both servers serve DNS (ns1=S1, ns2=S2). createMailDomain only adds
+          // auth records to the assigned server's zone. Without replication,
+          // DNS queries hitting the "wrong" server return nothing → VG fails.
+          context.log('[Step 6] Replicating SPF/DKIM/DMARC to cross-server zones...');
+          const replicationPairs: Array<{ domains: string[]; sourceSSH: typeof ssh1; targetSSH: typeof ssh2; sourceLabel: string; targetLabel: string; serverIP: string }> = [
+            { domains: server1Domains, sourceSSH: ssh1, targetSSH: ssh2, sourceLabel: 'S1', targetLabel: 'S2', serverIP: server1IP },
+            { domains: server2Domains, sourceSSH: ssh2, targetSSH: ssh1, sourceLabel: 'S2', targetLabel: 'S1', serverIP: server2IP },
+          ];
+
+          for (const { domains, sourceSSH, targetSSH, sourceLabel, targetLabel, serverIP } of replicationPairs) {
+            for (const domain of domains) {
+              try {
+                // Read DNS records from source server to get DKIM and DMARC values
+                const { stdout: jsonRecords } = await sourceSSH.exec(
+                  `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} json`,
+                  { timeout: 15000 }
+                );
+                const parsed = JSON.parse(jsonRecords || '{}') as Record<string, { RECORD: string; TYPE: string; VALUE: string }>;
+
+                for (const rec of Object.values(parsed)) {
+                  const host = rec.RECORD;
+                  const rtype = rec.TYPE;
+                  const value = rec.VALUE;
+
+                  // Replicate SPF (@ TXT with spf1), DKIM (mail._domainkey TXT), and DMARC (_dmarc TXT)
+                  const isSPF = rtype === 'TXT' && host === '@' && value.includes('spf1');
+                  const isDKIM = rtype === 'TXT' && host === 'mail._domainkey';
+                  const isDMARC = rtype === 'TXT' && host === '_dmarc';
+
+                  if (isSPF || isDKIM || isDMARC) {
+                    // Use single quotes around value to prevent shell interpretation
+                    const safeValue = value.replace(/'/g, "'\\''");
+                    await targetSSH.exec(
+                      `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} ${host} TXT '${safeValue}'`,
+                      { timeout: 10000 }
+                    ).catch(() => {
+                      // Record may already exist — not fatal
+                    });
+                  }
+                }
+                context.log(`[Step 6] Replicated auth DNS for ${domain}: ${sourceLabel} → ${targetLabel}`);
+              } catch (err) {
+                context.log(`[Step 6] Warning: DNS replication for ${domain} ${sourceLabel}→${targetLabel}: ${err}`);
+              }
+            }
+          }
+
           // rndc reload on both servers
           await ssh1.exec('rndc reload', { timeout: 10000 }).catch(() => {});
           await ssh2.exec('rndc reload', { timeout: 10000 }).catch(() => {});

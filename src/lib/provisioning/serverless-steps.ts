@@ -568,6 +568,21 @@ async function verifyDKIMCrossServerMatch(
   const issues: string[] = [];
   const supabase = await createAdminClient();
 
+  // PATCH 10c: Load per-server domain assignment from Step 6 metadata.
+  // With per-server split, each domain's DKIM key only exists on the
+  // assigned server. We verify the key exists on the correct server
+  // rather than requiring it on both.
+  const { data: step6Row } = await supabase
+    .from("provisioning_steps")
+    .select("metadata")
+    .eq("job_id", jobId)
+    .eq("step_type", "setup_mail_domains")
+    .maybeSingle();
+  const step6Meta = (step6Row?.metadata || {}) as Record<string, unknown>;
+  const s1Domains = new Set((step6Meta.server1Domains as string[]) || []);
+  const s2Domains = new Set((step6Meta.server2Domains as string[]) || []);
+  const hasPerServerSplit = s1Domains.size > 0 || s2Domains.size > 0;
+
   // Load ssh_credentials — one row per server
   const { data: creds, error: credsErr } = await supabase
     .from("ssh_credentials")
@@ -606,36 +621,58 @@ async function verifyDKIMCrossServerMatch(
 
     for (const domain of sendingDomains) {
       const dkimPath = `/home/admin/conf/mail/${domain}/dkim.pem`;
-      let h1 = "";
-      let h2 = "";
-      try {
-        const { stdout: r1 } = await ssh1.exec(
-          `sha256sum ${dkimPath} 2>/dev/null | cut -d' ' -f1`,
-          { timeout: 10000 }
-        );
-        h1 = (r1 || "").trim();
-      } catch {
-        issues.push(`${domain}: S1 sha256 failed (${dkimPath})`);
-        continue;
-      }
-      try {
-        const { stdout: r2 } = await ssh2.exec(
-          `sha256sum ${dkimPath} 2>/dev/null | cut -d' ' -f1`,
-          { timeout: 10000 }
-        );
-        h2 = (r2 || "").trim();
-      } catch {
-        issues.push(`${domain}: S2 sha256 failed (${dkimPath})`);
-        continue;
-      }
-      if (!h1) {
-        issues.push(`${domain}: DKIM key missing on S1 (${dkimPath})`);
-      } else if (!h2) {
-        issues.push(`${domain}: DKIM key missing on S2 (${dkimPath})`);
-      } else if (h1 !== h2) {
-        issues.push(
-          `${domain}: DKIM mismatch S1↔S2 (s1=${h1.slice(0, 8)}…, s2=${h2.slice(0, 8)}…)`
-        );
+
+      if (hasPerServerSplit) {
+        // PATCH 10c: Per-server mode — verify DKIM key exists on the
+        // assigned server only. The other server doesn't have the mail
+        // domain so it won't sign mail for this domain.
+        const assignedSSH = s1Domains.has(domain) ? ssh1 : ssh2;
+        const assignedLabel = s1Domains.has(domain) ? 'S1' : 'S2';
+        try {
+          const { stdout } = await assignedSSH.exec(
+            `sha256sum ${dkimPath} 2>/dev/null | cut -d' ' -f1`,
+            { timeout: 10000 }
+          );
+          const hash = (stdout || "").trim();
+          if (!hash) {
+            issues.push(`${domain}: DKIM key missing on ${assignedLabel} (${dkimPath})`);
+          }
+        } catch {
+          issues.push(`${domain}: ${assignedLabel} DKIM sha256 failed (${dkimPath})`);
+        }
+      } else {
+        // Legacy mode — all domains on both servers, require matching keys
+        let h1 = "";
+        let h2 = "";
+        try {
+          const { stdout: r1 } = await ssh1.exec(
+            `sha256sum ${dkimPath} 2>/dev/null | cut -d' ' -f1`,
+            { timeout: 10000 }
+          );
+          h1 = (r1 || "").trim();
+        } catch {
+          issues.push(`${domain}: S1 sha256 failed (${dkimPath})`);
+          continue;
+        }
+        try {
+          const { stdout: r2 } = await ssh2.exec(
+            `sha256sum ${dkimPath} 2>/dev/null | cut -d' ' -f1`,
+            { timeout: 10000 }
+          );
+          h2 = (r2 || "").trim();
+        } catch {
+          issues.push(`${domain}: S2 sha256 failed (${dkimPath})`);
+          continue;
+        }
+        if (!h1) {
+          issues.push(`${domain}: DKIM key missing on S1 (${dkimPath})`);
+        } else if (!h2) {
+          issues.push(`${domain}: DKIM key missing on S2 (${dkimPath})`);
+        } else if (h1 !== h2) {
+          issues.push(
+            `${domain}: DKIM mismatch S1↔S2 (s1=${h1.slice(0, 8)}…, s2=${h2.slice(0, 8)}…)`
+          );
+        }
       }
     }
   } catch (err) {
