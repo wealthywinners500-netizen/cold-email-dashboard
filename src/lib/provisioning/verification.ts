@@ -144,10 +144,11 @@ const RESOLVERS = [
   { ip: '208.67.222.222', name: 'OpenDNS' },
 ];
 
+// PATCH 10d: Removed Barracuda — it lists ~80% of Linode IPs (see Hard Lesson #74
+// and ip-blacklist-check.ts PATCH 10b). Keeping Spamhaus, SORBS, UCEPROTECT only.
 const IP_BLACKLISTS = [
   { zone: 'zen.spamhaus.org', name: 'Spamhaus ZEN' },
   { zone: 'dnsbl.sorbs.net', name: 'SORBS' },
-  { zone: 'b.barracudacentral.org', name: 'Barracuda' },
   { zone: 'dnsbl-1.uceprotect.net', name: 'UCEPROTECT L1' },
 ];
 
