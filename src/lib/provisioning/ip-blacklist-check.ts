@@ -17,10 +17,13 @@
 
 import { Resolver } from 'dns';
 
+// PATCH 10b: Removed Barracuda from IP pre-check — Barracuda lists ~80% of
+// Linode IPs across all US regions, causing 4/4 re-rolls to fail every time.
+// Barracuda delisting is instant/free and is NOT a hard deliverability blocker.
+// It's still checked in Step 8 (VG) as a non-fatal warning.
 const IP_BLACKLISTS = [
   { zone: 'zen.spamhaus.org', name: 'Spamhaus ZEN' },
   { zone: 'dnsbl.sorbs.net', name: 'SORBS' },
-  { zone: 'b.barracudacentral.org', name: 'Barracuda' },
   { zone: 'dnsbl-1.uceprotect.net', name: 'UCEPROTECT L1' },
 ] as const;
 
