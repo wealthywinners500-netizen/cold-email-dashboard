@@ -209,6 +209,17 @@ export async function POST(
       const server2IP = (vpsMetadata.server2IP as string) || jobRow?.server2_ip || "";
 
       if (jobRow && server1IP && server2IP) {
+        // Hard Lesson #81: provisioning_jobs.org_id stores the real Clerk
+        // org ID, but organizations.id may differ (old typo). The
+        // server_pairs.org_id FK references organizations.id, so look up
+        // the DB id by clerk_org_id to avoid FK violations.
+        const { data: orgRow } = await supabase
+          .from("organizations")
+          .select("id")
+          .eq("clerk_org_id", jobRow.org_id)
+          .maybeSingle();
+        const dbOrgId = orgRow?.id || jobRow.org_id;
+
         // Hard Lesson #50 + #62 parity (2026-04-11): this insert was using
         // the LEGACY server1_ip/server2_ip/server1_hostname/server2_hostname
         // column names that don't exist on the server_pairs table. The
@@ -222,7 +233,7 @@ export async function POST(
         const { data: maxPairRow } = await supabase
           .from("server_pairs")
           .select("pair_number")
-          .eq("org_id", jobRow.org_id)
+          .eq("org_id", dbOrgId)
           .order("pair_number", { ascending: false })
           .limit(1)
           .maybeSingle();
@@ -233,7 +244,7 @@ export async function POST(
         const { data: serverPair, error: serverPairError } = await supabase
           .from("server_pairs")
           .insert({
-            org_id: jobRow.org_id,
+            org_id: dbOrgId,
             pair_number: nextPairNumber,
             ns_domain: jobRow.ns_domain,
             s1_ip: server1IP,
@@ -309,7 +320,7 @@ export async function POST(
             for (const name of names) {
               const email = `${name}@${domain}`;
               accountRows.push({
-                org_id: jobRow.org_id,
+                org_id: dbOrgId,
                 email,
                 display_name: name
                   .split(".")

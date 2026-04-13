@@ -135,7 +135,7 @@ async function checkViaAPI(
 
 // ---- Internal Checks Mode (MXToolbox-equivalent) ----
 
-const RESOLVERS = ["8.8.8.8", "1.1.1.1", "9.9.9.9"];
+const RESOLVERS = ["1.1.1.1", "8.8.8.8", "9.9.9.9"];
 
 async function resolveWith(
   resolver: string,
@@ -195,7 +195,7 @@ async function checkDomainInternally(
   let passed = 0;
 
   // 1. MX Record Check
-  const mxRecords = await resolveWith("8.8.8.8", domain, "MX");
+  const mxRecords = await resolveWith("1.1.1.1", domain, "MX");
   if (mxRecords.length === 0) {
     errorDetails.push("MX: No MX records found");
   } else {
@@ -215,7 +215,7 @@ async function checkDomainInternally(
   }
 
   // 2. A Record Check
-  const aRecords = await resolveWith("8.8.8.8", domain, "A");
+  const aRecords = await resolveWith("1.1.1.1", domain, "A");
   if (aRecords.length === 0) {
     errorDetails.push("DNS: No A record found");
   } else {
@@ -223,7 +223,7 @@ async function checkDomainInternally(
   }
 
   // 3. SPF Check
-  const txtRecords = await resolveWith("8.8.8.8", domain, "TXT");
+  const txtRecords = await resolveWith("1.1.1.1", domain, "TXT");
   const spfRecords = txtRecords.filter((t) => t.startsWith("v=spf1"));
   if (spfRecords.length === 0) {
     errorDetails.push("SPF: No SPF record found");
@@ -250,7 +250,7 @@ async function checkDomainInternally(
 
   // 4. DKIM Check
   const dkimRecords = await resolveWith(
-    "8.8.8.8",
+    "1.1.1.1",
     `mail._domainkey.${domain}`,
     "TXT"
   );
@@ -273,7 +273,7 @@ async function checkDomainInternally(
 
   // 5. DMARC Check (Hard Lesson #79: every domain needs DMARC including NS)
   const dmarcRecords = await resolveWith(
-    "8.8.8.8",
+    "1.1.1.1",
     `_dmarc.${domain}`,
     "TXT"
   );
@@ -304,7 +304,7 @@ async function checkDomainInternally(
   let smtpIP = targetIP;
   if (mxRecords.length > 0) {
     const mxHost = mxRecords[0].split(" ").pop() || "";
-    const mxIPs = await resolveWith("8.8.8.8", mxHost, "A");
+    const mxIPs = await resolveWith("1.1.1.1", mxHost, "A");
     if (mxIPs.length > 0) {
       smtpIP = mxIPs[0];
     }
@@ -361,10 +361,10 @@ async function checkDomainInternally(
     ] as const) {
       try {
         const reversed = ip.split(".").reverse().join(".") + ".in-addr.arpa";
-        const ptrRecords = await resolveWith("8.8.8.8", reversed, "TXT");
+        const ptrRecords = await resolveWith("1.1.1.1", reversed, "TXT");
         // PTR is not a TXT record — use direct PTR lookup
         const r = new dnsPromises.Resolver();
-        r.setServers(["8.8.8.8"]);
+        r.setServers(["1.1.1.1"]);
         const ptrs = await Promise.race([
           r.reverse(ip),
           new Promise<never>((_, rej) =>
@@ -395,7 +395,7 @@ async function checkDomainInternally(
       const reversed = ip.split(".").reverse().join(".");
       try {
         const r = new dnsPromises.Resolver();
-        r.setServers(["8.8.8.8"]);
+        r.setServers(["1.1.1.1"]);
         const result = await Promise.race([
           r.resolve4(`${reversed}.zen.spamhaus.org`),
           new Promise<never>((_, rej) =>
