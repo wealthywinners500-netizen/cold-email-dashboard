@@ -721,23 +721,32 @@ async function runVerificationGateOnce(jobId: string): Promise<{
   });
 
   // Roll the report's per-server / per-domain issues up into pass/fail rows.
+  // PATCH 10d: Use overall status (PASS/WARN/FAIL) instead of raw issues count.
+  // WARN-level issues (e.g. transient resolver cache inconsistency) should not
+  // block VG pass — only FAIL-level issues are real configuration problems.
   for (const server of report.servers || []) {
-    if ((server.issues || []).length === 0) {
-      results.push(`✓ Server ${server.ip}: ${server.hostname} clean`);
-    } else {
-      for (const issue of server.issues) {
+    if (server.overall === 'FAIL') {
+      for (const issue of server.issues || []) {
         failures.push(`✗ Server ${server.ip} (${server.hostname}): ${issue}`);
       }
+    } else if (server.overall === 'WARN') {
+      warnings.push(`⚠ Server ${server.ip} (${server.hostname}): ${(server.issues || []).join('; ')}`);
+      results.push(`✓ Server ${server.ip}: ${server.hostname} (warn: ${(server.issues || []).join('; ')})`);
+    } else {
+      results.push(`✓ Server ${server.ip}: ${server.hostname} clean`);
     }
   }
 
   for (const domain of report.domains || []) {
-    if ((domain.issues || []).length === 0) {
-      results.push(`✓ Domain ${domain.domain} clean`);
-    } else {
-      for (const issue of domain.issues) {
+    if (domain.overall === 'FAIL') {
+      for (const issue of domain.issues || []) {
         failures.push(`✗ Domain ${domain.domain}: ${issue}`);
       }
+    } else if (domain.overall === 'WARN') {
+      warnings.push(`⚠ Domain ${domain.domain}: ${(domain.issues || []).join('; ')}`);
+      results.push(`✓ Domain ${domain.domain} (warn: ${(domain.issues || []).join('; ')})`);
+    } else {
+      results.push(`✓ Domain ${domain.domain} clean`);
     }
   }
 
