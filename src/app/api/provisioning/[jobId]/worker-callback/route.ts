@@ -1,6 +1,7 @@
 import { createAdminClient } from "@/lib/supabase/server";
 import { NextResponse } from "next/server";
 import { createHmac, timingSafeEqual } from "crypto";
+import { decrypt, encrypt } from "@/lib/provisioning/encryption";
 import type { StepType } from "@/lib/provisioning/types";
 
 export const dynamic = "force-dynamic";
@@ -200,7 +201,7 @@ export async function POST(
 
       const { data: jobRow } = await supabase
         .from("provisioning_jobs")
-        .select("org_id, ns_domain, server1_ip, server2_ip")
+        .select("org_id, ns_domain, server1_ip, server2_ip, sending_domains, mail_accounts_per_domain")
         .eq("id", jobId)
         .single();
 
@@ -209,162 +210,141 @@ export async function POST(
       const server2IP = (vpsMetadata.server2IP as string) || jobRow?.server2_ip || "";
 
       if (jobRow && server1IP && server2IP) {
-        // Hard Lesson #81: provisioning_jobs.org_id stores the real Clerk
-        // org ID, but organizations.id may differ (old typo). The
-        // server_pairs.org_id FK references organizations.id, so look up
-        // the DB id by clerk_org_id to avoid FK violations.
+        // Hard Lesson #81: provisioning_jobs.org_id stores the Clerk org ID,
+        // but server_pairs.org_id FK references organizations.id (which may differ).
+        // Always look up the DB org ID by clerk_org_id.
         const { data: orgRow } = await supabase
           .from("organizations")
           .select("id")
           .eq("clerk_org_id", jobRow.org_id)
-          .maybeSingle();
-        const dbOrgId = orgRow?.id || jobRow.org_id;
+          .single();
 
-        // Hard Lesson #50 + #62 parity (2026-04-11): this insert was using
-        // the LEGACY server1_ip/server2_ip/server1_hostname/server2_hostname
-        // column names that don't exist on the server_pairs table. The
-        // execute-step finalization block was patched in commit 506a2a8
-        // but THIS callback path was missed — until now verification_gate
-        // ran serverless so this branch was unreachable, but Test #15 moves
-        // verification_gate to the worker, so the worker callback now hits
-        // this finalization branch on the last step. Use the same
-        // pair_number-from-MAX+1 logic and the same s1_/s2_ column names
-        // and the same provisioning_job_id FK.
-        const { data: maxPairRow } = await supabase
-          .from("server_pairs")
-          .select("pair_number")
-          .eq("org_id", dbOrgId)
-          .order("pair_number", { ascending: false })
-          .limit(1)
-          .maybeSingle();
+        if (!orgRow) {
+          throw new Error(`Organization not found for clerk_org_id: ${jobRow.org_id} — cannot create server_pair`);
+        }
+        const dbOrgId = orgRow.id;
 
-        const nextPairNumber =
-          ((maxPairRow?.pair_number as number) || 0) + 1;
-
-        const { data: serverPair, error: serverPairError } = await supabase
+        // Create server_pair record (column names: s1_ip, s2_ip, s1_hostname, s2_hostname)
+        const { data: serverPair } = await supabase
           .from("server_pairs")
           .insert({
             org_id: dbOrgId,
-            pair_number: nextPairNumber,
             ns_domain: jobRow.ns_domain,
             s1_ip: server1IP,
-            s1_hostname: `mail1.${jobRow.ns_domain}`,
             s2_ip: server2IP,
+            s1_hostname: `mail1.${jobRow.ns_domain}`,
             s2_hostname: `mail2.${jobRow.ns_domain}`,
-            status: "complete",
-            provisioning_job_id: jobId,
+            status: "active",
+            health_status: "healthy",
           })
           .select()
           .single();
 
-        if (serverPairError || !serverPair) {
-          // Don't silently swallow — the whole point of Hard Lesson #50
-          // was that this row HAS to land or downstream code can never
-          // hop job → pair.
-          await supabase
-            .from("provisioning_jobs")
-            .update({
-              status: "failed",
-              error_message: `Final server_pairs insert failed: ${
-                serverPairError?.message || "unknown"
-              }`,
-            })
-            .eq("id", jobId);
+        // Create email accounts from setup_mail_domains step metadata
+        let accountsCreated = 0;
+        let accountsFailed = 0;
+        if (serverPair) {
+          const { data: mailStep } = await supabase
+            .from("provisioning_steps")
+            .select("metadata")
+            .eq("job_id", jobId)
+            .eq("step_type", "setup_mail_domains")
+            .single();
 
-          return NextResponse.json(
-            {
-              jobId,
-              stepType,
-              status: "failed",
-              error: `server_pairs insert failed: ${serverPairError?.message}`,
-            },
-            { status: 500 }
-          );
-        }
+          const mailMeta = (mailStep?.metadata as Record<string, unknown>) || {};
+          const allAccountsCreated = mailMeta.allAccountsCreated as Record<string, string[]> | undefined;
+          const server1Domains = (mailMeta.server1Domains as string[]) || [];
 
-        // Create email_accounts from setup_mail_domains metadata
-        const { data: mailStep } = await supabase
-          .from("provisioning_steps")
-          .select("metadata")
-          .eq("job_id", jobId)
-          .eq("step_type", "setup_mail_domains")
-          .single();
+          // Get server password for smtp_pass (Hard Lesson #78: smtp_user + smtp_pass are NOT NULL)
+          const { data: vpsStep } = await supabase
+            .from("provisioning_steps")
+            .select("metadata")
+            .eq("job_id", jobId)
+            .eq("step_type", "create_vps")
+            .single();
+          const vpsMeta = (vpsStep?.metadata as Record<string, unknown>) || {};
+          const encryptedPassword = vpsMeta.serverPassword_encrypted as string | undefined;
+          const serverPassword = encryptedPassword ? decrypt(encryptedPassword) : "";
 
-        const mailMeta = (mailStep?.metadata as Record<string, unknown>) || {};
-        const allAccounts = mailMeta.allAccountsCreated as Record<string, string[]> | undefined;
-        const s1Domains = (mailMeta.server1Domains as string[]) || [];
-
-        if (allAccounts && Object.keys(allAccounts).length > 0) {
-          // Read mail password from ssh_credentials
-          let mailPassword = "";
-          try {
-            const { data: sshCreds } = await supabase
-              .from("ssh_credentials")
-              .select("password_encrypted")
-              .eq("provisioning_job_id", jobId)
-              .limit(1)
-              .maybeSingle();
-
-            if (sshCreds?.password_encrypted) {
-              const { decrypt } = await import("@/lib/provisioning/encryption");
-              mailPassword = decrypt(sshCreds.password_encrypted);
+          if (allAccountsCreated) {
+            const accountRows = [];
+            for (const [domain, names] of Object.entries(allAccountsCreated)) {
+              const isServer1Domain = server1Domains.includes(domain);
+              const smtpHost = isServer1Domain ? server1IP : server2IP;
+              for (const name of names) {
+                accountRows.push({
+                  org_id: dbOrgId,
+                  email: `${name}@${domain}`,
+                  display_name: name
+                    .split(".")
+                    .map((n: string) => n.charAt(0).toUpperCase() + n.slice(1))
+                    .join(" "),
+                  server_pair_id: serverPair.id,
+                  smtp_host: smtpHost,
+                  smtp_port: 465,
+                  smtp_user: `${name}@${domain}`,
+                  smtp_pass: serverPassword,
+                  imap_host: smtpHost,
+                  imap_port: 993,
+                  status: "active",
+                  daily_send_limit: 50,
+                  sends_today: 0,
+                });
+              }
             }
-          } catch (decryptErr) {
-            console.error(`[WorkerCallback] Failed to decrypt mail password: ${decryptErr}`);
+            if (accountRows.length > 0) {
+              const { error: accountError, count } = await supabase
+                .from("email_accounts")
+                .insert(accountRows);
+              if (accountError) {
+                console.error(`[WorkerCallback] email_accounts insert failed: ${accountError.message}`);
+                accountsFailed = accountRows.length;
+              } else {
+                accountsCreated = accountRows.length;
+              }
+            }
           }
 
-          const accountRows = [];
-          for (const [domain, names] of Object.entries(allAccounts)) {
-            const isS1 = s1Domains.includes(domain);
-            const serverIP = isS1 ? server1IP : server2IP;
-            for (const name of names) {
-              const email = `${name}@${domain}`;
-              accountRows.push({
+          // Create SSH credentials
+          if (encryptedPassword) {
+            for (const [ip, hostname] of [
+              [server1IP, `mail1.${jobRow.ns_domain}`],
+              [server2IP, `mail2.${jobRow.ns_domain}`],
+            ]) {
+              await supabase.from("ssh_credentials").insert({
                 org_id: dbOrgId,
-                email,
-                display_name: name
-                  .split(".")
-                  .map((n: string) => n.charAt(0).toUpperCase() + n.slice(1))
-                  .join(" "),
-                server_pair_id: serverPair.id,
-                smtp_host: serverIP,
-                smtp_port: 587,
-                smtp_user: email,
-                smtp_pass: mailPassword,
-                imap_host: serverIP,
-                imap_port: 993,
-                status: "active",
-                daily_send_limit: 50,
+                server_ip: ip,
+                hostname,
+                username: "root",
+                password_encrypted: encryptedPassword,
+                port: 22,
+                provisioning_job_id: jobId,
               });
             }
           }
 
-          if (accountRows.length > 0) {
-            const { error: emailInsertErr } = await supabase
-              .from("email_accounts")
-              .insert(accountRows);
-            if (emailInsertErr) {
-              console.error(
-                `[WorkerCallback] email_accounts insert failed: ${emailInsertErr.message}`
-              );
-            } else {
-              console.log(
-                `[WorkerCallback] Inserted ${accountRows.length} email accounts for pair ${serverPair.id}`
-              );
-            }
+          // Update server_pair total_accounts
+          if (accountsCreated > 0) {
+            await supabase
+              .from("server_pairs")
+              .update({ total_accounts: accountsCreated })
+              .eq("id", serverPair.id);
           }
         }
 
-        // Mark job completed
+        // Mark job completed (include account creation status in metadata)
         await supabase
           .from("provisioning_jobs")
           .update({
             status: "completed",
             progress_pct: 100,
             completed_at: new Date().toISOString(),
-            server_pair_id: serverPair.id,
+            server_pair_id: serverPair?.id || null,
             server1_ip: server1IP,
             server2_ip: server2IP,
+            ...(accountsFailed > 0 ? {
+              error_message: `Completed with ${accountsFailed} email account insert failures`,
+            } : {}),
           })
           .eq("id", jobId);
       }

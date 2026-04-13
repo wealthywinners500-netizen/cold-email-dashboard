@@ -294,7 +294,10 @@ export async function handleProvisionPair(
           }
 
           // Store SSH credentials
-          const password = (ctx.serverPassword as string) || 'changeme123';
+          const password = ctx.serverPassword as string;
+          if (!password) {
+            throw new Error('Server password not found in provisioning context — cannot store SSH credentials');
+          }
           await createSSHCredentials(provJob.org_id, {
             server_ip: server1IP,
             hostname: `mail1.${provJob.ns_domain}`,

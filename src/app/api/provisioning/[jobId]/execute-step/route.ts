@@ -1,69 +1,72 @@
 import { auth } from "@clerk/nextjs/server";
 import { createAdminClient } from "@/lib/supabase/server";
 import { NextResponse } from "next/server";
-import { persistPairCredentials } from "@/lib/provisioning/persist-credentials";
-import {
-  runConfigureRegistrar,
-  runSetPtr,
-} from "@/lib/provisioning/serverless-steps";
-import type { StepType } from "@/lib/provisioning/types";
-import crypto from "crypto";
+import { getVPSProvider, getDNSRegistrar } from "@/lib/provisioning/provider-registry";
+import { decrypt } from "@/lib/provisioning/encryption";
+import type { StepType, ProvisioningJobRow, VPSProviderType, DNSRegistrarType } from "@/lib/provisioning/types";
 
 export const dynamic = "force-dynamic";
-// Vercel Hobby plan caps serverless functions at 60s. Everything in
-// SERVERLESS_STEPS must be bounded by that budget — no multi-minute
-// provider polling loops (Hard Lesson #59, Test #14). `create_vps` is
-// now a WORKER step because Linode boot routinely takes 60-120s.
+// All SSH steps + create_vps (which can take >60s polling) dispatch to the worker VPS.
+// Vercel Hobby plan limits serverless functions to 60s; create_vps took 82s in Test #21.
 export const maxDuration = 60;
 
-// How long a step can sit in `in_progress` before the driver treats it
-// as stranded (stale) and fails the job. Keeps the stranded-step class
-// of bug from silently advancing to the next pending step — which was
-// the Test #14 failure mode (Hard Lesson #59).
-//
-// Budget: the longest legitimate step is `await_dns_propagation` at 75
-// minutes (Ionos NS can take 30-60 min on a cold cache), followed by
-// `verification_gate` at 30 minutes (60s × 30 retries while LE issues).
-// 90 min gives comfortable headroom on those two while still catching
-// genuinely wedged steps before a human would notice. (Test #15 bumped
-// from 25 → 90 min after Test #14's 25-min cap proved too aggressive.)
-const STRANDED_STEP_TIMEOUT_MS = 90 * 60 * 1000;
-
-// Steps that can run in serverless (API calls only, <60s each).
-// configure_registrar (3) + set_ptr (6) hit Ionos / Linode APIs and
-// finish in seconds. Everything else exceeds the 60s cap.
+// Steps that can run in serverless (API calls only, no SSH)
+// Order: configure_registrar(3), set_ptr(5), verification_gate(8)
 const SERVERLESS_STEPS: StepType[] = [
   "configure_registrar",
   "set_ptr",
-];
-
-// Steps that run on the worker VPS (SSH, long-running provider polls,
-// long-running DNS propagation polls, port 25 reachability checks).
-//
-// Hard Lesson #59 (Test #14, 2026-04-10): `create_vps` was previously
-// on the serverless side, but Linode boot polling routinely blows
-// past Vercel's 60s function cap → step stranded `in_progress` with
-// orphan VPS + lost credentials. Moved to the worker, which has no
-// time cap.
-//
-// Test #15 (2026-04-11): `verification_gate` and `await_dns_propagation`
-// also moved here. The verification gate now runs port 25 banner checks
-// (Vercel egress is blocked on 25) and a 30-min retry loop for LE
-// issuance settling. await_dns_propagation polls public resolvers for
-// up to 75 min waiting for NS delegation to converge.
-const WORKER_STEPS: StepType[] = [
-  "create_vps",
-  "install_hestiacp",
-  "await_dns_propagation",
-  "setup_dns_zones",
-  "setup_mail_domains",
-  "security_hardening",
   "verification_gate",
 ];
 
-// Plan type mapping lives in the worker's provision-step handler now
-// that create_vps runs on the worker side. See
-// src/worker/handlers/provision-step.ts (Hard Lesson #59).
+// Steps that require SSH — dispatch to worker VPS
+// Order: create_vps(1), install_hestiacp(2), setup_dns_zones(4), setup_mail_domains(6), security_hardening(7)
+const WORKER_STEPS: StepType[] = [
+  "create_vps",
+  "install_hestiacp",
+  "setup_dns_zones",
+  "setup_mail_domains",
+  "security_hardening",
+];
+
+// ============================================
+// Plan type mapping: wizard size → provider API plan ID
+// ============================================
+const PLAN_TYPE_MAP: Record<string, Record<string, string>> = {
+  linode: {
+    small: "g6-nanode-1",     // 1 vCPU / 1GB RAM / $5/mo
+    medium: "g6-standard-1",  // 1 vCPU / 2GB RAM / $12/mo
+    large: "g6-standard-2",   // 2 vCPU / 4GB RAM / $24/mo
+  },
+  digitalocean: {
+    small: "s-1vcpu-2gb",
+    medium: "s-2vcpu-4gb",
+    large: "s-4vcpu-8gb",
+  },
+  hetzner: {
+    small: "cx22",
+    medium: "cx32",
+    large: "cx42",
+  },
+  vultr: {
+    small: "vc2-1c-2gb",
+    medium: "vc2-2c-4gb",
+    large: "vc2-4c-8gb",
+  },
+  clouding: {
+    small: "0.5C-1G",
+    medium: "1C-2G",
+    large: "2C-4G",
+  },
+};
+
+function resolveProviderPlan(providerType: string, sizeLabel: string): string {
+  const providerPlans = PLAN_TYPE_MAP[providerType];
+  if (providerPlans && providerPlans[sizeLabel]) {
+    return providerPlans[sizeLabel];
+  }
+  // If size is already a provider-specific plan ID (not a generic label), pass through
+  return sizeLabel;
+}
 
 async function getInternalOrgId(): Promise<string | null> {
   const { orgId } = await auth();
@@ -82,13 +85,7 @@ async function getInternalOrgId(): Promise<string | null> {
 // ============================================
 async function executeDryRunStep(
   stepType: StepType,
-  context: {
-    jobId: string;
-    orgId: string;
-    nsDomain: string;
-    sendingDomains: string[];
-    mailAccountsPerDomain: number;
-  }
+  context: { nsDomain: string; sendingDomains: string[]; mailAccountsPerDomain: number }
 ): Promise<{ output: string; metadata?: Record<string, unknown> }> {
   const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -97,28 +94,9 @@ async function executeDryRunStep(
       await delay(2000);
       const ip1 = `10.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
       const ip2 = `10.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
-
-      // Hard Lesson #58 — even in dry-run, exercise the credential
-      // persistence path so the wizard's Step 1 regression-tests SSH
-      // credential write end-to-end without spending real VPS dollars.
-      const rootPassword = crypto.randomBytes(16).toString("base64url");
-      await persistPairCredentials({
-        orgId: context.orgId,
-        jobId: context.jobId,
-        nsDomain: context.nsDomain,
-        server1IP: ip1,
-        server2IP: ip2,
-        rootPassword,
-      });
-
       return {
-        output: `[DryRun] VPS pair created: ${ip1} + ${ip2} (credentials persisted)`,
-        metadata: {
-          server1IP: ip1,
-          server2IP: ip2,
-          server1ProviderId: `dry-${Date.now()}-s1`,
-          server2ProviderId: `dry-${Date.now()}-s2`,
-        },
+        output: `[DryRun] VPS pair created: ${ip1} + ${ip2}`,
+        metadata: { server1IP: ip1, server2IP: ip2, server1ProviderId: `dry-${Date.now()}-s1`, server2ProviderId: `dry-${Date.now()}-s2` },
       };
     }
     case "set_ptr": {
@@ -159,19 +137,266 @@ async function executeDryRunStep(
 }
 
 // ============================================
-// Real serverless step execution (configure_registrar, set_ptr).
-// Bodies live in src/lib/provisioning/serverless-steps.ts so the worker
-// can call them too via pollAdvanceableJobs (Test #15 hands-off path).
+// Real serverless step execution (steps 1-3, 8)
 // ============================================
 async function executeServerlessStep(
   stepType: StepType,
-  jobId: string
+  job: ProvisioningJobRow,
+  allSteps: Array<{ id: string; step_type: string; status: string; metadata: Record<string, unknown> }>
 ): Promise<{ output: string; metadata?: Record<string, unknown> }> {
+  // Lazy-init Supabase for provider lookups (Hard Lesson #34)
+  const supabase = await createAdminClient();
+
+  // Load provider configs
+  const { data: vpsRow } = await supabase
+    .from("vps_providers")
+    .select("*")
+    .eq("id", job.vps_provider_id)
+    .single();
+
+  const { data: dnsRow } = await supabase
+    .from("dns_registrars")
+    .select("*")
+    .eq("id", job.dns_registrar_id)
+    .single();
+
+  if (!vpsRow || !dnsRow) {
+    throw new Error("VPS provider or DNS registrar config not found");
+  }
+
   switch (stepType) {
-    case "configure_registrar":
-      return runConfigureRegistrar(jobId);
-    case "set_ptr":
-      return runSetPtr(jobId);
+    case "create_vps": {
+      const vpsConfig: Record<string, unknown> = {
+        ...vpsRow.config,
+        apiKey: vpsRow.api_key_encrypted ? decrypt(vpsRow.api_key_encrypted) : undefined,
+        apiSecret: vpsRow.api_secret_encrypted ? decrypt(vpsRow.api_secret_encrypted) : undefined,
+      };
+      const provider = await getVPSProvider(vpsRow.provider_type as VPSProviderType, vpsConfig);
+
+      // Read region and size from JOB config (set by wizard), NOT vpsRow config
+      // Hard lesson #44 (2026-04-10): secondaryRegion defaults to primary region but
+      // the wizard now exposes it so pairs can land on different subnets for
+      // MXToolbox reputation. Honor it here so the serverless path matches the
+      // worker's handleProvisionPair path.
+      const jobConfig = (job.config || {}) as Record<string, string>;
+      const region = jobConfig.region || "us-east";
+      const secondaryRegion = jobConfig.secondaryRegion || region;
+      const sizeLabel = jobConfig.size || "small";
+      const providerPlan = resolveProviderPlan(vpsRow.provider_type, sizeLabel);
+
+      // Create two servers — server2 may live in a different region for subnet diversity
+      const server1 = await provider.createServer({
+        name: `mail1-${job.ns_domain.replace(/\./g, "-")}`,
+        region,
+        size: providerPlan,
+      });
+
+      const server2 = await provider.createServer({
+        name: `mail2-${job.ns_domain.replace(/\./g, "-")}`,
+        region: secondaryRegion,
+        size: providerPlan,
+      });
+
+      // Poll until both are active (max 10 min)
+      const pollStart = Date.now();
+      const POLL_TIMEOUT = 10 * 60 * 1000;
+      let s1Active = server1.status === "active";
+      let s2Active = server2.status === "active";
+
+      while ((!s1Active || !s2Active) && Date.now() - pollStart < POLL_TIMEOUT) {
+        await new Promise((r) => setTimeout(r, 15000));
+        if (!s1Active) {
+          const info = await provider.getServer(server1.id);
+          s1Active = info.status === "active" || info.status === "running";
+          if (s1Active && !server1.ip) Object.assign(server1, { ip: info.ip });
+        }
+        if (!s2Active) {
+          const info = await provider.getServer(server2.id);
+          s2Active = info.status === "active" || info.status === "running";
+          if (s2Active && !server2.ip) Object.assign(server2, { ip: info.ip });
+        }
+      }
+
+      if (!s1Active || !s2Active) {
+        throw new Error("Timed out waiting for VPS servers to become active");
+      }
+
+      // Store IPs in job row for later steps
+      await supabase
+        .from("provisioning_jobs")
+        .update({
+          server1_ip: server1.ip,
+          server2_ip: server2.ip,
+          server1_provider_id: server1.id,
+          server2_provider_id: server2.id,
+        })
+        .eq("id", job.id);
+
+      return {
+        output: `VPS pair created: ${server1.ip} (${region}) + ${server2.ip} (${secondaryRegion}) (${vpsRow.provider_type})`,
+        metadata: {
+          server1IP: server1.ip,
+          server2IP: server2.ip,
+          server1ProviderId: server1.id,
+          server2ProviderId: server2.id,
+          server1Region: region,
+          server2Region: secondaryRegion,
+        },
+      };
+    }
+
+    case "set_ptr": {
+      // CRITICAL: Linode/Hetzner/Vultr validate forward A record resolves BEFORE accepting rDNS.
+      // This step MUST come AFTER setup_dns_zones (Step 4) so A records exist.
+      // Implements exponential backoff retry for DNS propagation delay.
+      const vpsConfig: Record<string, unknown> = {
+        ...vpsRow.config,
+        apiKey: vpsRow.api_key_encrypted ? decrypt(vpsRow.api_key_encrypted) : undefined,
+        apiSecret: vpsRow.api_secret_encrypted ? decrypt(vpsRow.api_secret_encrypted) : undefined,
+      };
+      const provider = await getVPSProvider(vpsRow.provider_type as VPSProviderType, vpsConfig);
+
+      // Get IPs from create_vps step metadata or job row
+      const createVpsStep = allSteps.find((s) => s.step_type === "create_vps");
+      const meta = createVpsStep?.metadata || {};
+      const server1IP = (meta.server1IP as string) || job.server1_ip || "";
+      const server2IP = (meta.server2IP as string) || job.server2_ip || "";
+
+      if (!server1IP || !server2IP) {
+        throw new Error("Server IPs not available — create_vps step must complete first");
+      }
+
+      // Retry with exponential backoff (DNS propagation may not be instant)
+      const retryDelays = [0, 60_000, 180_000, 300_000]; // 0s, 1min, 3min, 5min
+      let lastError = "";
+
+      for (let attempt = 0; attempt < retryDelays.length; attempt++) {
+        if (attempt > 0) {
+          await new Promise((r) => setTimeout(r, retryDelays[attempt]));
+        }
+
+        try {
+          await provider.setPTR({ ip: server1IP, hostname: `mail1.${job.ns_domain}` });
+          await provider.setPTR({ ip: server2IP, hostname: `mail2.${job.ns_domain}` });
+          return { output: `PTR records set: mail1.${job.ns_domain} → ${server1IP}, mail2.${job.ns_domain} → ${server2IP}` };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          lastError = msg;
+
+          // Provider doesn't support PTR via API (e.g., Clouding) — no retry
+          if (msg.includes("not supported") || msg.includes("not implemented")) {
+            return {
+              output: `PTR via API not supported by ${vpsRow.provider_type} — manual PTR required`,
+              metadata: { manualRequired: true },
+            };
+          }
+
+          // DNS lookup failure — retry (forward DNS not yet propagated)
+          if (msg.includes("unable to perform a lookup") || msg.includes("Unable to look up") || msg.includes("400")) {
+            continue;
+          }
+
+          // Unknown error — don't retry
+          throw err;
+        }
+      }
+
+      // All retries exhausted — mark as manual required
+      return {
+        output: `PTR could not be set automatically after ${retryDelays.length} attempts (DNS propagation pending). Last error: ${lastError}. Manual setup: ${server1IP} → mail1.${job.ns_domain}, ${server2IP} → mail2.${job.ns_domain}`,
+        metadata: { manualRequired: true },
+      };
+    }
+
+    case "configure_registrar": {
+      const dnsConfig: Record<string, unknown> = {
+        ...dnsRow.config,
+        apiKey: dnsRow.api_key_encrypted ? decrypt(dnsRow.api_key_encrypted) : undefined,
+        apiSecret: dnsRow.api_secret_encrypted ? decrypt(dnsRow.api_secret_encrypted) : undefined,
+      };
+      const registrar = await getDNSRegistrar(dnsRow.registrar_type as DNSRegistrarType, dnsConfig);
+
+      // Get IPs from create_vps step metadata or job row
+      const createVpsStep = allSteps.find((s) => s.step_type === "create_vps");
+      const meta = createVpsStep?.metadata || {};
+      const server1IP = (meta.server1IP as string) || job.server1_ip || "";
+      const server2IP = (meta.server2IP as string) || job.server2_ip || "";
+
+      if (!server1IP || !server2IP) {
+        throw new Error("Server IPs not available — create_vps step must complete first");
+      }
+
+      // Set nameservers
+      await registrar.setNameservers(job.ns_domain, [
+        `ns1.${job.ns_domain}`,
+        `ns2.${job.ns_domain}`,
+      ]);
+
+      // Set glue records
+      await registrar.setGlueRecords(job.ns_domain, [
+        { hostname: `ns1.${job.ns_domain}`, ip: server1IP },
+        { hostname: `ns2.${job.ns_domain}`, ip: server2IP },
+      ]);
+
+      return {
+        output: `DNS configured for ${job.ns_domain}: NS → ns1/ns2, glue → ${server1IP}/${server2IP} (${dnsRow.registrar_type})`,
+      };
+    }
+
+    case "verification_gate": {
+      // DNS-only verification checks — no SSH required
+      // Check A records, PTR, SPF/DKIM/DMARC via dig
+      const { execSync } = await import("child_process");
+      const results: string[] = [];
+      const failures: string[] = [];
+
+      const createVpsStep = allSteps.find((s) => s.step_type === "create_vps");
+      const meta = createVpsStep?.metadata || {};
+      const server1IP = (meta.server1IP as string) || job.server1_ip || "";
+      const server2IP = (meta.server2IP as string) || job.server2_ip || "";
+
+      // Check A records for ns domain
+      for (const [hostname, expectedIP] of [
+        [`mail1.${job.ns_domain}`, server1IP],
+        [`mail2.${job.ns_domain}`, server2IP],
+      ]) {
+        try {
+          const result = execSync(`dig +short A ${hostname} @8.8.8.8`, { timeout: 10000 }).toString().trim();
+          if (result.includes(expectedIP)) {
+            results.push(`✓ A record ${hostname} → ${expectedIP}`);
+          } else {
+            failures.push(`✗ A record ${hostname}: expected ${expectedIP}, got ${result || "NXDOMAIN"}`);
+          }
+        } catch {
+          failures.push(`✗ A record lookup failed for ${hostname}`);
+        }
+      }
+
+      // Check SPF on sending domains
+      for (const domain of job.sending_domains || []) {
+        try {
+          const result = execSync(`dig +short TXT ${domain} @8.8.8.8`, { timeout: 10000 }).toString().trim();
+          if (result.includes("v=spf1")) {
+            results.push(`✓ SPF found for ${domain}`);
+          } else {
+            failures.push(`✗ No SPF record for ${domain}`);
+          }
+        } catch {
+          failures.push(`✗ SPF lookup failed for ${domain}`);
+        }
+      }
+
+      const output = [...results, ...failures].join("\n");
+      if (failures.length > 0) {
+        return {
+          output: `Verification completed with ${failures.length} issue(s):\n${output}`,
+          metadata: { failures, manualRequired: true },
+        };
+      }
+
+      return { output: `All verification checks passed:\n${output}` };
+    }
+
     default:
       throw new Error(`Step ${stepType} is not a serverless step`);
   }
@@ -215,10 +440,7 @@ async function dispatchToWorker(
  * - DryRun provider_type → simulate all steps inline (test/demo)
  * - Real providers:
  *   - Steps 3,5,8 (configure_registrar, set_ptr, verification_gate) → serverless
- *   - Steps 1,2,4,6,7 (create_vps, install_hestiacp, setup_dns_zones,
- *                      setup_mail_domains, security_hardening) → worker
- *     (create_vps was moved off serverless per Hard Lesson #59 —
- *     Linode boot polling exceeds Vercel's 60s cap.)
+ *   - Steps 1,2,4,6,7 (create_vps, install_hestiacp, setup_dns_zones, setup_mail_domains, security_hardening) → worker
  */
 export async function POST(
   _req: Request,
@@ -266,111 +488,28 @@ export async function POST(
       return NextResponse.json({ error: "Failed to load steps" }, { status: 500 });
     }
 
-    // Hard Lesson #59 (Test #14, 2026-04-10): NEVER silently advance
-    // past an in_progress step. The earlier bug was `steps.find(s =>
-    // s.status === "pending")` alone, which skipped the stranded Step 1
-    // (create_vps) after Vercel's 60s cap killed it, and dispatched
-    // Step 2 to the worker with undefined server IPs.
-    //
-    // New order of operations:
-    //   1. If ANY step is in_progress, that step owns the job — do not
-    //      pick a pending step past it. Either it's legitimately still
-    //      running (worker has it, or another Vercel invocation is
-    //      mid-flight) and we return "awaiting_worker"/"busy", OR it's
-    //      stale and we mark it failed and fail the whole job.
-    //   2. Only when there are ZERO in_progress steps do we look for a
-    //      new pending step.
-    //
-    // Staleness check: compare updated_at (or started_at) to
-    // STRANDED_STEP_TIMEOUT_MS. If older, the step is stranded — mark
-    // it failed, mark the job failed, and return 500 so the wizard
-    // shows the real error instead of silently moving on.
+    // Find first pending step
+    const pendingStep = steps.find((s: Record<string, unknown>) => s.status === "pending");
+    if (!pendingStep) {
+      // Check if any steps are still dispatched to worker (in_progress with dispatched_to_worker)
+      const workerStep = steps.find((s: Record<string, unknown>) => {
+        const meta = s.metadata as Record<string, unknown> | null;
+        return s.status === "in_progress" && meta?.dispatched_to_worker === true;
+      });
 
-    // --- Pass 1: detect any in_progress step ---------------------------
-    type DBStep = {
-      id: string;
-      step_type: string;
-      status: string;
-      metadata: Record<string, unknown> | null;
-      started_at: string | null;
-      updated_at: string | null;
-    };
-    const dbSteps = steps as DBStep[];
-
-    const inProgressStep = dbSteps.find((s) => s.status === "in_progress");
-    if (inProgressStep) {
-      const meta = inProgressStep.metadata as Record<string, unknown> | null;
-      const dispatchedAt = meta?.dispatched_at as string | undefined;
-      const lastTouchIso =
-        dispatchedAt ||
-        inProgressStep.updated_at ||
-        inProgressStep.started_at ||
-        null;
-      const lastTouchMs = lastTouchIso ? Date.parse(lastTouchIso) : NaN;
-      const ageMs = Number.isFinite(lastTouchMs)
-        ? Date.now() - lastTouchMs
-        : Number.POSITIVE_INFINITY;
-
-      if (ageMs > STRANDED_STEP_TIMEOUT_MS) {
-        // Stranded. Fail the step and the job. This is the ONLY branch
-        // that makes it past an in_progress step, and it does so by
-        // terminating the job, not by silently advancing.
-        const errorMsg = `Step "${inProgressStep.step_type}" stranded in_progress for ${Math.round(
-          ageMs / 1000
-        )}s (> ${Math.round(STRANDED_STEP_TIMEOUT_MS / 1000)}s limit). Likely Vercel function timeout or worker crash. Aborting job so it is not silently advanced past an incomplete step (Hard Lesson #59).`;
-
-        await supabase
-          .from("provisioning_steps")
-          .update({
-            status: "failed",
-            completed_at: new Date().toISOString(),
-            error_message: errorMsg,
-          })
-          .eq("id", inProgressStep.id);
-
-        await supabase
-          .from("provisioning_jobs")
-          .update({
-            status: "failed",
-            error_message: errorMsg,
-          })
-          .eq("id", jobId);
-
-        return NextResponse.json(
-          {
-            jobId,
-            step: inProgressStep.step_type,
-            status: "failed",
-            error: errorMsg,
-            progress_pct: job.progress_pct,
-            allComplete: false,
-          },
-          { status: 500 }
-        );
+      if (workerStep) {
+        // Worker is still processing — tell client to wait
+        return NextResponse.json({
+          jobId,
+          step: workerStep.step_type,
+          status: "awaiting_worker",
+          progress_pct: job.progress_pct,
+          allComplete: false,
+          output: `Step ${workerStep.step_type} is running on the worker VPS...`,
+        });
       }
 
-      // Fresh in_progress step — still running. Report back so the
-      // wizard keeps polling without dispatching anything new.
-      const statusLabel =
-        meta?.dispatched_to_worker === true ? "awaiting_worker" : "in_progress";
-
-      return NextResponse.json({
-        jobId,
-        step: inProgressStep.step_type,
-        status: statusLabel,
-        progress_pct: job.progress_pct,
-        allComplete: false,
-        output:
-          statusLabel === "awaiting_worker"
-            ? `Step ${inProgressStep.step_type} is running on the worker VPS...`
-            : `Step ${inProgressStep.step_type} is still running...`,
-      });
-    }
-
-    // --- Pass 2: no in_progress step — find the next pending ----------
-    const pendingStep = dbSteps.find((s) => s.status === "pending");
-    if (!pendingStep) {
-      // Nothing pending AND nothing in_progress → all done.
+      // All steps done
       return NextResponse.json({
         jobId,
         allComplete: true,
@@ -414,8 +553,6 @@ export async function POST(
       if (isDryRun) {
         // DryRun path — simulate all steps inline
         result = await executeDryRunStep(stepType, {
-          jobId,
-          orgId,
           nsDomain: job.ns_domain,
           sendingDomains: job.sending_domains || [],
           mailAccountsPerDomain: job.mail_accounts_per_domain || 3,
@@ -439,8 +576,12 @@ export async function POST(
           output: result.output,
         });
       } else if (SERVERLESS_STEPS.includes(stepType)) {
-        // API-only steps → execute inline (delegates to serverless-steps.ts)
-        result = await executeServerlessStep(stepType, jobId);
+        // API-only steps → execute inline with real providers
+        result = await executeServerlessStep(
+          stepType,
+          job as unknown as ProvisioningJobRow,
+          steps as Array<{ id: string; step_type: string; status: string; metadata: Record<string, unknown> }>
+        );
       } else {
         throw new Error(`Unknown step type: ${stepType}`);
       }
@@ -483,127 +624,28 @@ export async function POST(
           .eq("step_type", "create_vps")
           .single();
 
-        const server1IP = (createVpsStep?.metadata as Record<string, unknown>)?.server1IP as string || "10.0.0.1";
-        const server2IP = (createVpsStep?.metadata as Record<string, unknown>)?.server2IP as string || "10.0.0.2";
+        const server1IP = (createVpsStep?.metadata as Record<string, unknown>)?.server1IP as string || "";
+        const server2IP = (createVpsStep?.metadata as Record<string, unknown>)?.server2IP as string || "";
 
-        // Hard Lesson #50 (2026-04-10): this insert was using the LEGACY
-        // server1_ip/server2_ip/server1_hostname/server2_hostname column
-        // names that don't exist on the server_pairs table (actual schema
-        // uses s1_ip, s2_ip, s1_hostname, s2_hostname). The legacy monolithic
-        // handler got patched but THIS per-step path was missed, so every
-        // completed wizard job silently left server_pair_id=NULL on
-        // provisioning_jobs. Also: pair_number is NOT NULL on the table and
-        // must be computed per-org (UNIQUE (org_id, pair_number)). Never
-        // swallow the insert error — throw to fail the saga.
-        const { data: maxPairRow } = await supabase
-          .from("server_pairs")
-          .select("pair_number")
-          .eq("org_id", orgId)
-          .order("pair_number", { ascending: false })
-          .limit(1)
-          .maybeSingle();
+        if (!server1IP || !server2IP) {
+          throw new Error(`Server IPs missing from create_vps metadata: s1=${server1IP}, s2=${server2IP}`);
+        }
 
-        const nextPairNumber = ((maxPairRow?.pair_number as number) || 0) + 1;
-
-        // Hard Lesson #62 (2026-04-11): include provisioning_job_id on the
-        // server_pairs INSERT so future readers can hop server_pairs →
-        // provisioning_jobs → provisioning_steps without going through the
-        // ssh_credentials side door. Pair 10 (Test #14) was created without
-        // this FK and had to be backfilled by hand.
-        const { data: serverPair, error: serverPairError } = await supabase
+        // Create server_pair record (column names: s1_ip, s2_ip, s1_hostname, s2_hostname)
+        const { data: serverPair } = await supabase
           .from("server_pairs")
           .insert({
             org_id: orgId,
-            pair_number: nextPairNumber,
             ns_domain: job.ns_domain,
             s1_ip: server1IP,
-            s1_hostname: `mail1.${job.ns_domain}`,
             s2_ip: server2IP,
+            s1_hostname: `mail1.${job.ns_domain}`,
             s2_hostname: `mail2.${job.ns_domain}`,
-            status: "complete",
-            provisioning_job_id: jobId,
+            status: "active",
+            health_status: "healthy",
           })
           .select()
           .single();
-
-        if (serverPairError || !serverPair) {
-          throw new Error(
-            `Failed to insert server_pairs row: ${serverPairError?.message || "unknown"}`
-          );
-        }
-
-        // Create email_accounts from setup_mail_domains metadata
-        const { data: mailStep } = await supabase
-          .from("provisioning_steps")
-          .select("metadata")
-          .eq("job_id", jobId)
-          .eq("step_type", "setup_mail_domains")
-          .single();
-
-        const mailMeta = (mailStep?.metadata as Record<string, unknown>) || {};
-        const allAccounts = mailMeta.allAccountsCreated as Record<string, string[]> | undefined;
-        const s1Domains = (mailMeta.server1Domains as string[]) || [];
-
-        if (allAccounts && Object.keys(allAccounts).length > 0) {
-          // Read mail password from ssh_credentials
-          let mailPassword = "";
-          try {
-            const { data: sshCreds } = await supabase
-              .from("ssh_credentials")
-              .select("password_encrypted")
-              .eq("provisioning_job_id", jobId)
-              .limit(1)
-              .maybeSingle();
-
-            if (sshCreds?.password_encrypted) {
-              const { decrypt } = await import("@/lib/provisioning/encryption");
-              mailPassword = decrypt(sshCreds.password_encrypted);
-            }
-          } catch (decryptErr) {
-            console.error(`[ExecuteStep] Failed to decrypt mail password: ${decryptErr}`);
-          }
-
-          const accountRows = [];
-          for (const [domain, names] of Object.entries(allAccounts)) {
-            const isS1 = s1Domains.includes(domain);
-            const serverIP = isS1 ? server1IP : server2IP;
-            for (const name of names) {
-              const email = `${name}@${domain}`;
-              accountRows.push({
-                org_id: orgId,
-                email,
-                display_name: name
-                  .split(".")
-                  .map((n: string) => n.charAt(0).toUpperCase() + n.slice(1))
-                  .join(" "),
-                server_pair_id: serverPair.id,
-                smtp_host: serverIP,
-                smtp_port: 587,
-                smtp_user: email,
-                smtp_pass: mailPassword,
-                imap_host: serverIP,
-                imap_port: 993,
-                status: "active",
-                daily_send_limit: 50,
-              });
-            }
-          }
-
-          if (accountRows.length > 0) {
-            const { error: emailInsertErr } = await supabase
-              .from("email_accounts")
-              .insert(accountRows);
-            if (emailInsertErr) {
-              console.error(
-                `[ExecuteStep] email_accounts insert failed: ${emailInsertErr.message}`
-              );
-            } else {
-              console.log(
-                `[ExecuteStep] Inserted ${accountRows.length} email accounts for pair ${serverPair.id}`
-              );
-            }
-          }
-        }
 
         // Mark job as completed
         await supabase
@@ -612,19 +654,11 @@ export async function POST(
             status: "completed",
             progress_pct: 100,
             completed_at: new Date().toISOString(),
-            server_pair_id: serverPair.id,
+            server_pair_id: serverPair?.id || null,
             server1_ip: server1IP,
             server2_ip: server2IP,
           })
           .eq("id", jobId);
-
-        // NOTE: ssh_credentials rows were already inserted in Step 1
-        // (create_vps) and linked to the job via provisioning_job_id. The
-        // job row now has server_pair_id, so any reader can hop:
-        //   ssh_credentials.provisioning_job_id → provisioning_jobs.id
-        //   → provisioning_jobs.server_pair_id → server_pairs.id
-        // Migration 010 deliberately did not add server_pair_id to
-        // ssh_credentials — leave it that way to keep the schema tight.
 
         return NextResponse.json({
           jobId,

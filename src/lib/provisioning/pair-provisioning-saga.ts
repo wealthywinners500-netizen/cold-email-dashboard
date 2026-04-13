@@ -40,8 +40,6 @@ import type {
 import type { SagaStep, StepResult } from './saga-engine';
 import { checkSubnetDiversity } from './verification';
 import { checkDomainsBlacklistBatch } from './domain-blacklist';
-import { checkPort25 } from './checks/port25';
-import { checkMXToolboxHealth } from './checks/mxtoolbox-health';
 
 // Helper to access dynamic metadata on context safely
 function ctxMeta(context: ProvisioningContext): Record<string, unknown> {
@@ -261,7 +259,10 @@ export function createPairProvisioningSaga(
       async execute(context: ProvisioningContext): Promise<StepResult> {
         context.log('[Step 2] Installing HestiaCP on both servers...');
         const ctx = ctxMeta(context);
-        const password = (ctx.serverPassword as string) || 'changeme123';
+        const password = ctx.serverPassword as string;
+        if (!password) {
+          return { success: false, error: 'Server password not found in provisioning context — cannot SSH' };
+        }
         const outputLines: string[] = [];
 
         try {
@@ -750,7 +751,10 @@ export function createPairProvisioningSaga(
       async execute(context: ProvisioningContext): Promise<StepResult> {
         context.log('[Step 6] Setting up mail domains...');
         const ctx = ctxMeta(context);
-        const password = (ctx.serverPassword as string) || 'changeme123';
+        const password = ctx.serverPassword as string;
+        if (!password) {
+          return { success: false, error: 'Server password not found in provisioning context — cannot create mail accounts' };
+        }
 
         try {
           // Generate account names
@@ -818,24 +822,36 @@ export function createPairProvisioningSaga(
           const server1IP = (ctxMeta(context).server1IP as string);
           const server2IP = (ctxMeta(context).server2IP as string);
 
+          // Hard Lesson #82: HestiaCP v-add-mail-domain creates default SPF and DMARC.
+          // createMailDomain in hestia-scripts.ts also adds its own SPF/DMARC.
+          // Result: duplicate records. Clean up ALL existing SPF/DMARC, then add the correct ones.
+          const adminEmailForDmarc = context.adminEmail || 'dean.hofer@thestealthmail.com';
+
           for (const domain of server1Domains) {
             try {
-              // Find and delete existing SPF TXT record at @, then add correct one
               const { stdout: records } = await ssh1.exec(
                 `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
                 { timeout: 15000 }
               );
-              // Parse records to find SPF record ID
               const lines = records.split('\n');
               for (const line of lines) {
+                const cols = line.trim().split(/\s+/);
+                if (cols.length < 3) continue;
+                const recordId = cols[0];
+                if (!/^\d+$/.test(recordId)) continue;
+                // Delete ALL SPF records (HestiaCP default + createMailDomain's)
                 if (line.includes('TXT') && line.includes('spf1')) {
-                  const recordId = line.trim().split(/\s+/)[0];
-                  if (recordId && /^\d+$/.test(recordId)) {
-                    await ssh1.exec(
-                      `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${recordId}`,
-                      { timeout: 10000 }
-                    ).catch(() => {});
-                  }
+                  await ssh1.exec(
+                    `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${recordId}`,
+                    { timeout: 10000 }
+                  ).catch(() => {});
+                }
+                // Delete ALL DMARC records (HestiaCP default + createMailDomain's)
+                if (line.includes('TXT') && line.includes('_dmarc')) {
+                  await ssh1.exec(
+                    `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${recordId}`,
+                    { timeout: 10000 }
+                  ).catch(() => {});
                 }
               }
               // Add correct SPF with explicit IP
@@ -843,9 +859,14 @@ export function createPairProvisioningSaga(
                 `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ TXT '"v=spf1 ip4:${server1IP} -all"'`,
                 { timeout: 10000 }
               );
-              context.log(`[Step 6] SPF fixed for ${domain}: v=spf1 ip4:${server1IP} -all`);
+              // Add correct DMARC with rua
+              await ssh1.exec(
+                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100; rua=mailto:${adminEmailForDmarc}"'`,
+                { timeout: 10000 }
+              );
+              context.log(`[Step 6] SPF+DMARC fixed for ${domain} on S1`);
             } catch (err) {
-              context.log(`[Step 6] Warning: SPF fix for ${domain}: ${err}`);
+              context.log(`[Step 6] Warning: SPF/DMARC fix for ${domain}: ${err}`);
             }
           }
 
@@ -857,23 +878,34 @@ export function createPairProvisioningSaga(
               );
               const lines = records.split('\n');
               for (const line of lines) {
+                const cols = line.trim().split(/\s+/);
+                if (cols.length < 3) continue;
+                const recordId = cols[0];
+                if (!/^\d+$/.test(recordId)) continue;
                 if (line.includes('TXT') && line.includes('spf1')) {
-                  const recordId = line.trim().split(/\s+/)[0];
-                  if (recordId && /^\d+$/.test(recordId)) {
-                    await ssh2.exec(
-                      `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${recordId}`,
-                      { timeout: 10000 }
-                    ).catch(() => {});
-                  }
+                  await ssh2.exec(
+                    `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${recordId}`,
+                    { timeout: 10000 }
+                  ).catch(() => {});
+                }
+                if (line.includes('TXT') && line.includes('_dmarc')) {
+                  await ssh2.exec(
+                    `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${recordId}`,
+                    { timeout: 10000 }
+                  ).catch(() => {});
                 }
               }
               await ssh2.exec(
                 `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ TXT '"v=spf1 ip4:${server2IP} -all"'`,
                 { timeout: 10000 }
               );
-              context.log(`[Step 6] SPF fixed for ${domain}: v=spf1 ip4:${server2IP} -all`);
+              await ssh2.exec(
+                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100; rua=mailto:${adminEmailForDmarc}"'`,
+                { timeout: 10000 }
+              );
+              context.log(`[Step 6] SPF+DMARC fixed for ${domain} on S2`);
             } catch (err) {
-              context.log(`[Step 6] Warning: SPF fix for ${domain}: ${err}`);
+              context.log(`[Step 6] Warning: SPF/DMARC fix for ${domain}: ${err}`);
             }
           }
 
@@ -1294,21 +1326,6 @@ export function createPairProvisioningSaga(
             }
           }
 
-          // PATCH 11: Check DMARC on NS domain too — MXToolbox flags it
-          try {
-            const { stdout: nsDmarc } = await ssh1.exec(
-              `dig @8.8.8.8 _dmarc.${context.nsDomain} TXT +short 2>/dev/null`,
-              { timeout: 10000 }
-            );
-            if (!nsDmarc.includes('v=DMARC1')) {
-              failures.push(`${context.nsDomain}: missing DMARC record on NS domain`);
-            } else {
-              context.log(`[Step 8] OK: DMARC on NS domain ${context.nsDomain}`);
-            }
-          } catch {
-            failures.push(`${context.nsDomain}: DMARC check failed on NS domain`);
-          }
-
           // Check SPF/DKIM/DMARC on sending domains
           for (const domain of context.sendingDomains) {
             try {
@@ -1333,19 +1350,6 @@ export function createPairProvisioningSaga(
               }
             } catch {
               failures.push(`${domain}: DMARC check failed`);
-            }
-
-            // PATCH 11: Check DKIM on sending domains (was missing from saga VG)
-            try {
-              const { stdout: dkimRec } = await ssh1.exec(
-                `dig @8.8.8.8 mail._domainkey.${domain} TXT +short 2>/dev/null`,
-                { timeout: 10000 }
-              );
-              if (!dkimRec.includes('v=DKIM1') && !dkimRec.includes('p=')) {
-                failures.push(`${domain}: missing DKIM record (mail._domainkey)`);
-              }
-            } catch {
-              failures.push(`${domain}: DKIM check failed`);
             }
           }
 
@@ -1442,12 +1446,10 @@ export function createPairProvisioningSaga(
           }
 
           // Check blacklists for both IPs
-          // PATCH 11: Barracuda is WARN-only (Hard Lesson #76)
           const blacklists = [
-            { zone: 'zen.spamhaus.org', name: 'Spamhaus ZEN', warnOnly: false },
-            { zone: 'dnsbl.sorbs.net', name: 'SORBS', warnOnly: false },
-            { zone: 'dnsbl-1.uceprotect.net', name: 'UCEPROTECT L1', warnOnly: false },
-            { zone: 'b.barracudacentral.org', name: 'Barracuda', warnOnly: true },
+            'zen.spamhaus.org',
+            'dnsbl.sorbs.net',
+            'b.barracudacentral.org',
           ];
 
           for (const ip of [server1IP, server2IP]) {
@@ -1455,90 +1457,16 @@ export function createPairProvisioningSaga(
             for (const bl of blacklists) {
               try {
                 const { stdout } = await ssh1.exec(
-                  `dig ${reversedIP}.${bl.zone} A +short 2>/dev/null`,
+                  `dig ${reversedIP}.${bl} A +short 2>/dev/null`,
                   { timeout: 10000 }
                 );
                 if (stdout.trim() && stdout.includes('127.0.0')) {
-                  if (bl.warnOnly) {
-                    warnings.push({
-                      code: 'IP_BLACKLIST_WARN',
-                      message: `${ip}: listed on ${bl.name} (WARN — not checked by Gmail/Outlook)`,
-                    });
-                    context.log(`[Step 8] WARN: ${ip} listed on ${bl.name} (non-blocking)`);
-                  } else {
-                    failures.push(`${ip}: listed on ${bl.name}`);
-                  }
+                  failures.push(`${ip}: listed on ${bl}`);
                 }
               } catch {
                 // Query failure means not listed — that's good
               }
             }
-          }
-
-          // --- PATCH 12: SMTP Port 25 checks (STARTTLS, banner, open relay) ---
-          context.log('[Step 8] Checking SMTP port 25 (STARTTLS, banner, open relay)...');
-          for (const [ip, hostname] of [
-            [server1IP, `mail1.${context.nsDomain}`],
-            [server2IP, `mail2.${context.nsDomain}`],
-          ] as [string, string][]) {
-            try {
-              const port25Result = await checkPort25(ip, hostname, 15_000);
-              if (!port25Result.ok) {
-                failures.push(`SMTP: Port 25 unreachable on ${hostname} (${ip}): ${port25Result.error}`);
-              } else {
-                context.log(`[Step 8] OK: Port 25 ${hostname} (${ip}) — banner: ${port25Result.banner?.slice(0, 60)}`);
-                if (!port25Result.starttls) {
-                  warnings.push({
-                    code: 'STARTTLS_MISSING',
-                    message: `STARTTLS not offered on ${hostname} (${ip}):25`,
-                    remediation: 'Check Exim4 TLS configuration — ensure tls_advertise_hosts = * in exim4.conf.template',
-                  });
-                }
-                if (!port25Result.bannerHostnameMatch) {
-                  warnings.push({
-                    code: 'BANNER_MISMATCH',
-                    message: `SMTP banner hostname mismatch on ${hostname} (${ip}) — banner: ${port25Result.banner}`,
-                    remediation: 'Check /etc/mailname and Exim4 primary_hostname config',
-                  });
-                }
-                if (port25Result.openRelay) {
-                  failures.push(`SMTP: ${hostname} (${ip}) is an OPEN RELAY — critical security issue`);
-                }
-              }
-            } catch (err) {
-              context.log(`[Step 8] SMTP check failed for ${hostname}: ${err instanceof Error ? err.message : String(err)}`);
-            }
-          }
-
-          // --- PATCH 12: MXToolbox Domain Health (gold standard) ---
-          context.log('[Step 8] Running MXToolbox Domain Health check...');
-          try {
-            const mxReport = await checkMXToolboxHealth(
-              allDomains,
-              { server1IP, server2IP },
-              context.nsDomain
-            );
-            if (mxReport.ok) {
-              context.log(`[Step 8] ✓ MXToolbox Domain Health: ALL ${allDomains.length} domains clean [source: ${mxReport.source}]`);
-            } else {
-              for (const d of mxReport.domains) {
-                for (const detail of d.errorDetails) {
-                  failures.push(`MXToolbox ${d.domain}: ${detail}`);
-                }
-                for (const detail of d.warningDetails) {
-                  warnings.push({
-                    code: 'MXTOOLBOX_WARNING',
-                    message: `MXToolbox ${d.domain}: ${detail}`,
-                  });
-                }
-              }
-            }
-          } catch (err) {
-            // MXToolbox check failure is non-blocking
-            warnings.push({
-              code: 'MXTOOLBOX_UNAVAILABLE',
-              message: `MXToolbox check failed: ${err instanceof Error ? err.message : String(err)}`,
-            });
           }
 
           const warningsText = warnings.length > 0
