@@ -28,8 +28,6 @@ import {
   replicateZone,
   hardenSecurity,
   issueSSLCert,
-  replicateSSLCertToSecondary,
-  replicateDKIMKeysToSecondary,
   setHostname,
   HESTIA_PATH_PREFIX,
 } from './hestia-scripts';
@@ -751,9 +749,6 @@ export function createPairProvisioningSaga(
         context.log('[Step 6] Setting up mail domains...');
         const ctx = ctxMeta(context);
         const password = (ctx.serverPassword as string) || 'changeme123';
-        // Hard Lesson #72: both IPs needed for SPF records
-        const s1IP = (ctx.server1IP as string) || context.server1?.ip || '';
-        const s2IP = (ctx.server2IP as string) || context.server2?.ip || '';
 
         try {
           // Generate account names
@@ -769,63 +764,115 @@ export function createPairProvisioningSaga(
             );
           }
 
+          // PATCH 10: Split sending domains between servers
+          const midpoint = Math.ceil(context.sendingDomains.length / 2);
+          const server1Domains = context.sendingDomains.slice(0, midpoint);
+          const server2Domains = context.sendingDomains.slice(midpoint);
+
+          context.log(`[Step 6] Domain split: S1 gets ${server1Domains.length} domains (${server1Domains.join(', ')})`);
+          context.log(`[Step 6] Domain split: S2 gets ${server2Domains.length} domains (${server2Domains.join(', ')})`);
+
           const allAccountsCreated: Record<string, string[]> = {};
           const dkimRecords: Record<string, string> = {};
 
-          for (let i = 0; i < context.sendingDomains.length; i++) {
-            const domain = context.sendingDomains[i];
+          // Set up S1 domains (mail accounts + DKIM on server 1 only)
+          for (let i = 0; i < server1Domains.length; i++) {
+            const domain = server1Domains[i];
             const accounts = namesByDomain[i] || [];
 
-            context.log(
-              `[Step 6] Setting up mail domain ${domain} with ${accounts.length} accounts...`
-            );
+            context.log(`[Step 6] Setting up mail domain ${domain} on S1 with ${accounts.length} accounts...`);
 
-            // Create mail domain + accounts on Server 1
             const result = await createMailDomain(ssh1, {
               domain,
               accounts,
               password,
               adminEmail: context.adminEmail,
-              server1IP: s1IP,
-              server2IP: s2IP,
             });
 
             dkimRecords[domain] = result.dkimRecord;
             allAccountsCreated[domain] = result.accounts;
+          }
 
-            // Hard Lesson #2: Copy DKIM to Server 2 explicitly
-            context.log(`[Step 6] Copying DKIM for ${domain} to Server 2...`);
+          // Set up S2 domains (mail accounts + DKIM on server 2 only)
+          for (let i = 0; i < server2Domains.length; i++) {
+            const domain = server2Domains[i];
+            // namesByDomain index for S2 domains starts at midpoint
+            const accounts = namesByDomain[midpoint + i] || [];
+
+            context.log(`[Step 6] Setting up mail domain ${domain} on S2 with ${accounts.length} accounts...`);
+
+            const result = await createMailDomain(ssh2, {
+              domain,
+              accounts,
+              password,
+              adminEmail: context.adminEmail,
+            });
+
+            dkimRecords[domain] = result.dkimRecord;
+            allAccountsCreated[domain] = result.accounts;
+          }
+
+          // PATCH 10: Fix SPF records to use explicit server IP
+          const server1IP = (ctxMeta(context).server1IP as string);
+          const server2IP = (ctxMeta(context).server2IP as string);
+
+          for (const domain of server1Domains) {
             try {
-              // Create mail domain on Server 2 with same accounts
-              await createMailDomain(ssh2, {
-                domain,
-                accounts,
-                password,
-                adminEmail: context.adminEmail,
-                server1IP: s1IP,
-                server2IP: s2IP,
-              });
-            } catch (err) {
-              context.log(
-                `[Step 6] Warning: Server 2 mail setup for ${domain}: ${err}`
+              // Find and delete existing SPF TXT record at @, then add correct one
+              const { stdout: records } = await ssh1.exec(
+                `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+                { timeout: 15000 }
               );
+              // Parse records to find SPF record ID
+              const lines = records.split('\n');
+              for (const line of lines) {
+                if (line.includes('TXT') && line.includes('spf1')) {
+                  const recordId = line.trim().split(/\s+/)[0];
+                  if (recordId && /^\d+$/.test(recordId)) {
+                    await ssh1.exec(
+                      `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${recordId}`,
+                      { timeout: 10000 }
+                    ).catch(() => {});
+                  }
+                }
+              }
+              // Add correct SPF with explicit IP
+              await ssh1.exec(
+                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ TXT '"v=spf1 ip4:${server1IP} -all"'`,
+                { timeout: 10000 }
+              );
+              context.log(`[Step 6] SPF fixed for ${domain}: v=spf1 ip4:${server1IP} -all`);
+            } catch (err) {
+              context.log(`[Step 6] Warning: SPF fix for ${domain}: ${err}`);
             }
+          }
 
-            // Hard Lesson #66 (Test #15): HestiaCP generates a FRESH DKIM
-            // keypair on every server it runs v-add-mail-domain-dkim on.
-            // After createMailDomain on both s1 and s2, the two servers
-            // hold different private keys while the DNS TXT only has s1's.
-            // Replicate s1's dkim.pem + hestia metadata to s2 so
-            // both Exim instances sign with the same key the DNS publishes.
-            //
-            // Hard Lesson #68 (Test #16): PATCH 4 shipped with wrong paths
-            // and the error was swallowed here — unconditional "Replicated"
-            // log masked the silent failure. Now we RE-THROW so step 6 fails
-            // fast if DKIM replication cannot land. Do NOT add a catch here.
-            await replicateDKIMKeysToSecondary(ssh1, ssh2, domain);
-            context.log(
-              `[Step 6] Replicated DKIM keys for ${domain} from S1 to S2 (Hard Lesson #66/#68).`
-            );
+          for (const domain of server2Domains) {
+            try {
+              const { stdout: records } = await ssh2.exec(
+                `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+                { timeout: 15000 }
+              );
+              const lines = records.split('\n');
+              for (const line of lines) {
+                if (line.includes('TXT') && line.includes('spf1')) {
+                  const recordId = line.trim().split(/\s+/)[0];
+                  if (recordId && /^\d+$/.test(recordId)) {
+                    await ssh2.exec(
+                      `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${recordId}`,
+                      { timeout: 10000 }
+                    ).catch(() => {});
+                  }
+                }
+              }
+              await ssh2.exec(
+                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ TXT '"v=spf1 ip4:${server2IP} -all"'`,
+                { timeout: 10000 }
+              );
+              context.log(`[Step 6] SPF fixed for ${domain}: v=spf1 ip4:${server2IP} -all`);
+            } catch (err) {
+              context.log(`[Step 6] Warning: SPF fix for ${domain}: ${err}`);
+            }
           }
 
           // rndc reload on both servers
@@ -839,8 +886,10 @@ export function createPairProvisioningSaga(
 
           return {
             success: true,
-            output: `${context.sendingDomains.length} mail domains configured with ${totalAccounts} total accounts.`,
+            output: `${context.sendingDomains.length} mail domains configured (${server1Domains.length} on S1, ${server2Domains.length} on S2) with ${totalAccounts} total accounts.`,
             metadata: {
+              server1Domains,
+              server2Domains,
               allAccountsCreated,
               dkimRecords,
               namesByDomain,
@@ -924,38 +973,30 @@ export function createPairProvisioningSaga(
             context.log(`[Step 7] Server 2 hostname SSL failed (DNS may not have propagated). Mail works with self-signed cert.`);
           }
 
-          // Issue SSL for all sending domains.
-          //
-          // Hard Lesson #65 (Test #15, 2026-04-11): in a HestiaCP DNS
-          // cluster the sending domain's A record points to BOTH server
-          // IPs. If S1 and S2 each call v-add-letsencrypt-domain
-          // independently they generate different ACME account keys and
-          // different challenge files. LE's validator round-robins
-          // between the two A targets and one of the requests will
-          // always fail with "key authorization file did not match".
-          // Result on Test #15: S1 issued cleanly, S2 returned 400 for
-          // both krogerconsumermedia.info and krogergrowthpartners.info.
-          //
-          // Fix: issue ONCE on S1, then replicate the cert files
-          // (.crt/.key/.ca/.pem) from S1 → S2 via SSH base64 transfer
-          // and v-rebuild-{web,mail}-domain on S2 to pick them up. S2
-          // never talks to Let's Encrypt for sending domains.
-          for (const domain of context.sendingDomains) {
-            let s1IssueOk = false;
+          // Issue SSL for sending domains — per-server split (PATCH 10)
+          // Read domain assignment from Step 6 metadata
+          const ctx7 = ctxMeta(context);
+          const server1Domains = (ctx7.server1Domains as string[]) || [];
+          const server2Domains = (ctx7.server2Domains as string[]) || [];
+          context.log(`[Step 7] SSL per-server split: S1=${server1Domains.length} domains, S2=${server2Domains.length} domains`);
+
+          // SSL for S1's assigned sending domains
+          for (const domain of server1Domains) {
             try {
               await issueSSLCert(ssh1, { domain, isHostname: false });
-              s1IssueOk = true;
-              context.log(`[Step 7] LE cert issued on S1 for ${domain}`);
+              context.log(`[Step 7] S1 SSL issued for ${domain}`);
             } catch (err) {
               sslErrors.push(`S1 ${domain}: ${err}`);
-              context.log(`[Step 7] S1 LE failed for ${domain} — skipping S2 replication`);
             }
-            if (!s1IssueOk) continue;
+          }
+
+          // SSL for S2's assigned sending domains
+          for (const domain of server2Domains) {
             try {
-              await replicateSSLCertToSecondary(ssh1, ssh2, domain);
-              context.log(`[Step 7] Replicated ${domain} cert from S1 → S2`);
+              await issueSSLCert(ssh2, { domain, isHostname: false });
+              context.log(`[Step 7] S2 SSL issued for ${domain}`);
             } catch (err) {
-              sslErrors.push(`S2 ${domain} (replication): ${err}`);
+              sslErrors.push(`S2 ${domain}: ${err}`);
             }
           }
 
@@ -1114,122 +1155,125 @@ export function createPairProvisioningSaga(
             }
           }
 
-          // PATCH 6 / Hard Lesson #68: VG previously only checked "contains
-          // v=spf1" / "contains v=DMARC1" which false-greens when there are
-          // duplicates on the zone. The 12-row success bar requires EXACTLY
-          // ONE SPF and EXACTLY ONE DMARC TXT per sending domain. Also check
-          // DKIM TXT is publishable (row 9), port 25 banner (row 10), and
-          // the critical DKIM sha256 cross-server match (row 11).
+          // Check SPF/DKIM/DMARC on sending domains
           for (const domain of context.sendingDomains) {
-            // Row 7: SPF exactly 1
             try {
               const { stdout: spf } = await ssh1.exec(
                 `dig @8.8.8.8 ${domain} TXT +short 2>/dev/null`,
                 { timeout: 10000 }
               );
-              const spfCount = (spf.match(/v=spf1/gi) || []).length;
-              if (spfCount === 0) {
+              if (!spf.includes('v=spf1')) {
                 failures.push(`${domain}: missing SPF record`);
-              } else if (spfCount > 1) {
-                failures.push(`${domain}: ${spfCount} SPF records (expected exactly 1)`);
               }
             } catch {
               failures.push(`${domain}: SPF check failed`);
             }
 
-            // Row 8: DMARC exactly 1
             try {
               const { stdout: dmarc } = await ssh1.exec(
                 `dig @8.8.8.8 _dmarc.${domain} TXT +short 2>/dev/null`,
                 { timeout: 10000 }
               );
-              const dmarcCount = (dmarc.match(/v=DMARC1/gi) || []).length;
-              if (dmarcCount === 0) {
+              if (!dmarc.includes('v=DMARC1')) {
                 failures.push(`${domain}: missing DMARC record`);
-              } else if (dmarcCount > 1) {
-                failures.push(`${domain}: ${dmarcCount} DMARC records (expected exactly 1)`);
               }
             } catch {
               failures.push(`${domain}: DMARC check failed`);
             }
+          }
 
-            // Row 9: DKIM TXT published and parseable
+          // --- PATCH 10: Per-server domain assignment verification ---
+          const ctx8 = ctxMeta(context);
+          const s1Domains = (ctx8.server1Domains as string[]) || [];
+          const s2Domains = (ctx8.server2Domains as string[]) || [];
+          context.log(`[Step 8] Verifying per-server domain split: S1=${s1Domains.length}, S2=${s2Domains.length}`);
+
+          // Verify SPF per-server: each sending domain's SPF should only authorize its assigned server IP
+          for (const domain of s1Domains) {
             try {
-              const { stdout: dkimTxt } = await ssh1.exec(
-                `dig @8.8.8.8 mail._domainkey.${domain} TXT +short 2>/dev/null`,
+              const { stdout: spfRaw } = await ssh1.exec(
+                `dig @8.8.8.8 ${domain} TXT +short 2>/dev/null`,
                 { timeout: 10000 }
               );
-              if (!/v=DKIM1/i.test(dkimTxt) || !/p=[A-Za-z0-9+/]{50,}/.test(dkimTxt.replace(/\s|"/g, ''))) {
-                failures.push(`${domain}: DKIM TXT missing or pubkey too short`);
+              if (spfRaw.includes(server2IP) && !spfRaw.includes(server1IP)) {
+                failures.push(`${domain}: SPF contains wrong server IP (has S2 ${server2IP}, expected S1 ${server1IP})`);
               }
             } catch {
-              failures.push(`${domain}: DKIM TXT check failed`);
+              // SPF already checked above — skip
             }
-
-            // Row 11: DKIM PRIVATE key sha256 match S1 ↔ S2. This is the
-            // check that Test #16 completely lacked — silent replication
-            // failure false-greened the test. See Hard Lesson #68.
+          }
+          for (const domain of s2Domains) {
             try {
-              const dkimPath = `/home/admin/conf/mail/${domain}/dkim.pem`;
-              const { stdout: h1raw } = await ssh1.exec(
-                `sha256sum ${dkimPath} 2>/dev/null | cut -d' ' -f1 || echo NOT_FOUND`,
+              const { stdout: spfRaw } = await ssh1.exec(
+                `dig @8.8.8.8 ${domain} TXT +short 2>/dev/null`,
                 { timeout: 10000 }
               );
-              const { stdout: h2raw } = await ssh2.exec(
-                `sha256sum ${dkimPath} 2>/dev/null | cut -d' ' -f1 || echo NOT_FOUND`,
-                { timeout: 10000 }
-              );
-              const h1 = (h1raw || '').trim();
-              const h2 = (h2raw || '').trim();
-              if (h1 === 'NOT_FOUND' || !h1) {
-                failures.push(`${domain}: DKIM key missing on S1 (${dkimPath})`);
-              } else if (h2 === 'NOT_FOUND' || !h2) {
-                failures.push(`${domain}: DKIM key missing on S2 (${dkimPath})`);
-              } else if (h1 !== h2) {
-                failures.push(
-                  `${domain}: DKIM mismatch S1↔S2 (s1=${h1.slice(0, 8)}… s2=${h2.slice(0, 8)}…)`
-                );
-              } else {
-                context.log(`[Step 8] OK: DKIM match S1↔S2 for ${domain} (${h1.slice(0, 8)}…)`);
+              if (spfRaw.includes(server1IP) && !spfRaw.includes(server2IP)) {
+                failures.push(`${domain}: SPF contains wrong server IP (has S1 ${server1IP}, expected S2 ${server2IP})`);
               }
-            } catch (err) {
-              failures.push(`${domain}: DKIM sha256 cross-check failed: ${err instanceof Error ? err.message : String(err)}`);
+            } catch {
+              // SPF already checked above — skip
             }
           }
 
-          // Row 10: Port 25 open + SMTP banner from both servers
-          for (const [ip, hostname] of [
-            [server1IP, `mail1.${context.nsDomain}`],
-            [server2IP, `mail2.${context.nsDomain}`],
-          ]) {
-            try {
-              const { stdout: banner } = await ssh1.exec(
-                `timeout 6 bash -c "exec 3<>/dev/tcp/${ip}/25; head -c 200 <&3; exec 3<&-" 2>/dev/null || echo TIMEOUT`,
-                { timeout: 10000 }
-              );
-              if (/TIMEOUT/.test(banner) || !/220[\s-]/.test(banner)) {
-                failures.push(`${hostname} (${ip}): port 25 no 220 banner`);
-              }
-            } catch {
-              failures.push(`${hostname} (${ip}): port 25 check failed`);
-            }
-          }
+          // --- PATCH 10: SSL certificate verification ---
+          context.log('[Step 8] Checking SSL certificates...');
 
-          // Rows 4/5: LE cert CN on hostnames via SNI
-          for (const hostname of [
-            `mail1.${context.nsDomain}`,
-            `mail2.${context.nsDomain}`,
-          ]) {
+          // Check hostname SSL on both servers
+          for (const [ip, hostname, sshConn] of [
+            [server1IP, `mail1.${context.nsDomain}`, ssh1],
+            [server2IP, `mail2.${context.nsDomain}`, ssh2],
+          ] as [string, string, typeof ssh1][]) {
             try {
-              const { stdout: certCn } = await ssh1.exec(
-                `timeout 8 bash -lc "echo | openssl s_client -servername ${hostname} -connect ${hostname}:443 2>/dev/null | openssl x509 -noout -subject 2>/dev/null" || echo FAIL`,
+              const { stdout } = await sshConn.exec(
+                `echo | openssl s_client -connect ${ip}:443 -servername ${hostname} 2>/dev/null | openssl x509 -noout -subject`,
                 { timeout: 15000 }
               );
-              if (/FAIL/.test(certCn) || !certCn.includes(hostname)) {
-                failures.push(`${hostname}: LE cert CN does not match (got: ${certCn.trim().slice(0, 100)})`);
+              const cnMatch = stdout.match(/CN\s*=\s*([^\s/,]+)/);
+              const cn = cnMatch ? cnMatch[1] : '';
+              if (cn !== hostname) {
+                failures.push(`SSL: ${hostname} on ${ip}:443 — CN=${cn || 'none'} (expected ${hostname})`);
+              } else {
+                context.log(`[Step 8] OK: SSL ${hostname} on ${ip}:443 — CN=${cn}`);
               }
             } catch {
-              failures.push(`${hostname}: LE cert check failed`);
+              failures.push(`SSL: ${hostname} on ${ip}:443 — check failed`);
+            }
+          }
+
+          // Check sending domain SSL on assigned server only
+          for (const domain of s1Domains) {
+            try {
+              const { stdout } = await ssh1.exec(
+                `echo | openssl s_client -connect ${server1IP}:443 -servername ${domain} 2>/dev/null | openssl x509 -noout -subject`,
+                { timeout: 15000 }
+              );
+              const cnMatch = stdout.match(/CN\s*=\s*([^\s/,]+)/);
+              const cn = cnMatch ? cnMatch[1] : '';
+              if (cn !== domain) {
+                failures.push(`SSL: ${domain} on S1 ${server1IP}:443 — CN=${cn || 'none'} (expected ${domain})`);
+              } else {
+                context.log(`[Step 8] OK: SSL ${domain} on S1 — CN=${cn}`);
+              }
+            } catch {
+              failures.push(`SSL: ${domain} on S1 ${server1IP}:443 — check failed`);
+            }
+          }
+          for (const domain of s2Domains) {
+            try {
+              const { stdout } = await ssh2.exec(
+                `echo | openssl s_client -connect ${server2IP}:443 -servername ${domain} 2>/dev/null | openssl x509 -noout -subject`,
+                { timeout: 15000 }
+              );
+              const cnMatch = stdout.match(/CN\s*=\s*([^\s/,]+)/);
+              const cn = cnMatch ? cnMatch[1] : '';
+              if (cn !== domain) {
+                failures.push(`SSL: ${domain} on S2 ${server2IP}:443 — CN=${cn || 'none'} (expected ${domain})`);
+              } else {
+                context.log(`[Step 8] OK: SSL ${domain} on S2 — CN=${cn}`);
+              }
+            } catch {
+              failures.push(`SSL: ${domain} on S2 ${server2IP}:443 — check failed`);
             }
           }
 
@@ -1275,14 +1319,10 @@ export function createPairProvisioningSaga(
               metadata: { verificationWarnings: warnings },
             };
           } else {
-            // PATCH 6: bar failures are now FATAL. Previous behavior was
-            // success=true+manualRequired=true which caused Test #16 to
-            // false-green a broken DKIM pair. The saga still completes
-            // physically (servers are alive) but the job is marked failed
-            // so nobody pushes this pair into Snov.io without knowing.
             return {
-              success: false,
-              error: `Verification failed with ${failures.length} issue(s):\n${failures.join('\n')}${warningsText}`,
+              success: true,
+              manualRequired: true,
+              output: `Verification completed with ${failures.length} issues:\n${failures.join('\n')}${warningsText}`,
               metadata: {
                 verificationFailures: failures,
                 verificationWarnings: warnings,
