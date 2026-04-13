@@ -18,6 +18,7 @@ import { createPairProvisioningSaga } from '@/lib/provisioning/pair-provisioning
 import { getVPSProvider, getDNSRegistrar } from '@/lib/provisioning/provider-registry';
 import { decrypt } from '@/lib/provisioning/encryption';
 import { persistPairCredentials } from '@/lib/provisioning/persist-credentials';
+import { checkIPBlacklist } from '@/lib/provisioning/ip-blacklist-check';
 import { SERVERLESS_STEP_RUNNERS } from '@/lib/provisioning/serverless-steps';
 import { createHmac, randomBytes } from 'crypto';
 import type {
@@ -248,14 +249,14 @@ async function handleCreateVpsStep(
     );
 
     // 4. Create both servers
-    const server1 = await provider.createServer({
+    let server1 = await provider.createServer({
       name: `mail1-${provJob.ns_domain.replace(/\./g, '-')}`,
       region,
       size: providerPlan,
     });
     console.log(`[ProvisionStep][create_vps] server1 created: ${server1.id}`);
 
-    const server2 = await provider.createServer({
+    let server2 = await provider.createServer({
       name: `mail2-${provJob.ns_domain.replace(/\./g, '-')}`,
       region: secondaryRegion,
       size: providerPlan,
@@ -294,6 +295,113 @@ async function handleCreateVpsStep(
     console.log(
       `[ProvisionStep][create_vps] both active: ${server1.ip} + ${server2.ip}`
     );
+
+    // 5b. IP blacklist pre-check with re-roll (PATCH 9, Hard Lesson #74).
+    // Fresh Linode IPs can carry pre-existing blacklist entries from prior
+    // tenants. Check both IPs against 4 DNSBL zones. If either is listed,
+    // delete both Linodes and re-provision (up to 3 re-rolls, 4 total
+    // attempts). Prevents wasting 25-30 min of provisioning on a dirty IP
+    // that will fail the verification gate.
+    const MAX_IP_REROLL_ATTEMPTS = 3;
+    for (let rerollAttempt = 0; rerollAttempt <= MAX_IP_REROLL_ATTEMPTS; rerollAttempt++) {
+      const [bl1, bl2] = await Promise.all([
+        checkIPBlacklist(server1.ip),
+        checkIPBlacklist(server2.ip),
+      ]);
+      const listedIPs = [bl1, bl2].filter((r) => r.listed);
+
+      if (listedIPs.length === 0) {
+        // Both IPs clean — proceed
+        console.log(
+          `[ProvisionStep][create_vps] IP blacklist check PASSED: ${server1.ip} clean, ${server2.ip} clean` +
+            (rerollAttempt > 0 ? ` (after ${rerollAttempt} re-roll(s))` : '')
+        );
+        break;
+      }
+
+      // IPs are listed
+      const listDetail = listedIPs
+        .map((r) => `${r.ip}: ${r.listings.map((l) => l.name).join(', ')}`)
+        .join('; ');
+
+      if (rerollAttempt === MAX_IP_REROLL_ATTEMPTS) {
+        // Exhausted all retries — fail the step
+        throw new Error(
+          `IP blacklist pre-check failed after ${MAX_IP_REROLL_ATTEMPTS + 1} attempts. ` +
+            `Last IPs: ${listDetail}. All ${MAX_IP_REROLL_ATTEMPTS + 1} Linode IP pairs were ` +
+            `blacklisted. Try a different region or contact Linode support.`
+        );
+      }
+
+      console.log(
+        `[ProvisionStep][create_vps] IP BLACKLISTED (attempt ${rerollAttempt + 1}/${MAX_IP_REROLL_ATTEMPTS + 1}): ${listDetail}. ` +
+          `Deleting servers and re-rolling...`
+      );
+
+      // Delete both Linodes
+      await provider.deleteServer(server1.id);
+      await provider.deleteServer(server2.id);
+
+      // Brief pause to let Linode release IPs
+      await new Promise((r) => setTimeout(r, 5000));
+
+      // Re-create both Linodes with same params
+      server1 = await provider.createServer({
+        name: `mail1-${provJob.ns_domain.replace(/\./g, '-')}`,
+        region,
+        size: providerPlan,
+      });
+      console.log(
+        `[ProvisionStep][create_vps] re-roll server1 created: ${server1.id}`
+      );
+
+      server2 = await provider.createServer({
+        name: `mail2-${provJob.ns_domain.replace(/\./g, '-')}`,
+        region: secondaryRegion,
+        size: providerPlan,
+      });
+      console.log(
+        `[ProvisionStep][create_vps] re-roll server2 created: ${server2.id}`
+      );
+
+      // Re-poll until both active
+      const REROLL_POLL_TIMEOUT = 10 * 60 * 1000;
+      const rerollPollStart = Date.now();
+      let rs1Active =
+        server1.status === 'active' || server1.status === 'running';
+      let rs2Active =
+        server2.status === 'active' || server2.status === 'running';
+
+      while (
+        (!rs1Active || !rs2Active) &&
+        Date.now() - rerollPollStart < REROLL_POLL_TIMEOUT
+      ) {
+        await new Promise((r) => setTimeout(r, 15000));
+        if (!rs1Active) {
+          const info = await provider.getServer(server1.id);
+          rs1Active = info.status === 'active' || info.status === 'running';
+          if (rs1Active && !server1.ip)
+            Object.assign(server1, { ip: info.ip });
+        }
+        if (!rs2Active) {
+          const info = await provider.getServer(server2.id);
+          rs2Active = info.status === 'active' || info.status === 'running';
+          if (rs2Active && !server2.ip)
+            Object.assign(server2, { ip: info.ip });
+        }
+      }
+
+      if (!rs1Active || !rs2Active) {
+        throw new Error(
+          `Timed out waiting for re-rolled VPS servers to become active ` +
+            `(s1Active=${rs1Active}, s2Active=${rs2Active}, reroll=${rerollAttempt + 1})`
+        );
+      }
+
+      console.log(
+        `[ProvisionStep][create_vps] re-roll servers active: ${server1.ip} + ${server2.ip}`
+      );
+    }
 
     // 6. Write IPs back to the job row so downstream steps can read
     // them. Do this BEFORE persistPairCredentials — if persistence
