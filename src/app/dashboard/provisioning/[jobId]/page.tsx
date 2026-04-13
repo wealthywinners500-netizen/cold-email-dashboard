@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import { StepTimeline } from "@/components/provisioning/step-timeline";
 import { SSHLogViewer } from "@/components/provisioning/ssh-log-viewer";
+import { useRealtimeCallback } from "@/hooks/use-realtime";
 import type { ProvisioningJobRow, StepType, StepStatus } from "@/lib/provisioning/types";
 
 interface StepData {
@@ -38,7 +39,6 @@ const STEP_NAMES: Record<StepType, string> = {
   create_vps: "Create VPS Pair",
   set_ptr: "Set PTR Records",
   configure_registrar: "Configure DNS Registrar",
-  await_dns_propagation: "Wait for DNS Propagation",
   install_hestiacp: "Install HestiaCP",
   setup_dns_zones: "Setup DNS Zones",
   setup_mail_domains: "Setup Mail Domains",
@@ -75,6 +75,26 @@ export default function JobDetailPage() {
   const eventSourceRef = useRef<EventSource | null>(null);
   const retryCountRef = useRef(0);
   const maxRetries = 5;
+
+  // Supabase Realtime: re-fetch job+steps when DB changes (worker callbacks)
+  // This gives instant UI updates even when the saga loop is idle/waiting
+  const refreshJobData = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/provisioning/${jobId}`);
+      if (res.ok) {
+        const data = await res.json();
+        setJob(data.job);
+        setSteps(data.steps);
+      }
+    } catch {
+      // silently fail
+    }
+  }, [jobId]);
+
+  useRealtimeCallback("provisioning_steps", refreshJobData, {
+    column: "job_id",
+    value: jobId,
+  });
 
   // Fetch initial job data
   useEffect(() => {
@@ -205,6 +225,22 @@ export default function JobDetailPage() {
             es.close();
             break;
 
+          case "worker_step":
+            // Worker VPS is running a step — update timeline to show in_progress
+            if (data.step) {
+              setSteps((prev) =>
+                prev.map((s) =>
+                  s.step_type === data.step
+                    ? { ...s, status: "in_progress" as StepStatus }
+                    : s
+                )
+              );
+              setJob((prev) =>
+                prev ? { ...prev, current_step: data.step } : prev
+              );
+            }
+            break;
+
           case "timeout":
             setLogLines((prev) => [
               ...prev,
@@ -242,11 +278,14 @@ export default function JobDetailPage() {
   // (b) the legacy monolithic handler is disabled. The canonical path is now
   // exclusively client → /execute-step → worker bridge, so this loop must
   // run for ALL provider types. The /execute-step route handles serverless
-  // steps (1,3,5,8) inline and dispatches worker steps (2,4,6,7) to the VPS.
+  // steps (3,5) inline and dispatches worker steps (1,2,4,6,7,8) to the VPS.
   const executeDryRunLoop = useCallback(async () => {
     if (dryRunExecuting) return;
     setDryRunExecuting(true);
     dryRunAbortRef.current = false;
+
+    // Track which steps we've already logged as dispatched to avoid duplicate log lines
+    const loggedDispatched = new Set<string>();
 
     try {
       while (!dryRunAbortRef.current) {
@@ -265,8 +304,16 @@ export default function JobDetailPage() {
 
         const data = await res.json();
 
-        // Update step status
+        // Always update progress from server response
+        if (data.progress_pct !== undefined) {
+          setJob((prev) =>
+            prev ? { ...prev, progress_pct: data.progress_pct } : prev
+          );
+        }
+
+        // Handle step completed
         if (data.step && data.status === "completed") {
+          loggedDispatched.delete(data.step);
           setSteps((prev) =>
             prev.map((s) =>
               s.step_type === data.step
@@ -278,17 +325,64 @@ export default function JobDetailPage() {
             ...prev,
             {
               timestamp: new Date().toLocaleTimeString(),
-              text: `✓ ${STEP_NAMES[data.step as StepType] || data.step} completed (${data.duration_ms}ms)`,
+              text: `✓ ${STEP_NAMES[data.step as StepType] || data.step} completed (${Math.round((data.duration_ms || 0) / 1000)}s)`,
               type: "stdout" as const,
             },
           ]);
+          setJob((prev) =>
+            prev ? { ...prev, status: "in_progress" } : prev
+          );
+          // Quick pace for next step dispatch
+          await new Promise((r) => setTimeout(r, 500));
+          continue;
         }
 
-        // Update job progress
-        setJob((prev) =>
-          prev ? { ...prev, progress_pct: data.progress_pct, status: "in_progress" } : prev
-        );
+        // Handle step dispatched to worker
+        if (data.status === "dispatched_to_worker" && data.step) {
+          setSteps((prev) =>
+            prev.map((s) =>
+              s.step_type === data.step
+                ? { ...s, status: "in_progress" as StepStatus }
+                : s
+            )
+          );
+          setJob((prev) =>
+            prev ? { ...prev, status: "in_progress", current_step: data.step } : prev
+          );
+          if (!loggedDispatched.has(data.step)) {
+            loggedDispatched.add(data.step);
+            setLogLines((prev) => [
+              ...prev,
+              {
+                timestamp: new Date().toLocaleTimeString(),
+                text: `⚙ ${STEP_NAMES[data.step as StepType] || data.step} dispatched to worker VPS...`,
+                type: "progress" as const,
+              },
+            ]);
+          }
+          // Worker steps take time — poll with 5s delay
+          await new Promise((r) => setTimeout(r, 5_000));
+          continue;
+        }
 
+        // Handle awaiting worker completion
+        if (data.status === "awaiting_worker" && data.step) {
+          setSteps((prev) =>
+            prev.map((s) =>
+              s.step_type === data.step
+                ? { ...s, status: "in_progress" as StepStatus }
+                : s
+            )
+          );
+          setJob((prev) =>
+            prev ? { ...prev, status: "in_progress", current_step: data.step } : prev
+          );
+          // Poll at 5s intervals while worker runs
+          await new Promise((r) => setTimeout(r, 5_000));
+          continue;
+        }
+
+        // Handle all complete
         if (data.allComplete) {
           setJob((prev) =>
             prev ? { ...prev, status: "completed", progress_pct: 100 } : prev
@@ -297,7 +391,7 @@ export default function JobDetailPage() {
             ...prev,
             { timestamp: new Date().toLocaleTimeString(), text: "🎉 Provisioning complete! Server pair is ready.", type: "stdout" as const },
           ]);
-          // Refresh to get server_pair_id
+          // Refresh to get server_pair_id and final step data
           const refreshRes = await fetch(`/api/provisioning/${jobId}`);
           if (refreshRes.ok) {
             const refreshData = await refreshRes.json();
@@ -307,6 +401,7 @@ export default function JobDetailPage() {
           break;
         }
 
+        // Handle failure
         if (data.status === "failed") {
           setJob((prev) =>
             prev ? { ...prev, status: "failed", error_message: data.error } : prev
@@ -327,7 +422,15 @@ export default function JobDetailPage() {
           break;
         }
 
-        // Visual pacing
+        // Handle terminal states returned from already-finished jobs
+        if (["completed", "failed", "rolled_back", "cancelled"].includes(data.status)) {
+          setJob((prev) =>
+            prev ? { ...prev, status: data.status, progress_pct: data.progress_pct } : prev
+          );
+          break;
+        }
+
+        // Default pacing for serverless steps
         await new Promise((r) => setTimeout(r, 800));
       }
     } catch (err) {
@@ -602,11 +705,12 @@ export default function JobDetailPage() {
                   try {
                     const res = await fetch(`/api/provisioning/${job.id}/csv`);
                     if (!res.ok) {
-                      const errBody = await res.json().catch(() => ({ error: res.statusText }));
-                      alert(`CSV download failed: ${errBody.error || res.statusText}`);
+                      const err = await res.json().catch(() => ({ error: 'Download failed' }));
+                      alert(err.error || 'Failed to download CSV');
                       return;
                     }
-                    const blob = await res.blob();
+                    const csv = await res.text();
+                    const blob = new Blob([csv], { type: "text/csv" });
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement("a");
                     a.href = url;
@@ -614,7 +718,8 @@ export default function JobDetailPage() {
                     a.click();
                     URL.revokeObjectURL(url);
                   } catch (err) {
-                    alert(`CSV download error: ${err instanceof Error ? err.message : String(err)}`);
+                    console.error('CSV download failed:', err);
+                    alert('Failed to download CSV. Please try again.');
                   }
                 }}
                 className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded-lg transition-colors"

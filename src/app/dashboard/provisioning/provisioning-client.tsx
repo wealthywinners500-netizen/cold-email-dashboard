@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Rocket, Plus, Server, Globe, Loader2 } from "lucide-react";
+import { useRealtimeCallback } from "@/hooks/use-realtime";
 import type { ProvisioningJobRow } from "@/lib/provisioning/types";
 
 function getStatusBadge(status: string) {
@@ -47,6 +48,23 @@ export default function ProvisioningClient({ hasProviders }: ProvisioningClientP
   const [loading, setLoading] = useState(true);
   const [isDryRunOnly, setIsDryRunOnly] = useState(false);
 
+  // Re-fetch jobs function (extracted so Realtime can call it)
+  const fetchJobsNow = useCallback(async () => {
+    try {
+      const res = await fetch("/api/provisioning");
+      if (res.ok) {
+        const data = await res.json();
+        setJobs(data);
+      }
+    } catch {
+      // silently fail
+    }
+  }, []);
+
+  // Supabase Realtime: instant re-fetch when provisioning_jobs table changes
+  // This gives immediate UI updates when the worker callback writes progress
+  useRealtimeCallback("provisioning_jobs", fetchJobsNow);
+
   useEffect(() => {
     async function checkProviders() {
       try {
@@ -62,24 +80,12 @@ export default function ProvisioningClient({ hasProviders }: ProvisioningClientP
   }, []);
 
   useEffect(() => {
-    async function fetchJobs() {
-      try {
-        const res = await fetch("/api/provisioning");
-        if (res.ok) {
-          const data = await res.json();
-          setJobs(data);
-        }
-      } catch {
-        // silently fail
-      } finally {
-        setLoading(false);
-      }
-    }
-    fetchJobs();
-    // Refresh every 10s for active jobs
-    const interval = setInterval(fetchJobs, 10_000);
+    // Initial fetch + mark loading done
+    fetchJobsNow().finally(() => setLoading(false));
+    // Poll every 5s as fallback (Realtime gives instant updates)
+    const interval = setInterval(fetchJobsNow, 5_000);
     return () => clearInterval(interval);
-  }, []);
+  }, [fetchJobsNow]);
 
   const activeJobs = jobs.filter((j) => j.status === "pending" || j.status === "in_progress");
   const completedJobs = jobs.filter((j) => j.status !== "pending" && j.status !== "in_progress");
