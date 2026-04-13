@@ -29,6 +29,7 @@ import {
   hardenSecurity,
   issueSSLCert,
   setHostname,
+  unmaskExim4,
   HESTIA_PATH_PREFIX,
 } from './hestia-scripts';
 import { generateAccountNamesForPair } from './name-generator';
@@ -1014,6 +1015,26 @@ export function createPairProvisioningSaga(
           await ssh1.exec('rndc reload', { timeout: 10000 }).catch(() => {});
           await ssh2.exec('rndc reload', { timeout: 10000 }).catch(() => {});
 
+          // --- PATCH 14: Unmask Exim4 now that all auth records are in place ---
+          // Exim4 was masked in Step 2 (installHestiaCP) to prevent unauthenticated
+          // SMTP traffic. Now that SPF/DKIM/DMARC are correct and replicated on both
+          // servers, we can safely start the mail service.
+          context.log('[Step 6] Unmasking Exim4 on both servers (auth records ready)...');
+          try {
+            await Promise.all([
+              unmaskExim4(ssh1),
+              unmaskExim4(ssh2),
+            ]);
+            context.log('[Step 6] Exim4 started on both servers');
+          } catch (unmaskErr) {
+            // This IS fatal — if Exim4 can't start, mail won't work
+            context.log(`[Step 6] FATAL: Exim4 failed to start: ${unmaskErr instanceof Error ? unmaskErr.message : String(unmaskErr)}`);
+            return {
+              success: false,
+              error: `Exim4 failed to start after auth record setup: ${unmaskErr instanceof Error ? unmaskErr.message : String(unmaskErr)}`,
+            };
+          }
+
           const totalAccounts = Object.values(allAccountsCreated).reduce(
             (sum, arr) => sum + arr.length,
             0
@@ -1039,6 +1060,17 @@ export function createPairProvisioningSaga(
       },
 
       async compensate(context: ProvisioningContext): Promise<void> {
+        // --- PATCH 14: Re-mask Exim4 on rollback ---
+        // If Step 6 unmasked Exim4 but subsequent steps failed, we need to stop
+        // the mail service to prevent unauthenticated traffic.
+        try {
+          await ssh1.exec('systemctl stop exim4 && systemctl mask exim4 && systemctl stop dovecot && systemctl mask dovecot', { timeout: 15000 }).catch(() => {});
+          await ssh2.exec('systemctl stop exim4 && systemctl mask exim4 && systemctl stop dovecot && systemctl mask dovecot', { timeout: 15000 }).catch(() => {});
+          context.log('[Compensate Step 6] Exim4 re-masked on both servers');
+        } catch {
+          // Best-effort
+        }
+
         for (const domain of context.sendingDomains) {
           try {
             await ssh1.exec(`${HESTIA_PATH_PREFIX}v-delete-mail-domain admin ${domain}`, {

@@ -67,9 +67,6 @@ export interface CreateMailDomainParams {
   accounts: string[];
   password: string;
   adminEmail?: string | null;
-  /** Both server IPs required for SPF — Hard Lesson #72 */
-  server1IP?: string;
-  server2IP?: string;
 }
 
 export interface CreateMailDomainResult {
@@ -163,6 +160,23 @@ export async function installHestiaCP(
   );
 
   const success = exitCode === 0;
+
+  // --- PATCH 14: Mask Exim4 immediately after install ---
+  // Exim4 starts automatically during HestiaCP install. We must prevent it
+  // from listening on port 25 until ALL auth records (SPF, DKIM, DMARC, PTR)
+  // are in place. Otherwise any inbound SMTP probe or bounce goes out from
+  // an unauthenticated fresh IP — blacklist bait (Hard Lesson #84).
+  if (success) {
+    onProgress?.('Masking Exim4 until auth records are ready...');
+    await ssh.exec(
+      'systemctl stop exim4 && systemctl mask exim4 && systemctl stop dovecot && systemctl mask dovecot',
+      { timeout: 15000 }
+    ).catch((err) => {
+      // Log but don't fail — worst case Exim runs early, same as before PATCH 14
+      console.error(`[installHestiaCP] Warning: could not mask exim4: ${err}`);
+    });
+  }
+
   const adminUrl = `https://${hostname}:8083`;
 
   return { success, adminUrl };
@@ -367,7 +381,7 @@ export async function createMailDomain(
   ssh: SSHManager,
   params: CreateMailDomainParams
 ): Promise<CreateMailDomainResult> {
-  const { domain, accounts, password, adminEmail, server1IP, server2IP } = params;
+  const { domain, accounts, password } = params;
   const escapedPassword = password.replace(/'/g, "'\\''");
 
   // Check if mail domain already exists (idempotent)
@@ -432,149 +446,16 @@ export async function createMailDomain(
     if (lastErr) throw lastErr;
   }
 
-  // Hard Lesson #67 (Test #15, 2026-04-11): Hestia auto-generated
-  // SPF/DMARC duplication.
+  // SPF and DMARC records are NOT created here. HestiaCP's v-add-mail-domain
+  // auto-generates defaults, but they're incorrect (generic +a +mx, no explicit IP).
+  // Step 6's dedup block (pair-provisioning-saga.ts) deletes ALL SPF/DMARC records
+  // and adds the correct versions with explicit server IPs. Creating throwaway
+  // records here just creates a brief window of wrong auth. (Hard Lesson #84)
   //
-  // The ORDER OF OPERATIONS in this saga is:
-  //   Step 5: setup_dns_zones → v-add-dns-domain admin <domain>
-  //   Step 6: setup_mail_domains → v-add-mail-domain admin <domain>
-  //
-  // BOTH of these commands implicitly create SPF (v=spf1...) and DMARC
-  // (v=DMARC1...) TXT records on the zone. v-add-dns-domain uses a
-  // generic template; v-add-mail-domain layers a mail-aware template
-  // on top WITHOUT removing the first one. Result: every sending
-  // domain ends up with TWO SPF records and TWO DMARC records, which
-  // MXToolbox flags as "Multiple SPF Records" and DMARC as malformed.
-  //
-  // Fix: list TXT records on the @ name and on _dmarc, and delete any
-  // duplicates (keep one). v-list-dns-records admin <domain> json
-  // gives us record IDs; v-delete-dns-record admin <domain> <id>
-  // removes them.
-  const dmarcEmail = adminEmail || `postmaster@${domain}`;
-
-  try {
-    const { stdout } = await ssh.exec(
-      `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} json 2>/dev/null || echo '{}'`,
-      { timeout: 10000 }
-    );
-    interface DnsRec {
-      RECORD: string;
-      TYPE: string;
-      VALUE: string;
-    }
-    let recs: Record<string, DnsRec> = {};
-    try {
-      recs = JSON.parse(stdout) as Record<string, DnsRec>;
-    } catch {
-      recs = {};
-    }
-    const spfIds: string[] = [];
-    const dmarcIds: string[] = [];
-    for (const [id, rec] of Object.entries(recs)) {
-      if (rec.TYPE === "TXT" && rec.RECORD === "@" && /v=spf1/i.test(rec.VALUE)) {
-        spfIds.push(id);
-      }
-      if (
-        rec.TYPE === "TXT" &&
-        rec.RECORD === "_dmarc" &&
-        /v=DMARC1/i.test(rec.VALUE)
-      ) {
-        dmarcIds.push(id);
-      }
-    }
-    // Delete EVERY existing SPF then add ONE canonical SPF.
-    for (const id of spfIds) {
-      await ssh
-        .exec(
-          `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${id}`,
-          { timeout: 10000 }
-        )
-        .catch(() => { /* ignore */ });
-    }
-    // Same for DMARC.
-    for (const id of dmarcIds) {
-      await ssh
-        .exec(
-          `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${id}`,
-          { timeout: 10000 }
-        )
-        .catch(() => { /* ignore */ });
-    }
-  } catch {
-    // Listing failed — fall through to add path which is idempotent.
-  }
-
-  // Add canonical SPF TXT record (single source of truth).
-  // Hard Lesson #72: SPF must explicitly include ip4: for BOTH server IPs.
-  // The `a` mechanism only resolves to s1 (the A record), and `mx` covers
-  // mail1 (s1) but NOT mail2 (s2). Without explicit ip4: for s2, any mail
-  // sent from s2 fails SPF.
-  const spfValue = (server1IP && server2IP)
-    ? `v=spf1 ip4:${server1IP} ip4:${server2IP} a mx -all`
-    : `v=spf1 +a +mx -all`;
-  await ssh
-    .exec(
-      `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ TXT '"${spfValue}"'`,
-      { timeout: 10000 }
-    )
-    .catch(() => { /* tolerate idempotent re-add */ });
-
-  // Add canonical DMARC TXT record.
-  await ssh
-    .exec(
-      `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100; rua=mailto:${dmarcEmail}"'`,
-      { timeout: 10000 }
-    )
-    .catch(() => { /* tolerate */ });
-
-  // PATCH 6 (Hard Lesson #68 follow-up): verify the dedupe actually
-  // succeeded. If a delete failed and we still have >1 SPF or >1 DMARC
-  // after the canonical re-add, throw — MXToolbox will flag this as
-  // "Multiple SPF Records" on row #7 of the success bar.
-  try {
-    interface DnsRecRechecked {
-      RECORD: string;
-      TYPE: string;
-      VALUE: string;
-    }
-    const { stdout: recheckOut } = await ssh.exec(
-      `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} json 2>/dev/null || echo '{}'`,
-      { timeout: 10000 }
-    );
-    let rechecked: Record<string, DnsRecRechecked> = {};
-    try {
-      rechecked = JSON.parse(recheckOut) as Record<string, DnsRecRechecked>;
-    } catch {
-      rechecked = {};
-    }
-    const spfCount = Object.values(rechecked).filter(
-      (rec) =>
-        rec.TYPE === "TXT" && rec.RECORD === "@" && /v=spf1/i.test(rec.VALUE)
-    ).length;
-    const dmarcCount = Object.values(rechecked).filter(
-      (rec) =>
-        rec.TYPE === "TXT" &&
-        rec.RECORD === "_dmarc" &&
-        /v=DMARC1/i.test(rec.VALUE)
-    ).length;
-    if (spfCount > 1) {
-      throw new Error(
-        `createMailDomain: SPF dedupe failed for ${domain} — still ${spfCount} SPF records after cleanup`
-      );
-    }
-    if (dmarcCount > 1) {
-      throw new Error(
-        `createMailDomain: DMARC dedupe failed for ${domain} — still ${dmarcCount} DMARC records after cleanup`
-      );
-    }
-    // eslint-disable-next-line no-console
-    console.log(
-      `[createMailDomain] ${domain}: SPF=${spfCount} DMARC=${dmarcCount} (dedupe verified)`
-    );
-  } catch (err) {
-    if (err instanceof Error && /dedupe failed/.test(err.message)) throw err;
-    // Listing error is non-fatal — caller/VG will catch it.
-  }
+  // Previously this block contained Hard Lesson #67/#72 dedup + canonical SPF/DMARC
+  // creation. That logic is now consolidated into the saga's Step 6 dedup block,
+  // which has full context (both server IPs, admin email) and runs AFTER all
+  // domains are created on both servers.
 
   // Create mail accounts
   await ensureMailAccounts(ssh, domain, accounts, escapedPassword);
@@ -1252,5 +1133,24 @@ export async function setHostname(ssh: SSHManager, hostname: string): Promise<vo
       `Hostname mismatch: expected "${hostname}", got "${actualHostname}". ` +
       `May need to update /etc/hosts manually.`
     );
+  }
+}
+
+// ============================================
+// i) Unmask and start Exim4 + Dovecot
+// Called by Step 6 AFTER all auth records (SPF, DKIM, DMARC) are in place
+// and PTR has been set (Step 5). This ensures Exim4 never listens on port 25
+// until the server can send fully-authenticated email.
+// Hard Lesson #84: Exim4 must not run until auth is ready.
+// ============================================
+export async function unmaskExim4(ssh: SSHManager): Promise<void> {
+  await ssh.exec(
+    'systemctl unmask exim4 && systemctl start exim4 && systemctl unmask dovecot && systemctl start dovecot',
+    { timeout: 15000 }
+  );
+  // Verify Exim4 is actually running
+  const { stdout } = await ssh.exec('systemctl is-active exim4', { timeout: 5000 });
+  if (!stdout.trim().includes('active')) {
+    throw new Error('Exim4 failed to start after unmask');
   }
 }
