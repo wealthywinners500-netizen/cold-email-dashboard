@@ -8,7 +8,6 @@ import { createAdminClient } from '@/lib/supabase/server';
 import { NextResponse } from 'next/server';
 import { generateSnovioCSV } from '@/lib/provisioning/csv-generator';
 import type { ProvisioningJobRow } from '@/lib/provisioning/types';
-import { decrypt } from '@/lib/provisioning/encryption';
 
 export const dynamic = 'force-dynamic';
 
@@ -102,22 +101,24 @@ export async function GET(
       );
     }
 
-    // Read real password from ssh_credentials (encrypted)
-    const { data: sshCreds } = await supabase
-      .from('ssh_credentials')
-      .select('password_encrypted')
-      .eq('provisioning_job_id', jobId)
-      .limit(1)
-      .maybeSingle();
-
-    let mailPassword = 'changeme123'; // fallback only
-    if (sshCreds?.password_encrypted) {
-      try {
-        mailPassword = decrypt(sshCreds.password_encrypted);
-      } catch (err) {
-        console.error('[CSV] Failed to decrypt ssh_credentials password:', err);
+    // Build CSV from accounts
+    // Read real password from ssh_credentials (same password used for all mail accounts on the pair)
+    let realPassword = 'password-not-available';
+    try {
+      const { data: sshCred } = await supabase
+        .from('ssh_credentials')
+        .select('password_encrypted')
+        .eq('provisioning_job_id', jobId)
+        .limit(1)
+        .single();
+      if (sshCred?.password_encrypted) {
+        const { decrypt } = await import('@/lib/provisioning/encryption');
+        realPassword = decrypt(sshCred.password_encrypted);
       }
+    } catch {
+      // Fall through with default - ssh_credentials may not exist yet
     }
+    const server1Hostname = `mail1.${provJob.ns_domain}`;
 
     const mailAccounts = accounts.map((acc) => {
       const isServer1 =
@@ -125,7 +126,7 @@ export async function GET(
         acc.smtp_host?.includes('mail1');
       return {
         email: acc.email,
-        password: mailPassword,
+        password: realPassword,
         server: (isServer1 ? 'server1' : 'server2') as 'server1' | 'server2',
       };
     });

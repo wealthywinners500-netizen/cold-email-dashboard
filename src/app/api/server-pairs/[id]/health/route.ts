@@ -76,7 +76,7 @@ export async function GET(
       return NextResponse.json({ error: 'Server pair not found' }, { status: 404 });
     }
 
-    if (!serverPair.server1_ip || !serverPair.server2_ip) {
+    if (!serverPair.s1_ip || !serverPair.s2_ip) {
       return NextResponse.json(
         { error: 'Server pair missing IP addresses' },
         { status: 400 }
@@ -102,8 +102,8 @@ export async function GET(
     // Run full health check
     const verifier = new DNSVerifier();
     const report = await verifier.fullHealthCheck({
-      server1IP: serverPair.server1_ip,
-      server2IP: serverPair.server2_ip,
+      server1IP: serverPair.s1_ip,
+      server2IP: serverPair.s2_ip,
       nsDomain: serverPair.ns_domain,
       sendingDomains: domainList.filter((d) => d !== serverPair.ns_domain),
     });

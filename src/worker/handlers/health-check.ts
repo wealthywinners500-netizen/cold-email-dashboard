@@ -38,7 +38,7 @@ export async function handleHealthCheck(
     return;
   }
 
-  if (!serverPair.server1_ip || !serverPair.server2_ip) {
+  if (!serverPair.s1_ip || !serverPair.s2_ip) {
     console.warn(`[HealthCheck] Server pair ${serverPairId} missing IPs, skipping`);
     return;
   }
@@ -54,8 +54,8 @@ export async function handleHealthCheck(
   // Run full health check
   const verifier = new DNSVerifier();
   const report = await verifier.fullHealthCheck({
-    server1IP: serverPair.server1_ip,
-    server2IP: serverPair.server2_ip,
+    server1IP: serverPair.s1_ip,
+    server2IP: serverPair.s2_ip,
     nsDomain: serverPair.ns_domain,
     sendingDomains: domainList.filter((d: string) => d !== serverPair.ns_domain),
   });
