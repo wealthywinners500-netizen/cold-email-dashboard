@@ -21,16 +21,23 @@ import { Resolver } from 'dns';
 // Linode IPs across all US regions, causing 4/4 re-rolls to fail every time.
 // Barracuda delisting is instant/free and is NOT a hard deliverability blocker.
 // It's still checked in Step 8 (VG) as a non-fatal warning.
+//
+// Hard Lesson #83: TRUNCATE and Anonmails added as non-fatal monitors.
+// They're queryable from any IP and not as false-positive-heavy as Barracuda,
+// but listing shouldn't trigger IP re-roll — the VG surfaces them as warnings.
 const IP_BLACKLISTS = [
-  { zone: 'zen.spamhaus.org', name: 'Spamhaus ZEN' },
-  { zone: 'dnsbl.sorbs.net', name: 'SORBS' },
-  { zone: 'dnsbl-1.uceprotect.net', name: 'UCEPROTECT L1' },
+  { zone: 'zen.spamhaus.org', name: 'Spamhaus ZEN', fatal: true },
+  { zone: 'dnsbl.sorbs.net', name: 'SORBS', fatal: true },
+  { zone: 'dnsbl-1.uceprotect.net', name: 'UCEPROTECT L1', fatal: true },
+  { zone: 'truncate.gbudb.net', name: 'TRUNCATE', fatal: false },
+  { zone: 'spam.dnsbl.anonmails.de', name: 'Anonmails', fatal: false },
 ] as const;
 
 export interface IPBlacklistResult {
   ip: string;
-  listed: boolean;
-  listings: Array<{ zone: string; name: string; response?: string }>;
+  listed: boolean;       // true if ANY zone listed (fatal or not)
+  fatalListed: boolean;  // true only if a fatal zone listed (triggers re-roll)
+  listings: Array<{ zone: string; name: string; fatal: boolean; response?: string }>;
 }
 
 /**
@@ -66,7 +73,7 @@ function queryZone(
 }
 
 /**
- * Check a single IP against all 4 DNSBL zones in parallel.
+ * Check a single IP against all DNSBL zones in parallel.
  *
  * Any A-record response from a zone means the IP is listed on that zone.
  * NXDOMAIN or timeout means clean (or transient error → treated as clean
@@ -75,25 +82,30 @@ function queryZone(
  * Runs on the worker VPS (200.234.226.226) which is NOT a cloud provider
  * IP, so Spamhaus ZEN queries work without the 127.255.255.254 cloud-IP
  * denial (Hard Lesson #47).
+ *
+ * Returns both `listed` (any zone) and `fatalListed` (only fatal zones).
+ * The create_vps handler should only re-roll on `fatalListed` — non-fatal
+ * listings (TRUNCATE, Anonmails) are logged as warnings.
  */
 export async function checkIPBlacklist(ip: string): Promise<IPBlacklistResult> {
   const reversed = ip.split('.').reverse().join('.');
   const TIMEOUT_MS = 5000;
 
   const results = await Promise.all(
-    IP_BLACKLISTS.map(async ({ zone, name }) => {
+    IP_BLACKLISTS.map(async ({ zone, name, fatal }) => {
       const response = await queryZone(reversed, zone, TIMEOUT_MS);
-      return { zone, name, response };
+      return { zone, name, fatal, response };
     })
   );
 
   const listings = results
     .filter((r) => r.response !== null)
-    .map((r) => ({ zone: r.zone, name: r.name, response: r.response! }));
+    .map((r) => ({ zone: r.zone, name: r.name, fatal: r.fatal, response: r.response! }));
 
   return {
     ip,
     listed: listings.length > 0,
+    fatalListed: listings.some((l) => l.fatal),
     listings,
   };
 }

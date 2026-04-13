@@ -17,10 +17,15 @@
 //     {domain}.{key}.dbl.dq.spamhaus.net
 //   Set SPAMHAUS_DQS_KEY in the Vercel env. Signup: https://portal.spamhaus.com
 //
-// This module now implements a 3-tier blacklist check:
+// This module now implements a 4-tier blacklist check:
 //   1. PRIMARY: DQS (cloud-IP-allowed, auth'd via SPAMHAUS_DQS_KEY)
-//   2. FALLBACK: worker VPS proxy (non-cloud IP, queries legacy mirrors)
-//   3. UNAVAILABLE: definitive "unknown" result — wizard warns, doesn't block
+//   2. DIRECT DNSBL: SURBL + URIBL (no auth needed, work from cloud IPs)
+//   3. FALLBACK: worker VPS proxy (non-cloud IP, queries legacy mirrors)
+//   4. UNAVAILABLE: definitive "unknown" result — wizard warns, doesn't block
+//
+// Hard Lesson #83: DQS only checks Spamhaus DBL. SURBL and URIBL must be
+// checked separately via direct DNS. Results are MERGED — a domain listed
+// on SURBL but clean on DBL is still "listed".
 // ============================================
 
 import dns from 'dns/promises';
@@ -55,8 +60,9 @@ const DENIED_CODES = new Set([
 export type BlacklistStatus = 'clean' | 'listed' | 'unknown';
 export type BlacklistMethod =
   | 'dqs'              // primary: Spamhaus DQS
-  | 'fallback-proxy'   // secondary: worker VPS proxy
-  | 'legacy-public'    // tertiary: legacy public mirrors (worker only)
+  | 'direct-dnsbl'     // tier 2: direct DNSBL queries (SURBL, URIBL)
+  | 'fallback-proxy'   // tier 3: worker VPS proxy
+  | 'legacy-public'    // legacy: public mirrors (worker only)
   | 'unavailable';     // no method succeeded
 
 export interface BlacklistResult {
@@ -183,6 +189,46 @@ async function checkViaDQS(domain: string): Promise<BlacklistResult | null> {
 }
 
 // ============================================
+// Tier 2: Direct DNSBL queries (SURBL, URIBL)
+// These zones accept domain lookups (not reversed-IP) and work from cloud IPs.
+// No authentication key needed.
+// ============================================
+
+const DIRECT_DOMAIN_DNSBLS = [
+  { zone: 'multi.surbl.org', name: 'SURBL' },
+  { zone: 'black.uribl.com', name: 'URIBL' },
+] as const;
+
+async function checkDirectDomainDNSBLs(
+  domain: string
+): Promise<{ lists: string[]; raw: Record<string, string[]> }> {
+  const cleaned = domain.toLowerCase().replace(/\.$/, '');
+  const lists: string[] = [];
+  const raw: Record<string, string[]> = {};
+
+  for (const { zone, name } of DIRECT_DOMAIN_DNSBLS) {
+    const host = `${cleaned}.${zone}`;
+    try {
+      const addresses = await resolveOrNxdomain(host);
+      raw[zone] = addresses;
+      // Any 127.0.x.x response = listed; NXDOMAIN (empty) = clean
+      if (addresses.length > 0 && addresses.some((a) => a.startsWith('127.0.'))) {
+        lists.push(name);
+      }
+    } catch (err) {
+      // Timeout or DNS error — fail-open (treat as unknown for this zone)
+      console.error(
+        `[domain-blacklist] Direct DNSBL ${name} lookup failed for ${cleaned}:`,
+        err instanceof Error ? err.message : err
+      );
+      raw[zone] = [];
+    }
+  }
+
+  return { lists, raw };
+}
+
+// ============================================
 // Fallback path: worker VPS proxy
 // ============================================
 
@@ -237,34 +283,80 @@ async function checkViaWorkerProxy(
 
 /**
  * Check a single domain against the blacklist tier chain.
- *   1. DQS (if SPAMHAUS_DQS_KEY set)
- *   2. Worker proxy (if WORKER_BLACKLIST_URL + WORKER_CALLBACK_SECRET set)
- *   3. Returns `unknown` with method='unavailable'
+ *   1. DQS (if SPAMHAUS_DQS_KEY set) — Spamhaus DBL
+ *   2. Direct DNSBL (SURBL + URIBL) — always available, no key needed
+ *   3. Worker proxy (if WORKER_BLACKLIST_URL + WORKER_CALLBACK_SECRET set)
+ *   4. Returns `unknown` with method='unavailable'
+ *
+ * IMPORTANT: Results are MERGED across tiers 1+2. If DQS says clean but
+ * SURBL says listed, the combined result is 'listed'. Don't short-circuit
+ * after DQS clean — always run Tier 2. Only skip Tier 3 if Tiers 1+2
+ * produced at least one definitive answer (Hard Lesson #83).
  *
  * Returns a 3-state result. Callers MUST handle 'unknown' explicitly —
- * do NOT treat it as clean OR as listed. The wizard should warn-but-allow;
- * the IONOS domain-list enrichment should sort unknowns between clean and
- * listed.
+ * do NOT treat it as clean OR as listed.
  */
 export async function checkDomainBlacklist(
   domain: string
 ): Promise<BlacklistResult> {
   const cleaned = domain.trim().toLowerCase();
+  const mergedLists: string[] = [];
+  const mergedRaw: Record<string, string[]> = {};
+  let hadDefinitiveAnswer = false;
 
-  // Tier 1: DQS
+  // Tier 1: DQS (Spamhaus DBL)
   const dqs = await checkViaDQS(cleaned);
-  if (dqs && dqs.status !== 'unknown') return dqs;
+  if (dqs) {
+    Object.assign(mergedRaw, dqs.raw);
+    if (dqs.status === 'listed') {
+      mergedLists.push(...dqs.lists);
+      hadDefinitiveAnswer = true;
+    } else if (dqs.status === 'clean') {
+      hadDefinitiveAnswer = true;
+    }
+    // If 'unknown', DQS was inconclusive — still run Tier 2
+  }
 
-  // Tier 2: worker proxy (only if DQS returned unknown or was unavailable)
+  // Tier 2: Direct DNSBL (SURBL + URIBL) — always run, merge results
+  const direct = await checkDirectDomainDNSBLs(cleaned);
+  Object.assign(mergedRaw, direct.raw);
+  if (direct.lists.length > 0) {
+    mergedLists.push(...direct.lists);
+    hadDefinitiveAnswer = true;
+  } else if (Object.values(direct.raw).some((addrs) => addrs.length === 0)) {
+    // At least one zone responded (even if clean) — that's a definitive answer
+    hadDefinitiveAnswer = true;
+  }
+
+  // If any tier found a listing, return 'listed' immediately
+  if (mergedLists.length > 0) {
+    return makeResult(cleaned, 'listed', mergedLists, mergedRaw, dqs ? 'dqs' : 'direct-dnsbl');
+  }
+
+  // If tiers 1+2 both returned definitive clean, no need for proxy fallback
+  if (hadDefinitiveAnswer && dqs && dqs.status !== 'unknown') {
+    return makeResult(cleaned, 'clean', [], mergedRaw, 'dqs');
+  }
+
+  // Tier 3: worker proxy (only if tiers 1+2 were insufficient)
   const proxy = await checkViaWorkerProxy(cleaned);
-  if (proxy && proxy.status !== 'unknown') return proxy;
+  if (proxy && proxy.status !== 'unknown') {
+    Object.assign(mergedRaw, proxy.raw);
+    if (proxy.status === 'listed') {
+      return makeResult(cleaned, 'listed', proxy.lists, mergedRaw, 'fallback-proxy');
+    }
+    return makeResult(cleaned, 'clean', [], mergedRaw, 'fallback-proxy');
+  }
 
-  // If DQS returned a definitive "unknown" and proxy wasn't configured,
-  // return the DQS result to preserve its `raw` field for debugging.
-  if (dqs) return dqs;
-  if (proxy) return proxy;
+  // If we had a definitive answer from Tier 2 even though DQS was unavailable
+  if (hadDefinitiveAnswer) {
+    return makeResult(cleaned, 'clean', [], mergedRaw, 'direct-dnsbl');
+  }
 
-  return makeResult(cleaned, 'unknown', [], {}, 'unavailable');
+  // All tiers inconclusive
+  if (dqs) return makeResult(cleaned, 'unknown', [], mergedRaw, 'dqs');
+  if (proxy) return makeResult(cleaned, 'unknown', [], mergedRaw, 'fallback-proxy');
+  return makeResult(cleaned, 'unknown', [], mergedRaw, 'unavailable');
 }
 
 /**

@@ -153,13 +153,17 @@ const IP_BLACKLISTS = [
   { zone: 'dnsbl.sorbs.net', name: 'SORBS' },
   { zone: 'dnsbl-1.uceprotect.net', name: 'UCEPROTECT L1' },
   { zone: 'b.barracudacentral.org', name: 'Barracuda' },
+  { zone: 'truncate.gbudb.net', name: 'TRUNCATE' },
+  { zone: 'spam.dnsbl.anonmails.de', name: 'Anonmails' },
 ];
 
-// Barracuda is WARN-only — not checked by Gmail/Outlook (Hard Lesson #76)
-const WARN_ONLY_BLACKLISTS = new Set(['Barracuda']);
+// Barracuda + UCEPROTECT are WARN-only — high false-positive rates on Linode (Hard Lesson #76)
+const WARN_ONLY_BLACKLISTS = new Set(['Barracuda', 'UCEPROTECT L1']);
 
 const DOMAIN_BLACKLISTS = [
   { zone: 'dbl.spamhaus.org', name: 'Spamhaus DBL' },
+  { zone: 'multi.surbl.org', name: 'SURBL' },
+  { zone: 'black.uribl.com', name: 'URIBL' },
 ];
 
 // --- Helper: create resolver with specific nameserver ---

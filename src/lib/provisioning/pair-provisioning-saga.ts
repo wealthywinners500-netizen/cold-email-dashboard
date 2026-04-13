@@ -1202,17 +1202,20 @@ export function createPairProvisioningSaga(
           context.log(`[Step 8] Subnet diversity check failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
         }
 
-        // --- Hard lesson #43/#47: Domain blacklist defense-in-depth ---
+        // --- Hard lesson #43/#47/#83: Domain blacklist defense-in-depth ---
         // check-domain was stubbed before #43, then DNS-blocked from Vercel
         // before #47. Either failure mode could allow Spamhaus-listed domains
         // through. Re-check at the end of the saga so the verification report
-        // surfaces any blacklisted domain. Does NOT fail the saga (the pair
-        // hardware is still fine) — just warns.
+        // surfaces any blacklisted domain.
+        //
+        // Hard Lesson #83: Domain blacklist hits are now FATAL. A blacklisted
+        // domain means emails will bounce — there's no point marking the pair
+        // "complete". The pair hardware is fine but the domain is unusable.
         //
         // 3-state result handling:
-        //   - 'listed'  → emit DOMAIN_BLACKLISTED warning (definitive hit)
-        //   - 'unknown' → emit BLACKLIST_CHECK_UNAVAILABLE warning so the
-        //                 operator knows to verify on MXToolbox manually
+        //   - 'listed'  → FATAL — return success: false
+        //   - 'unknown' → emit BLACKLIST_CHECK_UNAVAILABLE warning (non-fatal)
+        //                 so the operator knows to verify on MXToolbox manually
         //   - 'clean'   → log OK and move on
         try {
           const allSagaDomains = [context.nsDomain, ...context.sendingDomains];
@@ -1221,15 +1224,12 @@ export function createPairProvisioningSaga(
           const unknown = blResults.filter((r) => r.status === 'unknown');
 
           if (listed.length > 0) {
-            for (const r of listed) {
-              const msg = `Domain ${r.domain} is listed on: ${r.blacklists.join(', ')}`;
-              warnings.push({
-                code: 'DOMAIN_BLACKLISTED',
-                message: msg,
-                remediation: 'Submit delisting requests to each blocklist. Consider re-provisioning with clean domains.',
-              });
-              context.log(`[Step 8] WARNING: ${msg}`);
-            }
+            const listedDomains = listed.map((r) => `${r.domain} (${r.blacklists.join(', ')})`).join('; ');
+            context.log(`[Step 8] FATAL: ${listed.length} domain(s) blacklisted — ${listedDomains}`);
+            return {
+              success: false,
+              error: `FATAL: ${listed.length} domain(s) blacklisted — ${listedDomains}. Pair cannot be used for cold email. Submit delisting requests or re-provision with clean domains.`,
+            };
           }
 
           if (unknown.length > 0) {
