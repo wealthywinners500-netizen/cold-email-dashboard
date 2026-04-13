@@ -1,155 +1,121 @@
-// ============================================
-// SSL Certificate CN/Issuer/Expiry check
-// ============================================
-//
-// Connects to host:port over TLS and inspects the leaf certificate.
-// Returns subject CN, issuer, validity dates, and a flag for whether
-// the cert is self-signed.
-//
-// We treat any cert whose issuer CN matches its subject CN as
-// self-signed (the HestiaCP default before we run the LE issue),
-// and we treat Let's Encrypt as the only acceptable production CA.
+/**
+ * SSL certificate CN/SAN check — verifies certificate exists, matches expected hostname,
+ * and reports expiry info. Used by VG serverless step in serverless-steps.ts.
+ */
 
-import { connect as tlsConnect } from "tls";
+import * as tls from "tls";
 
 export interface SSLCertResult {
   ok: boolean;
-  selfSigned: boolean;
   subjectCN?: string;
   issuerCN?: string;
   issuerO?: string;
-  validFrom?: string;
-  validTo?: string;
   daysUntilExpiry?: number;
   error?: string;
-  durationMs: number;
 }
 
-const MS_PER_DAY = 1000 * 60 * 60 * 24;
-
 export async function checkSSLCert(
-  host: string,
-  port: number = 443,
-  servername?: string,
-  timeoutMs: number = 15_000
+  hostname: string,
+  port: number,
+  expectedCN: string
 ): Promise<SSLCertResult> {
-  const start = Date.now();
+  return new Promise((resolve) => {
+    const timeout = 10000;
+    let resolved = false;
 
-  return new Promise<SSLCertResult>((resolve) => {
-    let settled = false;
-
-    const finish = (r: SSLCertResult) => {
-      if (settled) return;
-      settled = true;
-      resolve({ ...r, durationMs: Date.now() - start });
+    const finish = (result: SSLCertResult) => {
+      if (resolved) return;
+      resolved = true;
+      resolve(result);
     };
 
-    const sock = tlsConnect(
-      {
-        host,
-        port,
-        servername: servername || host,
-        rejectUnauthorized: false, // we want to inspect bad certs too
-        timeout: timeoutMs,
-      },
-      () => {
-        try {
-          const cert = sock.getPeerCertificate(true);
-          if (!cert || !cert.subject) {
+    try {
+      const socket = tls.connect(
+        {
+          host: hostname,
+          port,
+          servername: expectedCN,
+          rejectUnauthorized: false,
+          timeout,
+        },
+        () => {
+          try {
+            const cert = socket.getPeerCertificate();
+            if (!cert || !cert.subject) {
+              finish({ ok: false, error: "No certificate presented" });
+              socket.destroy();
+              return;
+            }
+
+            const rawCN = cert.subject.CN;
+            const subjectCN = Array.isArray(rawCN) ? rawCN[0] || "" : rawCN || "";
+            const rawIssuerCN = cert.issuer?.CN;
+            const issuerCN = Array.isArray(rawIssuerCN) ? rawIssuerCN[0] || "" : rawIssuerCN || "";
+            const rawIssuerO = cert.issuer?.O;
+            const issuerO = Array.isArray(rawIssuerO) ? rawIssuerO[0] || "" : rawIssuerO || "";
+            const validTo = new Date(cert.valid_to);
+            const daysUntilExpiry = Math.floor(
+              (validTo.getTime() - Date.now()) / (1000 * 60 * 60 * 24)
+            );
+
+            // Check if CN or SAN matches expected
+            const sans = (cert.subjectaltname || "")
+              .split(",")
+              .map((s: string) => s.trim().replace(/^DNS:/, "").toLowerCase());
+            const cnMatch =
+              subjectCN.toLowerCase() === expectedCN.toLowerCase() ||
+              sans.includes(expectedCN.toLowerCase());
+
+            if (cnMatch && daysUntilExpiry > 0) {
+              finish({
+                ok: true,
+                subjectCN,
+                issuerCN,
+                issuerO,
+                daysUntilExpiry,
+              });
+            } else if (daysUntilExpiry <= 0) {
+              finish({
+                ok: false,
+                subjectCN,
+                issuerCN,
+                issuerO,
+                daysUntilExpiry,
+                error: `Certificate expired ${Math.abs(daysUntilExpiry)} days ago`,
+              });
+            } else {
+              finish({
+                ok: false,
+                subjectCN,
+                issuerCN,
+                issuerO,
+                daysUntilExpiry,
+                error: `CN mismatch: expected ${expectedCN}, got ${subjectCN} (SANs: ${sans.join(", ")})`,
+              });
+            }
+          } catch (err) {
             finish({
               ok: false,
-              selfSigned: false,
-              error: "No peer certificate",
-              durationMs: 0,
+              error: `Certificate parse error: ${err instanceof Error ? err.message : String(err)}`,
             });
-            sock.end();
-            return;
           }
-          const subjectCN: string | undefined = (cert.subject as { CN?: string }).CN;
-          const issuerCN: string | undefined = (cert.issuer as { CN?: string }).CN;
-          const issuerO: string | undefined = (cert.issuer as { O?: string }).O;
-          const validFrom = cert.valid_from;
-          const validTo = cert.valid_to;
-          const daysUntilExpiry = validTo
-            ? Math.floor((new Date(validTo).getTime() - Date.now()) / MS_PER_DAY)
-            : undefined;
-
-          // Self-signed: subject CN equals issuer CN AND issuer O is empty/missing.
-          // (HestiaCP self-signed default sets both to the hostname.)
-          const selfSigned = !!(
-            subjectCN &&
-            issuerCN &&
-            subjectCN === issuerCN &&
-            (!issuerO || issuerO === subjectCN)
-          );
-
-          // OK = NOT self-signed AND not expired AND issued by Let's Encrypt
-          // (the only CA we use). We are intentionally strict here because
-          // a Comodo / DigiCert cert showing up would mean someone reused
-          // an old hostname.
-          const isLetsEncrypt =
-            (issuerO || "").includes("Let's Encrypt") ||
-            (issuerCN || "").startsWith("R") || // R3, R10, R11 etc.
-            (issuerCN || "").startsWith("E"); // E1, E5, E6 etc.
-
-          finish({
-            ok:
-              !selfSigned &&
-              isLetsEncrypt &&
-              (daysUntilExpiry === undefined || daysUntilExpiry > 0),
-            selfSigned,
-            subjectCN,
-            issuerCN,
-            issuerO,
-            validFrom,
-            validTo,
-            daysUntilExpiry,
-            durationMs: 0,
-            error: selfSigned
-              ? "Certificate is self-signed (HestiaCP default — LE issue did not run)"
-              : !isLetsEncrypt
-                ? `Issuer is not Let's Encrypt: ${issuerO || issuerCN}`
-                : daysUntilExpiry !== undefined && daysUntilExpiry <= 0
-                  ? "Certificate is expired"
-                  : undefined,
-          });
-        } catch (err) {
-          finish({
-            ok: false,
-            selfSigned: false,
-            error: `Cert inspection failed: ${(err as Error).message}`,
-            durationMs: 0,
-          });
-        } finally {
-          try {
-            sock.end();
-          } catch {
-            // ignore
-          }
+          socket.destroy();
         }
-      }
-    );
+      );
 
-    sock.on("error", (err) =>
-      finish({
-        ok: false,
-        selfSigned: false,
-        error: `TLS connect error: ${(err as Error).message}`,
-        durationMs: 0,
-      })
-    );
-    sock.on("timeout", () => {
-      try {
-        sock.destroy();
-      } catch {
-        // ignore
-      }
-      finish({
-        ok: false,
-        selfSigned: false,
-        error: `TLS connect timeout after ${timeoutMs}ms`,
-        durationMs: 0,
+      socket.on("error", (err) => {
+        finish({ ok: false, error: `TLS connection error: ${err.message}` });
       });
-    });
+
+      socket.on("timeout", () => {
+        finish({ ok: false, error: "TLS connection timed out" });
+        socket.destroy();
+      });
+    } catch (err) {
+      finish({
+        ok: false,
+        error: `SSL check failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
   });
 }

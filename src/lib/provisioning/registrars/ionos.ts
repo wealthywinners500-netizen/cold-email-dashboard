@@ -278,23 +278,23 @@ export class IonosRegistrar extends BaseDNSRegistrar {
    * Get current nameservers for a domain.
    * GET /domains/v1/domainitems/{uuid}/nameservers
    * Returns { type: "CUSTOM"|"DEFAULT", nameservers: [{ name, ipV4Addresses? }] }
-   *
-   * Hard Lesson #72: Ionos 202 Accepted from NS update is async and can
-   * silently fail. Use this to verify the update actually took effect.
    */
-  async getDomainNameservers(domain: string): Promise<{ type: string; nameservers: Array<{ name: string; ipV4Addresses?: string[] }> }> {
+  async getDomainNameservers(domain: string): Promise<{
+    type?: string;
+    nameservers?: Array<{ name: string; ipV4Addresses?: string[] }>;
+  }> {
     const domainId = await this.getDomainId(domain);
     const url = `${this.baseUrl}/domains/v1/domainitems/${domainId}/nameservers`;
     this.log(`Getting nameservers for ${domain} (UUID: ${domainId})`);
 
     interface NSResponse {
-      type: string;
-      nameservers: Array<{ name: string; ipV4Addresses?: string[] }>;
+      type?: string;
+      nameservers?: Array<{ name: string; ipV4Addresses?: string[] }>;
     }
 
     const result = await this.httpRequest<NSResponse>(url, { method: "GET" });
-    this.log(`Nameservers for ${domain}: ${JSON.stringify(result?.nameservers?.map(ns => ns.name) || [])}`);
-    return result;
+    this.log(`Nameservers for ${domain}: ${JSON.stringify(result)}`);
+    return result || { nameservers: [] };
   }
 
   /**
