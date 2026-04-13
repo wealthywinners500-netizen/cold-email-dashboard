@@ -710,6 +710,25 @@ async function runVerificationGateOnce(jobId: string): Promise<{
 
   const verifier = new DNSVerifier();
 
+  // PATCH 11: Verify authoritative nameservers respond BEFORE running full checks.
+  // If NS are dead, all DNS checks will fail with misleading "record not found" errors.
+  for (const [nsLabel, nsIP] of [
+    ['ns1', server1IP],
+    ['ns2', server2IP],
+  ] as const) {
+    try {
+      const nsResolver = new dnsPromises.Resolver();
+      nsResolver.setServers([nsIP]);
+      await Promise.race([
+        nsResolver.resolve4(job.ns_domain),
+        new Promise<string[]>((_, reject) => setTimeout(() => reject(new Error('timeout')), 10000)),
+      ]);
+      results.push(`✓ ${nsLabel}.${job.ns_domain} (${nsIP}) responding to DNS queries`);
+    } catch (err) {
+      failures.push(`✗ ${nsLabel}.${job.ns_domain} (${nsIP}) NOT responding to DNS queries: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   // Use the existing fullHealthCheck which already covers items 1, 2, 4-7, 11
   // (with DQS support added in this same patch). It returns a structured
   // report we can split into our 12-row table.
@@ -798,6 +817,42 @@ async function runVerificationGateOnce(jobId: string): Promise<{
     failures.push(
       `✗ SSL mail2.${job.ns_domain}: ${ssl2.error} (subject=${ssl2.subjectCN}, issuer=${ssl2.issuerCN || ssl2.issuerO})`
     );
+  }
+
+  // PATCH 11: SSL cert checks on individual sending domains.
+  // MXToolbox checks HTTPS on every domain. Step 7 issues LE certs for
+  // each sending domain, but the VG never verified them until now.
+  // Load per-server domain assignment from Step 6 metadata.
+  {
+    const supabase = await createAdminClient();
+    const { data: step6Row } = await supabase
+      .from("provisioning_steps")
+      .select("metadata")
+      .eq("job_id", jobId)
+      .eq("step_type", "setup_mail_domains")
+      .maybeSingle();
+    const step6Meta = (step6Row?.metadata || {}) as Record<string, unknown>;
+    const s1Domains = (step6Meta.server1Domains as string[]) || [];
+    const s2Domains = (step6Meta.server2Domains as string[]) || [];
+
+    for (const domain of s1Domains) {
+      const sslCheck = await checkSSLCert(domain, 443, domain);
+      if (sslCheck.ok) {
+        results.push(`✓ SSL ${domain} (S1): ${sslCheck.issuerCN || sslCheck.issuerO} (${sslCheck.daysUntilExpiry}d)`);
+      } else {
+        // SSL on sending domains is a warning, not a hard failure —
+        // some LE issuance can be slow and mail delivery works without HTTPS
+        warnings.push(`⚠ SSL ${domain} (S1): ${sslCheck.error}`);
+      }
+    }
+    for (const domain of s2Domains) {
+      const sslCheck = await checkSSLCert(domain, 443, domain);
+      if (sslCheck.ok) {
+        results.push(`✓ SSL ${domain} (S2): ${sslCheck.issuerCN || sslCheck.issuerO} (${sslCheck.daysUntilExpiry}d)`);
+      } else {
+        warnings.push(`⚠ SSL ${domain} (S2): ${sslCheck.error}`);
+      }
+    }
   }
 
   // Item 11: DKIM sha256 cross-server match (Hard Lesson #68/#69).

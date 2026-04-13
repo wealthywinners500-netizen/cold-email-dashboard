@@ -300,6 +300,12 @@ async function ensureDNSRecords(
     requiredRecords.push(
       { type: 'TXT', host: '@', value: `"v=spf1 ip4:${server1IP} ip4:${server2IP} a mx -all"` }
     );
+    // PATCH 11: NS domain needs DMARC too. MXToolbox flags "No DMARC Record found"
+    // on any domain without a _dmarc TXT record — including the NS/hostname domain.
+    // Hard Lesson #79: Every domain that appears in DNS must have a DMARC record.
+    requiredRecords.push(
+      { type: 'TXT', host: '_dmarc', value: '"v=DMARC1; p=quarantine; pct=100; rua=mailto:dean.hofer@thestealthmail.com"' }
+    );
   }
 
   // Add any extra records from params

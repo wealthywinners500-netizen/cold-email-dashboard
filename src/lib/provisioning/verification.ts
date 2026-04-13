@@ -621,6 +621,32 @@ export class DNSVerifier {
     const { server1IP, server2IP, nsDomain, sendingDomains } = serverPair;
     const allDomains = [nsDomain, ...sendingDomains];
 
+    // PATCH 11: Verify authoritative nameservers respond to queries.
+    // MXToolbox's #1 check is "DNS No Valid NameServers Responded" — if ns1/ns2
+    // don't respond, ALL downstream checks fail. We query each NS directly for
+    // the NS domain's A record to confirm they're alive and serving DNS.
+    const nsChecks: Array<{ ns: string; ip: string; ok: boolean; error?: string }> = [];
+    for (const [nsHost, nsIP] of [
+      [`ns1.${nsDomain}`, server1IP],
+      [`ns2.${nsDomain}`, server2IP],
+    ]) {
+      try {
+        const nsResolver = createResolver(nsIP);
+        const result = await resolveWithTimeout(
+          () => nsResolver.resolve4(nsDomain),
+          10000
+        );
+        nsChecks.push({ ns: nsHost, ip: nsIP, ok: result.length > 0 });
+      } catch (err) {
+        nsChecks.push({
+          ns: nsHost,
+          ip: nsIP,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     // Run server-level checks in parallel
     const [
       ptr1,
@@ -647,6 +673,11 @@ export class DNSVerifier {
       blacklist: BlacklistResult
     ): ServerHealthScore => {
       const issues: string[] = [];
+      // PATCH 11: Check if this server's NS responded
+      const nsCheck = nsChecks.find(n => n.ip === ip);
+      if (nsCheck && !nsCheck.ok) {
+        issues.push(`Authoritative NS ${nsCheck.ns} (${ip}) not responding to DNS queries${nsCheck.error ? `: ${nsCheck.error}` : ''}`);
+      }
       if (!ptr.matches) issues.push(`PTR mismatch: expected ${hostname}, got ${ptr.actualHostnames.join(', ') || 'nothing'}`);
       if (!alignment.a_ok) issues.push(`A record for ${hostname} does not resolve to ${ip}`);
       if (!alignment.helo_ok) issues.push(`HELO SPF on ${alignment.heloDomain} does not include ${ip}`);
@@ -663,7 +694,7 @@ export class DNSVerifier {
         (b) => b.listed && !WARN_ONLY_BLACKLISTS.has(b.name)
       );
       let overall: 'PASS' | 'FAIL' | 'WARN' = 'PASS';
-      if (hardBlacklisted || !ptr.matches) overall = 'FAIL';
+      if (hardBlacklisted || !ptr.matches || (nsCheck && !nsCheck.ok)) overall = 'FAIL';
       else if (!alignment.fully_aligned || (blacklist.listed && !hardBlacklisted)) overall = 'WARN';
 
       return { ip, hostname, ptr, alignment, blacklist, overall, issues };
@@ -683,7 +714,7 @@ export class DNSVerifier {
         // Run all checks for this domain in parallel
         const [aCheck, mxCheck, spf, dkim, dmarc, domainBl] = await Promise.all([
           this.checkDNS(domain, 'A'),
-          isNs ? Promise.resolve(null) : this.checkDNS(domain, 'MX'),
+          this.checkDNS(domain, 'MX'),
           this.checkSPF(domain),
           this.checkDKIM(domain, 'mail'),
           this.checkDMARC(domain),
@@ -699,7 +730,7 @@ export class DNSVerifier {
         if (!aCheck.consistent) {
           issues.push(`Inconsistent A records across resolvers for ${domain}`);
         }
-        if (!isNs && mxCheck && !mxCheck.found) {
+        if (mxCheck && !mxCheck.found) {
           dns_ok = false;
           issues.push(`No MX record for ${domain}`);
         }

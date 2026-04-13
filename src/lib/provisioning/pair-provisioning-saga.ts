@@ -1292,6 +1292,21 @@ export function createPairProvisioningSaga(
             }
           }
 
+          // PATCH 11: Check DMARC on NS domain too — MXToolbox flags it
+          try {
+            const { stdout: nsDmarc } = await ssh1.exec(
+              `dig @8.8.8.8 _dmarc.${context.nsDomain} TXT +short 2>/dev/null`,
+              { timeout: 10000 }
+            );
+            if (!nsDmarc.includes('v=DMARC1')) {
+              failures.push(`${context.nsDomain}: missing DMARC record on NS domain`);
+            } else {
+              context.log(`[Step 8] OK: DMARC on NS domain ${context.nsDomain}`);
+            }
+          } catch {
+            failures.push(`${context.nsDomain}: DMARC check failed on NS domain`);
+          }
+
           // Check SPF/DKIM/DMARC on sending domains
           for (const domain of context.sendingDomains) {
             try {
@@ -1316,6 +1331,19 @@ export function createPairProvisioningSaga(
               }
             } catch {
               failures.push(`${domain}: DMARC check failed`);
+            }
+
+            // PATCH 11: Check DKIM on sending domains (was missing from saga VG)
+            try {
+              const { stdout: dkimRec } = await ssh1.exec(
+                `dig @8.8.8.8 mail._domainkey.${domain} TXT +short 2>/dev/null`,
+                { timeout: 10000 }
+              );
+              if (!dkimRec.includes('v=DKIM1') && !dkimRec.includes('p=')) {
+                failures.push(`${domain}: missing DKIM record (mail._domainkey)`);
+              }
+            } catch {
+              failures.push(`${domain}: DKIM check failed`);
             }
           }
 
@@ -1412,10 +1440,12 @@ export function createPairProvisioningSaga(
           }
 
           // Check blacklists for both IPs
+          // PATCH 11: Barracuda is WARN-only (Hard Lesson #76)
           const blacklists = [
-            'zen.spamhaus.org',
-            'dnsbl.sorbs.net',
-            'b.barracudacentral.org',
+            { zone: 'zen.spamhaus.org', name: 'Spamhaus ZEN', warnOnly: false },
+            { zone: 'dnsbl.sorbs.net', name: 'SORBS', warnOnly: false },
+            { zone: 'dnsbl-1.uceprotect.net', name: 'UCEPROTECT L1', warnOnly: false },
+            { zone: 'b.barracudacentral.org', name: 'Barracuda', warnOnly: true },
           ];
 
           for (const ip of [server1IP, server2IP]) {
@@ -1423,11 +1453,19 @@ export function createPairProvisioningSaga(
             for (const bl of blacklists) {
               try {
                 const { stdout } = await ssh1.exec(
-                  `dig ${reversedIP}.${bl} A +short 2>/dev/null`,
+                  `dig ${reversedIP}.${bl.zone} A +short 2>/dev/null`,
                   { timeout: 10000 }
                 );
                 if (stdout.trim() && stdout.includes('127.0.0')) {
-                  failures.push(`${ip}: listed on ${bl}`);
+                  if (bl.warnOnly) {
+                    warnings.push({
+                      code: 'IP_BLACKLIST_WARN',
+                      message: `${ip}: listed on ${bl.name} (WARN — not checked by Gmail/Outlook)`,
+                    });
+                    context.log(`[Step 8] WARN: ${ip} listed on ${bl.name} (non-blocking)`);
+                  } else {
+                    failures.push(`${ip}: listed on ${bl.name}`);
+                  }
                 }
               } catch {
                 // Query failure means not listed — that's good
