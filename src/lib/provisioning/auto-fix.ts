@@ -384,7 +384,10 @@ async function addDMARC(
   domain: string,
   params: { log: (msg: string) => void }
 ): Promise<void> {
-  const dmarcValue = '"v=DMARC1; p=quarantine; pct=100; rua=mailto:dean.hofer@thestealthmail.com"';
+  // Hard Lesson #95: No rua= in DMARC — external reporting domain
+  // (thestealthmail.com) lacks authorization records for sending domains,
+  // causing MXToolbox "External Domains not giving permission" warning.
+  const dmarcValue = '"v=DMARC1; p=quarantine; pct=100"';
   const addCmd = `v-add-dns-record admin ${domain} _dmarc TXT ${dmarcValue}`;
 
   for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
@@ -405,7 +408,10 @@ async function fixDMARC(
   domain: string,
   params: { log: (msg: string) => void }
 ): Promise<void> {
-  const dmarcValue = '"v=DMARC1; p=quarantine; pct=100; rua=mailto:dean.hofer@thestealthmail.com"';
+  // Hard Lesson #95: No rua= in DMARC — external reporting domain
+  // (thestealthmail.com) lacks authorization records for sending domains,
+  // causing MXToolbox "External Domains not giving permission" warning.
+  const dmarcValue = '"v=DMARC1; p=quarantine; pct=100"';
   const addCmd = `v-add-dns-record admin ${domain} _dmarc TXT ${dmarcValue}`;
 
   const matchFn = (line: string) => {

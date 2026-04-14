@@ -318,7 +318,8 @@ async function ensureDNSRecords(
     // on any domain without a _dmarc TXT record — including the NS/hostname domain.
     // Hard Lesson #79: Every domain that appears in DNS must have a DMARC record.
     requiredRecords.push(
-      { type: 'TXT', host: '_dmarc', value: '"v=DMARC1; p=quarantine; pct=100; rua=mailto:dean.hofer@thestealthmail.com"' }
+      // Hard Lesson #95: No rua= — external domain lacks authorization records
+      { type: 'TXT', host: '_dmarc', value: '"v=DMARC1; p=quarantine; pct=100"' }
     );
   }
 
@@ -636,6 +637,55 @@ export async function replicateZone(
   // Hard Lesson #16b: Use rndc reload on BOTH servers — NEVER v-rebuild-dns-domains for serial sync
   await sourceSSH.exec('rndc reload', { timeout: 10000 }).catch(() => {});
   await targetSSH.exec('rndc reload', { timeout: 10000 }).catch(() => {});
+}
+
+/**
+ * Hard Lesson #95: Sync zone DB files from S1 → S2 via SSH.
+ * HestiaCP DNS cluster is non-functional (#16a), so after any DNS record
+ * modification on S1 we must copy the zone files to S2 and reload BIND.
+ * This ensures SOA serials match and all records are identical on both
+ * authoritative nameservers (fixes MXToolbox "Serial numbers do not match").
+ *
+ * Requires sshpass on S1 (installed automatically if missing).
+ */
+export async function syncZoneFiles(
+  sourceSSH: SSHManager,
+  targetIP: string,
+  targetPassword: string,
+  domains: string[],
+): Promise<{ synced: string[]; failed: string[] }> {
+  const synced: string[] = [];
+  const failed: string[] = [];
+
+  // Ensure sshpass is available on source
+  await sourceSSH.exec(
+    'which sshpass >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y sshpass >/dev/null 2>&1',
+    { timeout: 30000 }
+  ).catch(() => {});
+
+  for (const domain of domains) {
+    const zonePath = `/home/admin/conf/dns/${domain}.db`;
+    try {
+      await sourceSSH.exec(
+        `sshpass -p '${targetPassword.replace(/'/g, "'\\''")}' scp -o StrictHostKeyChecking=no ${zonePath} root@${targetIP}:${zonePath}`,
+        { timeout: 15000 }
+      );
+      synced.push(domain);
+    } catch {
+      failed.push(domain);
+    }
+  }
+
+  // Reload BIND on target to pick up new zone files
+  await sourceSSH.exec(
+    `sshpass -p '${targetPassword.replace(/'/g, "'\\''")}' ssh -o StrictHostKeyChecking=no root@${targetIP} 'rndc reload'`,
+    { timeout: 15000 }
+  ).catch(() => {});
+
+  // Also reload source
+  await sourceSSH.exec('rndc reload', { timeout: 10000 }).catch(() => {});
+
+  return { synced, failed };
 }
 
 // ============================================

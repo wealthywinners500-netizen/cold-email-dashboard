@@ -33,6 +33,7 @@ import {
   issueSSLCert,
   setHostname,
   unmaskExim4,
+  syncZoneFiles,
   HESTIA_PATH_PREFIX,
 } from './hestia-scripts';
 import { generateAccountNamesForPair } from './name-generator';
@@ -867,7 +868,7 @@ export function createPairProvisioningSaga(
               );
               // Add correct DMARC with rua
               await ssh1.exec(
-                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100; rua=mailto:${adminEmailForDmarc}"'`,
+                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100"'`,
                 { timeout: 10000 }
               );
               context.log(`[Step 6] SPF+DMARC fixed for ${domain} on S1`);
@@ -906,7 +907,7 @@ export function createPairProvisioningSaga(
                 { timeout: 10000 }
               );
               await ssh2.exec(
-                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100; rua=mailto:${adminEmailForDmarc}"'`,
+                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100"'`,
                 { timeout: 10000 }
               );
               context.log(`[Step 6] SPF+DMARC fixed for ${domain} on S2`);
@@ -1124,9 +1125,24 @@ export function createPairProvisioningSaga(
             }
           }
 
-          // rndc reload on both servers
-          await ssh1.exec('rndc reload', { timeout: 10000 }).catch(() => {});
-          await ssh2.exec('rndc reload', { timeout: 10000 }).catch(() => {});
+          // Hard Lesson #95: Sync zone files from S1 → S2 so SOA serials match.
+          // HestiaCP DNS cluster is non-functional (#16a), and all v-add-dns-record
+          // commands above only modified S1's zone files. Without this sync, S2's
+          // zones are stale, causing MXToolbox "Serial numbers do not match" warning.
+          context.log('[Step 6] Syncing zone files from S1 → S2...');
+          const allDomainsForSync = [context.nsDomain, ...context.sendingDomains];
+          const s2IP = (ctx.server2IP as string) || context.server2?.ip || '';
+          const syncResult = await syncZoneFiles(
+            ssh1,
+            s2IP,
+            password,
+            allDomainsForSync,
+          );
+          if (syncResult.failed.length > 0) {
+            context.log(`[Step 6] Zone sync: ${syncResult.synced.length} synced, ${syncResult.failed.length} failed: ${syncResult.failed.join(', ')}`);
+          } else {
+            context.log(`[Step 6] Zone sync: all ${syncResult.synced.length} zones synced to S2`);
+          }
 
           // --- PATCH 14: Unmask Exim4 now that all auth records are in place ---
           // Exim4 was masked in Step 2 (installHestiaCP) to prevent unauthenticated
@@ -1536,6 +1552,17 @@ export function createPairProvisioningSaga(
               log: context.log,
             }
           );
+
+          // Hard Lesson #95: Sync zone files after auto-fix modifies DNS records
+          if (fixed.length > 0) {
+            context.log('[Step 10] Syncing zone files from S1 → S2 after auto-fix...');
+            const password = ctx.serverPassword as string;
+            if (password) {
+              const allDomainsForSync = [context.nsDomain, ...context.sendingDomains];
+              await syncZoneFiles(ssh1, server2IP, password, allDomainsForSync);
+              context.log('[Step 10] Zone sync complete');
+            }
+          }
 
           const output = `Auto-Fix: ${fixed.length} fixed, ${failed.length} failed.${
             failed.length > 0 ? `\nFailed: ${failed.join('; ')}` : ''
