@@ -158,15 +158,25 @@ export async function filterUsedDomains(
     );
   }
 
+  // Spamhaus DBL listings are permanent/serious (spam, phish, malware, botnet).
+  // URIBL, SURBL, and SEM Fresh are temporary reputation lists that clear
+  // naturally during the 4-week warm-up period. Only hard-block on DBL.
+  const HARD_BLOCK_LISTS = new Set([
+    'dbl.dq.spamhaus.net',  // Spamhaus DBL via DQS
+    'dbl.spamhaus.org',     // Legacy Spamhaus DBL
+  ]);
+
   return domains.map((d) => {
     const inUse = usedSet.has(d.domain.toLowerCase());
-    // Blacklist status is informational only — don't gate availability on it.
-    // Fresh .info domains are routinely URIBL-listed; blocking them here would
-    // make every newly-purchased domain unselectable. The wizard shows the
-    // blacklist badge so the user can make an informed choice.
+    // Only block if listed on a permanent blacklist (Spamhaus DBL).
+    // Temporary lists (URIBL, SURBL, SEM Fresh) are shown as warnings
+    // but don't prevent selection — they clear during warm-up.
+    const hardBlocked =
+      d.blacklistStatus === "listed" &&
+      (d.blacklists || []).some((list) => HARD_BLOCK_LISTS.has(list));
     return {
       ...d,
-      isAvailable: d.isAvailable && !inUse,
+      isAvailable: d.isAvailable && !inUse && !hardBlocked,
       ...(inUse ? { inUse: true } : {}),
     };
   });
