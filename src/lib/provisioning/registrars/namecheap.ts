@@ -90,7 +90,8 @@ export class NamecheapRegistrar extends BaseDNSRegistrar {
     await this.enforceRateLimit();
 
     const url = new URL(this.baseUrl);
-    url.searchParams.set("Command", command);
+    const fullCommand = command.startsWith("namecheap.") ? command : `namecheap.${command}`;
+    url.searchParams.set("Command", fullCommand);
     url.searchParams.set("ApiUser", this.apiSecret || "");
     url.searchParams.set("ApiKey", this.apiKey);
     url.searchParams.set("UserName", this.apiSecret || "");
@@ -112,7 +113,7 @@ export class NamecheapRegistrar extends BaseDNSRegistrar {
 
     // Check for API error in response
     if (xml.includes('Status="ERROR"') || xml.includes("<Error>")) {
-      const errorMatch = xml.match(/<ErrorMessage>(.*?)<\/ErrorMessage>/);
+      const errorMatch = xml.match(/<Error[^>]*>(.*?)<\/Error>/);
       const errorMsg = errorMatch ? errorMatch[1] : "Unknown error";
       throw new Error(`Namecheap API Error: ${errorMsg}`);
     }
