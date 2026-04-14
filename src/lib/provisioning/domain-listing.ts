@@ -160,10 +160,13 @@ export async function filterUsedDomains(
 
   return domains.map((d) => {
     const inUse = usedSet.has(d.domain.toLowerCase());
-    const blocked = d.blacklistStatus === "listed";
+    // Blacklist status is informational only — don't gate availability on it.
+    // Fresh .info domains are routinely URIBL-listed; blocking them here would
+    // make every newly-purchased domain unselectable. The wizard shows the
+    // blacklist badge so the user can make an informed choice.
     return {
       ...d,
-      isAvailable: d.isAvailable && !inUse && !blocked,
+      isAvailable: d.isAvailable && !inUse,
       ...(inUse ? { inUse: true } : {}),
     };
   });
