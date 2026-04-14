@@ -356,10 +356,8 @@ export function DomainInput({
             fetchedAt: data.fetchedAt || null,
             requestedAt: null,
           });
-          const available = (data.domains || [])
-            .filter((d: DomainInfo) => d.isAvailable)
-            .map((d: DomainInfo) => d.domain);
-          setSelectedFetched(new Set(available));
+          // Default to none selected — user picks which domains to use
+          setSelectedFetched(new Set());
           return;
         }
 
@@ -478,10 +476,8 @@ export function DomainInput({
             fetchedAt: data.fetchedAt || null,
             requestedAt: null,
           });
-          const available = (data.domains || [])
-            .filter((d: DomainInfo) => d.isAvailable)
-            .map((d: DomainInfo) => d.domain);
-          setSelectedFetched(new Set(available));
+          // Default to none selected — user picks which domains to use
+          setSelectedFetched(new Set());
           return;
         }
 

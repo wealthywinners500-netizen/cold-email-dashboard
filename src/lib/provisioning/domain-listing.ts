@@ -124,9 +124,10 @@ export async function filterUsedDomains(
     "setup", // pair 9 manual-repair state — still counts as in-use
   ];
 
+  // 1. Get live server pairs — also grab ns_domain to mark NS domains as in-use
   const { data: livePairs, error: pairsErr } = await supabase
     .from("server_pairs")
-    .select("id")
+    .select("id, ns_domain")
     .eq("org_id", orgId)
     .in("status", LIVE_PAIR_STATUSES);
 
@@ -140,6 +141,15 @@ export async function filterUsedDomains(
   const livePairIds = (livePairs || []).map((p: { id: string }) => p.id);
 
   let usedSet = new Set<string>();
+
+  // Add NS domains from live pairs — these are always in-use
+  for (const pair of livePairs || []) {
+    if ((pair as { ns_domain?: string }).ns_domain) {
+      usedSet.add(((pair as { ns_domain: string }).ns_domain).toLowerCase());
+    }
+  }
+
+  // 2. Check sending_domains table (canonical source for sending domains)
   if (livePairIds.length > 0) {
     const { data: usedDomains, error: sdErr } = await supabase
       .from("sending_domains")
@@ -153,9 +163,36 @@ export async function filterUsedDomains(
       );
     }
 
-    usedSet = new Set(
-      (usedDomains || []).map((d: { domain: string }) => d.domain.toLowerCase())
+    for (const d of usedDomains || []) {
+      usedSet.add((d as { domain: string }).domain.toLowerCase());
+    }
+  }
+
+  // 3. Also check provisioning_jobs.sending_domains (JSONB array) for jobs
+  //    that completed but may not have populated the sending_domains table yet.
+  //    Also checks in-progress jobs so domains being provisioned are blocked.
+  const ACTIVE_JOB_STATUSES = ["pending", "running", "completed"];
+  const { data: activeJobs, error: jobsErr } = await supabase
+    .from("provisioning_jobs")
+    .select("ns_domain, sending_domains")
+    .eq("org_id", orgId)
+    .in("status", ACTIVE_JOB_STATUSES);
+
+  if (jobsErr) {
+    console.warn(
+      "[domain-listing] filterUsedDomains: provisioning_jobs query failed:",
+      jobsErr.message
     );
+  }
+
+  for (const job of activeJobs || []) {
+    const j = job as { ns_domain?: string; sending_domains?: string[] };
+    if (j.ns_domain) usedSet.add(j.ns_domain.toLowerCase());
+    if (Array.isArray(j.sending_domains)) {
+      for (const d of j.sending_domains) {
+        usedSet.add(d.toLowerCase());
+      }
+    }
   }
 
   // Spamhaus DBL listings are permanent/serious (spam, phish, malware, botnet).

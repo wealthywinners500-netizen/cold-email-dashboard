@@ -298,6 +298,21 @@ export async function POST(
             }
           }
 
+          // Populate sending_domains table for domain-in-use filtering
+          const sendingDomainsList = jobRow.sending_domains as string[] | undefined;
+          if (sendingDomainsList && sendingDomainsList.length > 0) {
+            const sdRows = sendingDomainsList.map((domain: string) => ({
+              pair_id: serverPair.id,
+              domain,
+            }));
+            const { error: sdError } = await supabase
+              .from("sending_domains")
+              .insert(sdRows);
+            if (sdError) {
+              console.error(`[WorkerCallback] sending_domains insert failed: ${sdError.message}`);
+            }
+          }
+
           // Create SSH credentials
           if (encryptedPassword) {
             for (const [ip, hostname] of [
