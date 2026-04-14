@@ -210,19 +210,12 @@ export async function POST(
       const server2IP = (vpsMetadata.server2IP as string) || jobRow?.server2_ip || "";
 
       if (jobRow && server1IP && server2IP) {
-        // Hard Lesson #81: provisioning_jobs.org_id stores the Clerk org ID,
-        // but server_pairs.org_id FK references organizations.id (which may differ).
-        // Always look up the DB org ID by clerk_org_id.
-        const { data: orgRow } = await supabase
-          .from("organizations")
-          .select("id")
-          .eq("clerk_org_id", jobRow.org_id)
-          .single();
-
-        if (!orgRow) {
-          throw new Error(`Organization not found for clerk_org_id: ${jobRow.org_id} — cannot create server_pair`);
-        }
-        const dbOrgId = orgRow.id;
+        // Hard Lesson #94: provisioning_jobs.org_id stores organizations.id
+        // (the internal DB PK), NOT the Clerk org ID. getInternalOrgId() in
+        // the POST handler returns organizations.id, so jobRow.org_id IS the
+        // DB org ID already — no lookup needed. The old code tried to match
+        // it against clerk_org_id which failed when the two diverged.
+        const dbOrgId = jobRow.org_id;
 
         // Create server_pair record (column names: s1_ip, s2_ip, s1_hostname, s2_hostname)
         const { data: serverPair } = await supabase
