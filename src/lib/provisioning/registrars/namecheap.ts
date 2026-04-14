@@ -322,10 +322,9 @@ export class NamecheapRegistrar extends BaseDNSRegistrar {
       TLD: tld,
     };
 
-    // Add nameservers as indexed params
-    nameservers.forEach((ns, idx) => {
-      params[`Nameserver${idx + 1}`] = ns;
-    });
+    // Namecheap domains.dns.setCustom expects a single comma-separated
+    // "Nameservers" param — NOT indexed Nameserver1/Nameserver2 (Hard Lesson #87)
+    params["Nameservers"] = nameservers.join(",");
 
     await this.rawRequest("domains.dns.setCustom", params);
     this.log(`Nameservers set successfully`);
