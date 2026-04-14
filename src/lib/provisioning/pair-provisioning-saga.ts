@@ -34,6 +34,7 @@ import {
   setHostname,
   unmaskExim4,
   syncZoneFiles,
+  replicateSSLCertToSecondary,
   HESTIA_PATH_PREFIX,
 } from './hestia-scripts';
 import { generateAccountNamesForPair } from './name-generator';
@@ -1350,14 +1351,30 @@ export function createPairProvisioningSaga(
             context.log(`[Step 8] Server 2 hostname SSL failed (DNS may not have propagated). Mail works with self-signed cert.`);
           }
 
-          // Issue SSL for sending domains — per-server split (PATCH 10)
+          // Issue SSL for NS domain on S1, replicate to S2
+          // Hard Lesson #96: NS domain needs its own web domain + LE cert
+          try {
+            await issueSSLCert(ssh1, { domain: context.nsDomain, isHostname: false });
+            context.log(`[Step 8] NS domain SSL issued on S1: ${context.nsDomain}`);
+            try {
+              await replicateSSLCertToSecondary(ssh1, ssh2, context.nsDomain);
+              context.log(`[Step 8] NS domain SSL replicated to S2`);
+            } catch (repErr) {
+              context.log(`[Step 8] NS domain cert replication warning: ${repErr}`);
+            }
+          } catch (err) {
+            sslErrors.push(`NS ${context.nsDomain}: ${err}`);
+            context.log(`[Step 8] NS domain SSL failed: ${err}`);
+          }
+
+          // Issue SSL for sending domains
           // Read domain assignment from Step 6 metadata
           const ctx7 = ctxMeta(context);
           const server1Domains = (ctx7.server1Domains as string[]) || [];
           const server2Domains = (ctx7.server2Domains as string[]) || [];
           context.log(`[Step 8] SSL per-server split: S1=${server1Domains.length} domains, S2=${server2Domains.length} domains`);
 
-          // SSL for S1's assigned sending domains
+          // SSL for S1's assigned sending domains (issued on S1, no replication needed)
           for (const domain of server1Domains) {
             try {
               await issueSSLCert(ssh1, { domain, isHostname: false });
@@ -1367,13 +1384,34 @@ export function createPairProvisioningSaga(
             }
           }
 
-          // SSL for S2's assigned sending domains
+          // SSL for S2's assigned sending domains — Hard Lesson #65: issue on S1
+          // (primary), then replicate to S2 to avoid ACME HTTP-01 validation race
+          // where round-robin hits the wrong server's challenge file.
           for (const domain of server2Domains) {
             try {
-              await issueSSLCert(ssh2, { domain, isHostname: false });
-              context.log(`[Step 8] S2 SSL issued for ${domain}`);
+              await issueSSLCert(ssh1, { domain, isHostname: false });
+              context.log(`[Step 8] S2 domain SSL issued on S1: ${domain}`);
+              try {
+                await replicateSSLCertToSecondary(ssh1, ssh2, domain);
+                context.log(`[Step 8] SSL replicated to S2: ${domain}`);
+              } catch (repErr) {
+                sslErrors.push(`S2 ${domain} replication: ${repErr}`);
+              }
             } catch (err) {
               sslErrors.push(`S2 ${domain}: ${err}`);
+            }
+          }
+
+          // Hard Lesson #95: Sync zone files after LE cert issuance
+          // LE ACME challenges modify zone serials on both servers
+          {
+            const ctx8 = ctxMeta(context);
+            const pw = ctx8.serverPassword as string;
+            const s2ip = (ctx8.server2IP as string) || context.server2?.ip || '';
+            if (pw && s2ip) {
+              context.log('[Step 8] Syncing zone files S1→S2 after LE certs...');
+              await syncZoneFiles(ssh1, s2ip, pw, [context.nsDomain, ...context.sendingDomains]).catch(() => {});
+              context.log('[Step 8] Zone sync complete');
             }
           }
 

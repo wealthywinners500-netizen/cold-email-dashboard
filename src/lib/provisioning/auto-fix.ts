@@ -82,10 +82,15 @@ async function robustDNSRecordReplace(
     for (const addCmd of addCommands) {
       const fullCmd = `${HESTIA_PATH_PREFIX}${addCmd}`;
       const addResult = await ssh.exec(fullCmd, { timeout: 10000 });
-      if (addResult.code !== 0) {
+      // Hard Lesson #97: HestiaCP exit code 4 = "object already exists" — non-fatal for DNS adds
+      // Exit code 3 = "object already exists" for some record types (also non-fatal)
+      if (addResult.code !== 0 && addResult.code !== 3 && addResult.code !== 4) {
         throw new Error(
           `${serverName} Failed to add DNS record for ${domain}: ${addResult.stderr || addResult.stdout}`
         );
+      }
+      if (addResult.code === 3 || addResult.code === 4) {
+        log(`[Auto-Fix] ${label}/${serverName}: Record already exists for ${domain} (exit code ${addResult.code}) — continuing`);
       }
     }
 
