@@ -207,9 +207,11 @@ function AddProviderForm({
   const [providerType, setProviderType] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [apiSecret, setApiSecret] = useState("");
+  const [clientIp, setClientIp] = useState("");
   const [isDefault, setIsDefault] = useState(false);
 
   const typeOptions = type === "vps" ? VPS_PROVIDER_TYPES : DNS_REGISTRAR_TYPES;
+  const isNamecheap = type === "dns" && providerType === "namecheap";
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -217,12 +219,17 @@ function AddProviderForm({
     try {
       const endpoint =
         type === "vps" ? "/api/vps-providers" : "/api/dns-registrars";
+      const config: Record<string, unknown> = {};
+      if (isNamecheap && clientIp) {
+        config.clientIp = clientIp;
+      }
       const body: Record<string, unknown> = {
         name,
         [type === "vps" ? "provider_type" : "registrar_type"]: providerType,
         api_key: apiKey || undefined,
         api_secret: apiSecret || undefined,
         is_default: isDefault,
+        ...(Object.keys(config).length > 0 ? { config } : {}),
       };
       const res = await fetch(endpoint, {
         method: "POST",
@@ -235,6 +242,7 @@ function AddProviderForm({
         setProviderType("");
         setApiKey("");
         setApiSecret("");
+        setClientIp("");
         setIsDefault(false);
         onAdded();
       } else {
@@ -298,26 +306,49 @@ function AddProviderForm({
       </div>
       <div className="grid grid-cols-2 gap-4">
         <div>
-          <label className="block text-sm text-gray-400 mb-1">API Key</label>
+          <label className="block text-sm text-gray-400 mb-1">
+            {isNamecheap ? "API Token" : "API Key"}
+          </label>
           <input
             type="password"
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
-            placeholder="Optional — enter to enable automation"
+            placeholder={isNamecheap ? "Namecheap API token" : "Optional — enter to enable automation"}
             className="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-md text-white text-sm focus:outline-none focus:border-blue-500"
           />
         </div>
         <div>
-          <label className="block text-sm text-gray-400 mb-1">API Secret</label>
+          <label className="block text-sm text-gray-400 mb-1">
+            {isNamecheap ? "API Username" : "API Secret"}
+          </label>
           <input
             type="password"
             value={apiSecret}
             onChange={(e) => setApiSecret(e.target.value)}
-            placeholder="Optional — for providers needing key + secret"
+            placeholder={isNamecheap ? "Your Namecheap username" : "Optional — for providers needing key + secret"}
             className="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-md text-white text-sm focus:outline-none focus:border-blue-500"
           />
         </div>
       </div>
+      {isNamecheap && (
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">
+              Whitelisted Client IP
+            </label>
+            <input
+              type="text"
+              value={clientIp}
+              onChange={(e) => setClientIp(e.target.value)}
+              placeholder="e.g. 200.234.226.226"
+              className="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-md text-white text-sm focus:outline-none focus:border-blue-500"
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              IP whitelisted in Namecheap API settings — must match your worker VPS
+            </p>
+          </div>
+        </div>
+      )}
       <div className="flex items-center gap-2">
         <input
           type="checkbox"
