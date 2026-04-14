@@ -1035,7 +1035,9 @@ export async function runVerificationChecks(
     [ssh2, 'S2'],
   ] as const) {
     try {
-      const result = await sshn.exec('nc -z -w5 localhost 25 2>&1', { timeout: 15000 });
+      // Hard Lesson #92: Use 127.0.0.1 not localhost — HestiaCP servers
+      // resolve localhost to ::1 (IPv6) but Exim4 binds 0.0.0.0 (IPv4 only).
+      const result = await sshn.exec('nc -z -w5 127.0.0.1 25 2>&1', { timeout: 15000 });
       if (result.code === 0) {
         results.push({
           check: 'port_25_connectivity',
@@ -1071,7 +1073,7 @@ export async function runVerificationChecks(
     [ssh2, 'S2'],
   ] as const) {
     try {
-      const result = await sshn.exec('echo "QUIT" | nc -w5 localhost 25 2>&1 | head -1', {
+      const result = await sshn.exec('echo "QUIT" | nc -w5 127.0.0.1 25 2>&1 | head -1', {
         timeout: 15000,
       });
       const banner = result.stdout.trim();
@@ -1240,7 +1242,7 @@ export async function runVerificationChecks(
     try {
       const expectedHostname = name === 'S1' ? `mail1.${nsDomain}` : `mail2.${nsDomain}`;
       const result = await sshn.exec(
-        `echo "QUIT" | openssl s_client -starttls smtp -connect localhost:25 -servername ${expectedHostname} 2>&1 | head -20`,
+        `echo "QUIT" | openssl s_client -starttls smtp -connect 127.0.0.1:25 -servername ${expectedHostname} 2>&1 | head -20`,
         { timeout: 15000 }
       );
       const output = result.stdout;
@@ -1286,7 +1288,7 @@ export async function runVerificationChecks(
     try {
       const expectedHostname = name === 'S1' ? `mail1.${nsDomain}` : `mail2.${nsDomain}`;
       const result = await sshn.exec(
-        `echo | openssl s_client -starttls smtp -connect localhost:25 2>/dev/null | openssl x509 -noout -subject`,
+        `echo | openssl s_client -starttls smtp -connect 127.0.0.1:25 2>/dev/null | openssl x509 -noout -subject`,
         { timeout: 15000 }
       );
       const subject = result.stdout.trim();
@@ -1328,7 +1330,7 @@ export async function runVerificationChecks(
   ] as const) {
     try {
       const result = await sshn.exec(
-        `{ echo "EHLO test"; echo "MAIL FROM:<test@test.com>"; echo "RCPT TO:<test@example.com>"; echo "QUIT"; } | nc -w5 localhost 25 2>&1`,
+        `{ echo "EHLO test"; echo "MAIL FROM:<test@test.com>"; echo "RCPT TO:<test@example.com>"; echo "QUIT"; } | nc -w5 127.0.0.1 25 2>&1`,
         { timeout: 15000 }
       );
       const output = result.stdout;
@@ -1420,7 +1422,7 @@ export async function runVerificationChecks(
     try {
       const domain = server1Domains[0] || nsDomain;
       const result = await sshn.exec(
-        `time { echo -e "EHLO test\\nMAIL FROM:<test@test.com>\\nRCPT TO:<postmaster@${domain}>\\nQUIT"; } | nc -w15 localhost 25 > /dev/null 2>&1`,
+        `time { echo -e "EHLO test\\nMAIL FROM:<test@test.com>\\nRCPT TO:<postmaster@${domain}>\\nQUIT"; } | nc -w15 127.0.0.1 25 > /dev/null 2>&1`,
         { timeout: 20000 }
       );
       const timeMatch = result.stderr.match(/real\s+0m([0-9.]+)s/);
