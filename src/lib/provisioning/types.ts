@@ -46,8 +46,11 @@ export type StepType =
   | "setup_dns_zones"        // Step 5: A records on BIND
   | "set_ptr"                // Step 6: Requires forward A to resolve
   | "setup_mail_domains"     // Step 7: DKIM/SPF/DMARC/accounts
-  | "security_hardening"     // Step 8: Kill services + SSL certs
-  | "verification_gate";     // Step 9: PTR↔A↔HELO + blacklists + port 25 + SSL CN
+  | "await_s2_dns"           // Step 8: Poll resolvers for S2 domain A records before SSL
+  | "security_hardening"     // Step 9: Kill services + SSL certs
+  | "verification_gate"      // Step 10: VG1 — categorized checks (auto_fixable vs manual_required)
+  | "auto_fix"               // Step 11: Auto-fix all auto_fixable issues from VG1
+  | "verification_gate_2";   // Step 12: VG2 — re-run checks, pass = done
 
 export type StepStatus =
   | "pending"
@@ -211,6 +214,16 @@ export interface DNSRegistrar {
   deleteRecord(zone: string, recordId: string): Promise<void>;
   testConnection(): Promise<{ ok: boolean; message: string }>;
   listDomains(): Promise<DomainInfo[]>;
+}
+
+// Verification gate result — used by VG1, Auto-Fix, and VG2
+export interface VerificationResult {
+  check: string;       // e.g., 'dns_a_record', 'ssl_cert', 'ptr_alignment'
+  domain: string;      // which domain or IP this check applies to
+  server: 'S1' | 'S2' | 'both';
+  status: 'pass' | 'auto_fixable' | 'manual_required';
+  details: string;     // human-readable description
+  fixAction?: string;  // key for the auto-fix step to act on
 }
 
 // Runtime context passed through provisioning saga steps

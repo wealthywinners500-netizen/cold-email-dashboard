@@ -1049,5 +1049,6 @@ export const SERVERLESS_STEP_RUNNERS: Partial<
   configure_registrar: runConfigureRegistrar,
   set_ptr: runSetPtr,
   await_dns_propagation: runAwaitDnsPropagation,
-  verification_gate: runVerificationGate,
+  // verification_gate moved to SSH-required saga path (needs SSH to both
+  // servers for SMTP banner, DKIM cross-check, auto-fix, etc.)
 };

@@ -28,8 +28,11 @@ const STEP_CONFIG: Record<StepType, { label: string; icon: React.ElementType }> 
   install_hestiacp: { label: "Install HestiaCP", icon: Download },
   setup_dns_zones: { label: "Setup DNS Zones", icon: Globe },
   setup_mail_domains: { label: "Setup Mail Domains", icon: Mail },
+  await_s2_dns: { label: "Await S2 DNS Propagation", icon: Clock },
   security_hardening: { label: "Security Hardening", icon: Shield },
-  verification_gate: { label: "Verification Gate", icon: CheckCircle2 },
+  verification_gate: { label: "Verification Gate 1", icon: CheckCircle2 },
+  auto_fix: { label: "Auto-Fix Issues", icon: Settings },
+  verification_gate_2: { label: "Verification Gate 2", icon: CheckCircle2 },
 };
 
 interface StepData {

@@ -1,14 +1,17 @@
 // ============================================
-// B15-3 REVISED: 8-Step Pair Provisioning Saga
+// B15-3 REVISED: 11-Step Pair Provisioning Saga (Self-Healing)
 // Order corrected based on deep research (April 2026):
 //   1. Create VPS        — get IPs first
 //   2. Install HestiaCP  — no DNS needed, bare server + hostname
 //   3. Configure Registrar (NS/glue) — start propagation early (12-48hr)
 //   4. Setup DNS Zones   — A records on BIND, authoritative once NS propagates
 //   5. Set PTR           — REQUIRES forward A to resolve first (Linode validates)
-//   6. Setup Mail Domains — DKIM/SPF/DMARC/accounts
-//   7. Security Hardening + SSL — SpamAssassin kill + LE certs (needs DNS)
-//   8. Verification Gate  — PTR↔A↔HELO, SPF/DKIM/DMARC, blacklists
+//   6. Setup Mail Domains — DKIM/SPF/DMARC/accounts + mail/webmail A fix for S2
+//   7. Await S2 DNS      — poll resolvers for S2 domain A records before SSL
+//   8. Security Hardening + SSL — SpamAssassin kill + LE certs (needs DNS)
+//   9. Verification Gate 1 — categorized checks (auto_fixable vs manual_required)
+//  10. Auto-Fix          — attempt automated fixes for all auto_fixable issues
+//  11. Verification Gate 2 — re-run checks, pass = done
 //
 // WHY THIS ORDER:
 // - Linode/Hetzner/Vultr PTR APIs validate forward DNS resolves BEFORE accepting rDNS
@@ -41,6 +44,8 @@ import type {
 import type { SagaStep, StepResult } from './saga-engine';
 import { checkSubnetDiversity } from './verification';
 import { checkDomainsBlacklistBatch } from './domain-blacklist';
+import { runVerificationChecks } from './verification-checks';
+import { runAutoFixes } from './auto-fix';
 
 // Helper to access dynamic metadata on context safely
 function ctxMeta(context: ProvisioningContext): Record<string, unknown> {
@@ -117,7 +122,7 @@ async function checkForwardDNSResolves(
 }
 
 // ============================================
-// Factory: Create the 8-step saga (CORRECTED ORDER)
+// Factory: Create the 11-step saga (SELF-HEALING)
 // ============================================
 
 export function createPairProvisioningSaga(
@@ -1002,6 +1007,75 @@ export function createPairProvisioningSaga(
             context.log(`[Step 6] A/MX fixed for ${domain}: @ A → ${server2IP}, MX → mail2.${domain}`);
           }
 
+          // PATCH 15: Fix mail/webmail A records for S2 domains on BOTH servers
+          // Hard Lesson #90: HestiaCP's v-add-letsencrypt-domain includes mail.domain
+          // and webmail.domain in the SAN cert. If these subdomains don't resolve to
+          // the correct server (NXDOMAIN from either ns1 or ns2), LE validation fails
+          // with exit 15. ensureDNSRecords in Step 4 creates mail A → server1IP for ALL
+          // domains. For S2 domains, we must delete the stale record and add the correct one.
+          context.log('[Step 6] Fixing mail/webmail A records for S2 domains on both DNS servers...');
+          for (const domain of server2Domains) {
+            for (const [sshConn, label] of [[ssh1, 'S1'], [ssh2, 'S2']] as [typeof ssh1, string][]) {
+              try {
+                const { stdout: records } = await sshConn.exec(
+                  `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+                  { timeout: 15000 }
+                );
+                const lines = records.split('\n');
+
+                // Collect mail A and webmail A record IDs to delete
+                const mailAIds: string[] = [];
+                for (const line of lines) {
+                  const cols = line.trim().split(/\s+/);
+                  if (cols.length < 4) continue;
+                  const [recordId, host, type] = cols;
+                  if (!/^\d+$/.test(recordId)) continue;
+                  if (type === 'A' && (host === 'mail' || host === 'webmail')) {
+                    mailAIds.push(recordId);
+                  }
+                }
+
+                // Delete old mail/webmail A records with explicit error logging
+                for (const rid of mailAIds) {
+                  const delResult = await sshConn.exec(
+                    `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${rid}`,
+                    { timeout: 10000 }
+                  );
+                  if (delResult.code !== 0) {
+                    context.log(`[Step 6] WARNING: Failed to delete mail/webmail A record ${rid} for ${domain} on ${label}: exit ${delResult.code} ${delResult.stderr}`);
+                  }
+                }
+
+                // Verify no stale mail/webmail A records remain
+                const { stdout: postDeleteRecords } = await sshConn.exec(
+                  `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+                  { timeout: 15000 }
+                );
+                const remainingMailA = postDeleteRecords.split('\n').filter(l => {
+                  const c = l.trim().split(/\s+/);
+                  return c.length >= 4 && c[2] === 'A' && (c[1] === 'mail' || c[1] === 'webmail');
+                });
+                if (remainingMailA.length > 0) {
+                  context.log(`[Step 6] ERROR: ${remainingMailA.length} stale mail/webmail A record(s) still present for ${domain} on ${label}`);
+                }
+
+                // Add correct mail A → server2IP and webmail A → server2IP
+                await sshConn.exec(
+                  `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} mail A ${server2IP}`,
+                  { timeout: 10000 }
+                );
+                await sshConn.exec(
+                  `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} webmail A ${server2IP}`,
+                  { timeout: 10000 }
+                );
+              } catch (err) {
+                context.log(`[Step 6] ERROR: mail/webmail A fix for ${domain} on ${label} FAILED: ${err}`);
+                throw new Error(`Failed to fix mail/webmail A for S2 domain ${domain} on ${label}: ${err}`);
+              }
+            }
+            context.log(`[Step 6] mail/webmail A fixed for ${domain}: mail A → ${server2IP}, webmail A → ${server2IP}`);
+          }
+
           // PATCH 10c: Replicate SPF/DKIM/DMARC DNS records to the OTHER server.
           // Both servers serve DNS (ns1=S1, ns2=S2). createMailDomain only adds
           // auth records to the assigned server's zone. Without replication,
@@ -1127,7 +1201,88 @@ export function createPairProvisioningSaga(
     },
 
     // ========================================
-    // Step 7: SECURITY_HARDENING + SSL (~1-3 min)
+    // Step 7: AWAIT_S2_DNS_PROPAGATION (~5-120s)
+    // Poll public resolvers to confirm S2 domain A records propagated
+    // before SSL cert issuance in Step 8. Zone changes typically
+    // propagate in 5-60 seconds. If timeout: warn but don't block —
+    // LE queries authoritative NS directly.
+    // ========================================
+    {
+      name: 'Await S2 DNS Propagation',
+      type: 'await_s2_dns' as const,
+      estimatedDurationMs: 120_000,
+
+      async execute(context: ProvisioningContext): Promise<StepResult> {
+        context.log('[Step 7] Awaiting S2 DNS propagation...');
+        const ctx = ctxMeta(context);
+        const server2IP = ctx.server2IP as string;
+        const server2Domains = (ctx.server2Domains as string[]) || [];
+
+        if (server2Domains.length === 0) {
+          context.log('[Step 7] No S2 domains to check. Skipping.');
+          return { success: true, output: 'No S2 domains — skipped.' };
+        }
+
+        const resolvers = ['8.8.8.8', '1.1.1.1', '9.9.9.9'];
+        const requiredResolvers = 2; // At least 2 of 3 must confirm
+        const pollIntervalMs = 10_000;
+        const timeoutMs = 120_000;
+        const results: Array<{ domain: string; propagated: boolean }> = [];
+
+        for (const domain of server2Domains) {
+          const start = Date.now();
+          let propagated = false;
+
+          while (Date.now() - start < timeoutMs) {
+            let confirmCount = 0;
+            for (const resolver of resolvers) {
+              try {
+                const { stdout } = await ssh1.exec(
+                  `dig +short ${domain} A @${resolver} 2>/dev/null`,
+                  { timeout: 10000 }
+                );
+                const ip = stdout.trim().split('\n')[0];
+                if (ip === server2IP) confirmCount++;
+              } catch {
+                // Resolver timeout — doesn't count
+              }
+            }
+
+            if (confirmCount >= requiredResolvers) {
+              propagated = true;
+              context.log(`[Step 7] ${domain} propagated (${confirmCount}/${resolvers.length} resolvers confirm ${server2IP})`);
+              break;
+            }
+
+            context.log(`[Step 7] ${domain}: ${confirmCount}/${resolvers.length} resolvers see ${server2IP} — waiting ${pollIntervalMs / 1000}s...`);
+            await new Promise((r) => setTimeout(r, pollIntervalMs));
+          }
+
+          if (!propagated) {
+            context.log(`[Step 7] WARNING: ${domain} did not propagate within ${timeoutMs / 1000}s. LE may still work via authoritative NS.`);
+          }
+          results.push({ domain, propagated });
+        }
+
+        const propagatedCount = results.filter(r => r.propagated).length;
+        const output = `S2 DNS propagation: ${propagatedCount}/${server2Domains.length} domains confirmed on public resolvers.`;
+        context.log(`[Step 7] ${output}`);
+
+        // Always succeed — this is informational, don't block the saga
+        return {
+          success: true,
+          output,
+          metadata: { s2DnsPropagation: results },
+        };
+      },
+
+      async compensate(_context: ProvisioningContext): Promise<void> {
+        // Informational step — nothing to rollback
+      },
+    },
+
+    // ========================================
+    // Step 8: SECURITY_HARDENING + SSL (~1-3 min)
     // SpamAssassin/ClamAV/fail2ban kill + Let's Encrypt certs.
     // LE HTTP-01 requires A record to resolve globally.
     // If LE fails (DNS not propagated), hardening still succeeds —
@@ -1139,7 +1294,7 @@ export function createPairProvisioningSaga(
       estimatedDurationMs: 180_000,
 
       async execute(context: ProvisioningContext): Promise<StepResult> {
-        context.log('[Step 7] Running security hardening...');
+        context.log('[Step 8] Running security hardening...');
 
         try {
           // Harden both servers (SpamAssassin, ClamAV, fail2ban)
@@ -1148,7 +1303,7 @@ export function createPairProvisioningSaga(
             hardenSecurity(ssh2),
           ]);
 
-          context.log('[Step 7] Security hardening complete. Attempting SSL certs...');
+          context.log('[Step 8] Security hardening complete. Attempting SSL certs...');
 
           // Track SSL results — LE may fail if DNS hasn't propagated globally yet
           const sslErrors: string[] = [];
@@ -1161,10 +1316,10 @@ export function createPairProvisioningSaga(
               isHostname: true,
             });
             hostnameSSLSuccess = true;
-            context.log('[Step 7] Server 1 hostname SSL cert issued.');
+            context.log('[Step 8] Server 1 hostname SSL cert issued.');
           } catch (err) {
             sslErrors.push(`S1 hostname: ${err}`);
-            context.log(`[Step 7] Server 1 hostname SSL failed (DNS may not have propagated). Mail works with self-signed cert.`);
+            context.log(`[Step 8] Server 1 hostname SSL failed (DNS may not have propagated). Mail works with self-signed cert.`);
           }
 
           try {
@@ -1173,10 +1328,10 @@ export function createPairProvisioningSaga(
               isHostname: true,
             });
             if (hostnameSSLSuccess) hostnameSSLSuccess = true;
-            context.log('[Step 7] Server 2 hostname SSL cert issued.');
+            context.log('[Step 8] Server 2 hostname SSL cert issued.');
           } catch (err) {
             sslErrors.push(`S2 hostname: ${err}`);
-            context.log(`[Step 7] Server 2 hostname SSL failed (DNS may not have propagated). Mail works with self-signed cert.`);
+            context.log(`[Step 8] Server 2 hostname SSL failed (DNS may not have propagated). Mail works with self-signed cert.`);
           }
 
           // Issue SSL for sending domains — per-server split (PATCH 10)
@@ -1184,13 +1339,13 @@ export function createPairProvisioningSaga(
           const ctx7 = ctxMeta(context);
           const server1Domains = (ctx7.server1Domains as string[]) || [];
           const server2Domains = (ctx7.server2Domains as string[]) || [];
-          context.log(`[Step 7] SSL per-server split: S1=${server1Domains.length} domains, S2=${server2Domains.length} domains`);
+          context.log(`[Step 8] SSL per-server split: S1=${server1Domains.length} domains, S2=${server2Domains.length} domains`);
 
           // SSL for S1's assigned sending domains
           for (const domain of server1Domains) {
             try {
               await issueSSLCert(ssh1, { domain, isHostname: false });
-              context.log(`[Step 7] S1 SSL issued for ${domain}`);
+              context.log(`[Step 8] S1 SSL issued for ${domain}`);
             } catch (err) {
               sslErrors.push(`S1 ${domain}: ${err}`);
             }
@@ -1200,7 +1355,7 @@ export function createPairProvisioningSaga(
           for (const domain of server2Domains) {
             try {
               await issueSSLCert(ssh2, { domain, isHostname: false });
-              context.log(`[Step 7] S2 SSL issued for ${domain}`);
+              context.log(`[Step 8] S2 SSL issued for ${domain}`);
             } catch (err) {
               sslErrors.push(`S2 ${domain}: ${err}`);
             }
@@ -1232,339 +1387,268 @@ export function createPairProvisioningSaga(
     },
 
     // ========================================
-    // Step 8: VERIFICATION_GATE (~2 min)
-    // PTR↔A↔HELO alignment, SPF/DKIM/DMARC, blacklists.
-    // Issues that can't be auto-fixed are flagged as manual_required.
+    // Step 9: VERIFICATION_GATE_1 (~2-5 min)
+    // Enhanced verification with categorized results:
+    // auto_fixable vs manual_required. Feeds Step 10 (Auto-Fix).
     // ========================================
     {
-      name: 'Verification Gate',
+      name: 'Verification Gate 1',
       type: 'verification_gate',
-      estimatedDurationMs: 120_000,
+      estimatedDurationMs: 300_000,
 
       async execute(context: ProvisioningContext): Promise<StepResult> {
-        context.log('[Step 8] Running verification gate...');
+        context.log('[Step 9] Running Verification Gate 1...');
         const ctx = ctxMeta(context);
         const server1IP = ctx.server1IP as string;
         const server2IP = ctx.server2IP as string;
-        const resolvers = ['8.8.8.8', '1.1.1.1', '9.9.9.9'];
-        const failures: string[] = [];
-        const warnings: Array<{ code: string; message: string; remediation?: string }> = [];
-
-        // --- Hard lesson #44: Subnet diversity check ---
-        // MXToolbox flags pairs that share a /24. Linode assigns IPs from the
-        // same regional pool, so same region → near-guaranteed shared /24.
-        // Non-fatal warning so Dean can decide per-pair whether to rollback.
-        try {
-          const subnet = checkSubnetDiversity(server1IP, server2IP);
-          if (subnet.sameSlash24) {
-            const msg = `mail1 (${server1IP}) and mail2 (${server2IP}) share /24 ${subnet.slash24_1}. MXToolbox will flag this as a same-subnet pair.`;
-            warnings.push({
-              code: 'SAME_SUBNET_24',
-              message: msg,
-              remediation: 'Rollback and reprovision mail2 in a different region (set secondaryRegion in the wizard), or request Linode support for placement diversity.',
-            });
-            context.log(`[Step 8] WARNING: Same /24 detected for pair — ${msg}`);
-          } else if (subnet.sameSlash16) {
-            context.log(`[Step 8] INFO: mail1 and mail2 share /16 but differ on /24 (OK)`);
-          } else {
-            context.log(`[Step 8] OK: subnet diversity verified (${subnet.slash24_1} vs ${subnet.slash24_2})`);
-          }
-        } catch (err) {
-          context.log(`[Step 8] Subnet diversity check failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
-        }
+        const s1Domains = (ctx.server1Domains as string[]) || [];
+        const s2Domains = (ctx.server2Domains as string[]) || [];
 
         // --- Hard lesson #43/#47/#83: Domain blacklist defense-in-depth ---
-        // check-domain was stubbed before #43, then DNS-blocked from Vercel
-        // before #47. Either failure mode could allow Spamhaus-listed domains
-        // through. Re-check at the end of the saga so the verification report
-        // surfaces any blacklisted domain.
-        //
-        // Hard Lesson #83: Domain blacklist hits are now FATAL. A blacklisted
-        // domain means emails will bounce — there's no point marking the pair
-        // "complete". The pair hardware is fine but the domain is unusable.
-        //
-        // 3-state result handling:
-        //   - 'listed'  → FATAL — return success: false
-        //   - 'unknown' → emit BLACKLIST_CHECK_UNAVAILABLE warning (non-fatal)
-        //                 so the operator knows to verify on MXToolbox manually
-        //   - 'clean'   → log OK and move on
+        // Domain blacklist hits are FATAL. Check BEFORE running full VG.
         try {
           const allSagaDomains = [context.nsDomain, ...context.sendingDomains];
           const blResults = await checkDomainsBlacklistBatch(allSagaDomains, { concurrency: 5 });
           const listed = blResults.filter((r) => r.status === 'listed');
-          const unknown = blResults.filter((r) => r.status === 'unknown');
 
           if (listed.length > 0) {
             const listedDomains = listed.map((r) => `${r.domain} (${r.blacklists.join(', ')})`).join('; ');
-            context.log(`[Step 8] FATAL: ${listed.length} domain(s) blacklisted — ${listedDomains}`);
+            context.log(`[Step 9] FATAL: ${listed.length} domain(s) blacklisted — ${listedDomains}`);
             return {
               success: false,
-              error: `FATAL: ${listed.length} domain(s) blacklisted — ${listedDomains}. Pair cannot be used for cold email. Submit delisting requests or re-provision with clean domains.`,
+              error: `FATAL: ${listed.length} domain(s) blacklisted — ${listedDomains}. Pair cannot be used for cold email.`,
             };
           }
 
+          const unknown = blResults.filter((r) => r.status === 'unknown');
           if (unknown.length > 0) {
-            const msg = `Blacklist service unavailable for: ${unknown.map((r) => r.domain).join(', ')}`;
-            warnings.push({
-              code: 'BLACKLIST_CHECK_UNAVAILABLE',
-              message: msg,
-              remediation: 'Run a manual MXToolbox blacklist scan on each listed domain to confirm clean status.',
-            });
-            context.log(`[Step 8] WARNING: ${msg} (method=${unknown[0]?.method ?? 'unavailable'})`);
-          }
-
-          if (listed.length === 0 && unknown.length === 0) {
-            context.log(`[Step 8] OK: all ${allSagaDomains.length} domains clean on DNSBLs`);
+            context.log(`[Step 9] WARNING: Blacklist service unavailable for: ${unknown.map((r) => r.domain).join(', ')}`);
+          } else {
+            context.log(`[Step 9] OK: all ${allSagaDomains.length} domains clean on DNSBLs`);
           }
         } catch (err) {
-          context.log(`[Step 8] Domain blacklist check failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+          context.log(`[Step 9] Domain blacklist check failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
         }
 
         try {
-          // Check all domains via multi-resolver DNS
-          const allDomains = [context.nsDomain, ...context.sendingDomains];
+          // Run comprehensive verification checks
+          const verificationResults = await runVerificationChecks(ssh1, ssh2, {
+            nsDomain: context.nsDomain,
+            sendingDomains: context.sendingDomains,
+            server1IP,
+            server2IP,
+            server1Domains: s1Domains,
+            server2Domains: s2Domains,
+            log: context.log,
+          });
 
-          for (const domain of allDomains) {
-            for (const resolver of resolvers) {
-              try {
-                const { stdout } = await ssh1.exec(
-                  `dig @${resolver} ${domain} A +short 2>/dev/null`,
-                  { timeout: 10000 }
-                );
-                if (!stdout.trim()) {
-                  failures.push(`${domain}: no A record via ${resolver}`);
-                }
-              } catch {
-                failures.push(`${domain}: DNS query failed via ${resolver}`);
-              }
+          // Categorize results
+          const passing = verificationResults.filter(r => r.status === 'pass');
+          const autoFixable = verificationResults.filter(r => r.status === 'auto_fixable');
+          const manualRequired = verificationResults.filter(r => r.status === 'manual_required');
+
+          context.log(`[Step 9] VG1 results: ${passing.length} pass, ${autoFixable.length} auto-fixable, ${manualRequired.length} manual-required`);
+
+          // Store results in context for Step 10 (Auto-Fix) to read
+          const outputSummary = [
+            `VG1: ${verificationResults.length} checks total`,
+            `  ${passing.length} passed`,
+            `  ${autoFixable.length} auto-fixable`,
+            `  ${manualRequired.length} manual-required`,
+          ].join('\n');
+
+          if (autoFixable.length > 0) {
+            context.log(`[Step 9] Auto-fixable issues:\n${autoFixable.map(r => `  - ${r.check} on ${r.domain}: ${r.details} [fix: ${r.fixAction}]`).join('\n')}`);
+          }
+          if (manualRequired.length > 0) {
+            context.log(`[Step 9] Manual-required issues:\n${manualRequired.map(r => `  - ${r.check} on ${r.domain}: ${r.details}`).join('\n')}`);
+          }
+
+          return {
+            success: true,
+            output: outputSummary,
+            metadata: {
+              verificationResults: verificationResults,
+              autoFixableCount: autoFixable.length,
+              manualRequiredCount: manualRequired.length,
+              passCount: passing.length,
+            },
+          };
+        } catch (err) {
+          return {
+            success: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      },
+
+      async compensate(_context: ProvisioningContext): Promise<void> {
+        // Informational step — nothing to rollback
+      },
+    },
+
+    // ========================================
+    // Step 10: AUTO_FIX (~1-5 min)
+    // Reads VG1 results and attempts automated fixes for all
+    // auto_fixable issues. Skipped entirely if VG1 found zero
+    // auto_fixable issues.
+    // ========================================
+    {
+      name: 'Auto-Fix Issues',
+      type: 'auto_fix' as const,
+      estimatedDurationMs: 300_000,
+
+      async execute(context: ProvisioningContext): Promise<StepResult> {
+        context.log('[Step 10] Running Auto-Fix...');
+        const ctx = ctxMeta(context);
+        const server1IP = ctx.server1IP as string;
+        const server2IP = ctx.server2IP as string;
+        const s1Domains = (ctx.server1Domains as string[]) || [];
+        const s2Domains = (ctx.server2Domains as string[]) || [];
+
+        // Read VG1 results from context
+        const verificationResults = (ctx.verificationResults as import('./types').VerificationResult[]) || [];
+        const autoFixableCount = (ctx.autoFixableCount as number) || 0;
+
+        if (autoFixableCount === 0) {
+          context.log('[Step 10] No auto-fixable issues from VG1. Skipping.');
+          return {
+            success: true,
+            output: 'No auto-fixable issues — skipped.',
+            metadata: { fixedCount: 0, failedCount: 0 },
+          };
+        }
+
+        context.log(`[Step 10] ${autoFixableCount} auto-fixable issues to attempt...`);
+
+        try {
+          const { fixed, failed } = await runAutoFixes(
+            ssh1,
+            ssh2,
+            vpsProvider,
+            verificationResults,
+            {
+              nsDomain: context.nsDomain,
+              server1IP,
+              server2IP,
+              server1Domains: s1Domains,
+              server2Domains: s2Domains,
+              log: context.log,
             }
-          }
+          );
 
-          // PATCH 10c: Verify per-server A record IP assignment
-          // S1 domains should resolve to server1IP, S2 domains to server2IP
-          const ctx8 = ctxMeta(context);
-          const s1Domains = (ctx8.server1Domains as string[]) || [];
-          const s2Domains = (ctx8.server2Domains as string[]) || [];
-          context.log(`[Step 8] Verifying per-server A record assignment: S1=${s1Domains.length}, S2=${s2Domains.length}`);
+          const output = `Auto-Fix: ${fixed.length} fixed, ${failed.length} failed.${
+            failed.length > 0 ? `\nFailed: ${failed.join('; ')}` : ''
+          }`;
+          context.log(`[Step 10] ${output}`);
 
-          for (const domain of s1Domains) {
-            try {
-              const { stdout } = await ssh1.exec(
-                `dig @8.8.8.8 ${domain} A +short 2>/dev/null`,
-                { timeout: 10000 }
-              );
-              const ip = stdout.trim().split('\n')[0];
-              if (ip && ip !== server1IP) {
-                failures.push(`${domain}: @ A → ${ip} (expected S1 ${server1IP})`);
-              } else if (ip === server1IP) {
-                context.log(`[Step 8] OK: ${domain} @ A → ${server1IP} (S1)`);
-              }
-            } catch { /* already checked above */ }
-          }
-          for (const domain of s2Domains) {
-            try {
-              const { stdout } = await ssh1.exec(
-                `dig @8.8.8.8 ${domain} A +short 2>/dev/null`,
-                { timeout: 10000 }
-              );
-              const ip = stdout.trim().split('\n')[0];
-              if (ip && ip !== server2IP) {
-                failures.push(`${domain}: @ A → ${ip} (expected S2 ${server2IP})`);
-              } else if (ip === server2IP) {
-                context.log(`[Step 8] OK: ${domain} @ A → ${server2IP} (S2)`);
-              }
-            } catch { /* already checked above */ }
-          }
+          return {
+            success: true,
+            output,
+            metadata: {
+              fixedCount: fixed.length,
+              failedCount: failed.length,
+              fixedActions: fixed,
+              failedActions: failed,
+            },
+          };
+        } catch (err) {
+          return {
+            success: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      },
 
-          // Verify PTR ↔ A ↔ HELO alignment
-          for (const [ip, hostname] of [
-            [server1IP, `mail1.${context.nsDomain}`],
-            [server2IP, `mail2.${context.nsDomain}`],
-          ]) {
-            try {
-              const { stdout: ptrResult } = await ssh1.exec(
-                `dig -x ${ip} +short @8.8.8.8 2>/dev/null`,
-                { timeout: 10000 }
-              );
-              const ptr = ptrResult.trim().replace(/\.$/, '');
-              if (ptr !== hostname) {
-                failures.push(
-                  `PTR mismatch: ${ip} → ${ptr} (expected ${hostname})`
-                );
-              }
-            } catch {
-              failures.push(`PTR check failed for ${ip}`);
-            }
-          }
+      async compensate(_context: ProvisioningContext): Promise<void> {
+        // Auto-fix changes are DNS records — compensate would mean reverting
+        // to broken state, which is worse. No-op.
+      },
+    },
 
-          // Check SPF/DKIM/DMARC on sending domains
-          for (const domain of context.sendingDomains) {
-            try {
-              const { stdout: spf } = await ssh1.exec(
-                `dig @8.8.8.8 ${domain} TXT +short 2>/dev/null`,
-                { timeout: 10000 }
-              );
-              if (!spf.includes('v=spf1')) {
-                failures.push(`${domain}: missing SPF record`);
-              }
-            } catch {
-              failures.push(`${domain}: SPF check failed`);
-            }
+    // ========================================
+    // Step 11: VERIFICATION_GATE_2 (~2-5 min)
+    // Re-runs the same checks as VG1 to confirm fixes worked.
+    // Pass = done. Still failing = manualRequired: true.
+    // Max 2 passes total (VG1 + VG2), never loop.
+    // ========================================
+    {
+      name: 'Verification Gate 2',
+      type: 'verification_gate_2' as const,
+      estimatedDurationMs: 300_000,
 
-            try {
-              const { stdout: dmarc } = await ssh1.exec(
-                `dig @8.8.8.8 _dmarc.${domain} TXT +short 2>/dev/null`,
-                { timeout: 10000 }
-              );
-              if (!dmarc.includes('v=DMARC1')) {
-                failures.push(`${domain}: missing DMARC record`);
-              }
-            } catch {
-              failures.push(`${domain}: DMARC check failed`);
-            }
-          }
+      async execute(context: ProvisioningContext): Promise<StepResult> {
+        context.log('[Step 11] Running Verification Gate 2 (post-fix verification)...');
+        const ctx = ctxMeta(context);
+        const server1IP = ctx.server1IP as string;
+        const server2IP = ctx.server2IP as string;
+        const s1Domains = (ctx.server1Domains as string[]) || [];
+        const s2Domains = (ctx.server2Domains as string[]) || [];
 
-          // --- PATCH 10: Per-server SPF verification ---
-          // (ctx8, s1Domains, s2Domains already declared above in A-record check)
+        try {
+          const verificationResults = await runVerificationChecks(ssh1, ssh2, {
+            nsDomain: context.nsDomain,
+            sendingDomains: context.sendingDomains,
+            server1IP,
+            server2IP,
+            server1Domains: s1Domains,
+            server2Domains: s2Domains,
+            log: context.log,
+          });
 
-          // Verify SPF per-server: each sending domain's SPF should only authorize its assigned server IP
-          for (const domain of s1Domains) {
-            try {
-              const { stdout: spfRaw } = await ssh1.exec(
-                `dig @8.8.8.8 ${domain} TXT +short 2>/dev/null`,
-                { timeout: 10000 }
-              );
-              if (spfRaw.includes(server2IP) && !spfRaw.includes(server1IP)) {
-                failures.push(`${domain}: SPF contains wrong server IP (has S2 ${server2IP}, expected S1 ${server1IP})`);
-              }
-            } catch {
-              // SPF already checked above — skip
-            }
-          }
-          for (const domain of s2Domains) {
-            try {
-              const { stdout: spfRaw } = await ssh1.exec(
-                `dig @8.8.8.8 ${domain} TXT +short 2>/dev/null`,
-                { timeout: 10000 }
-              );
-              if (spfRaw.includes(server1IP) && !spfRaw.includes(server2IP)) {
-                failures.push(`${domain}: SPF contains wrong server IP (has S1 ${server1IP}, expected S2 ${server2IP})`);
-              }
-            } catch {
-              // SPF already checked above — skip
-            }
-          }
+          const passing = verificationResults.filter(r => r.status === 'pass');
+          const autoFixable = verificationResults.filter(r => r.status === 'auto_fixable');
+          const manualRequired = verificationResults.filter(r => r.status === 'manual_required');
 
-          // --- PATCH 10: SSL certificate verification ---
-          context.log('[Step 8] Checking SSL certificates...');
+          context.log(`[Step 11] VG2 results: ${passing.length} pass, ${autoFixable.length} auto-fixable, ${manualRequired.length} manual-required`);
 
-          // Check hostname SSL on both servers
-          for (const [ip, hostname, sshConn] of [
-            [server1IP, `mail1.${context.nsDomain}`, ssh1],
-            [server2IP, `mail2.${context.nsDomain}`, ssh2],
-          ] as [string, string, typeof ssh1][]) {
-            try {
-              const { stdout } = await sshConn.exec(
-                `echo | openssl s_client -connect ${ip}:443 -servername ${hostname} 2>/dev/null | openssl x509 -noout -subject`,
-                { timeout: 15000 }
-              );
-              const cnMatch = stdout.match(/CN\s*=\s*([^\s/,]+)/);
-              const cn = cnMatch ? cnMatch[1] : '';
-              if (cn !== hostname) {
-                failures.push(`SSL: ${hostname} on ${ip}:443 — CN=${cn || 'none'} (expected ${hostname})`);
-              } else {
-                context.log(`[Step 8] OK: SSL ${hostname} on ${ip}:443 — CN=${cn}`);
-              }
-            } catch {
-              failures.push(`SSL: ${hostname} on ${ip}:443 — check failed`);
-            }
-          }
+          const outputSummary = [
+            `VG2: ${verificationResults.length} checks total`,
+            `  ${passing.length} passed`,
+            `  ${autoFixable.length} still auto-fixable (could not be fixed)`,
+            `  ${manualRequired.length} manual-required`,
+          ].join('\n');
 
-          // Check sending domain SSL on assigned server only
-          for (const domain of s1Domains) {
-            try {
-              const { stdout } = await ssh1.exec(
-                `echo | openssl s_client -connect ${server1IP}:443 -servername ${domain} 2>/dev/null | openssl x509 -noout -subject`,
-                { timeout: 15000 }
-              );
-              const cnMatch = stdout.match(/CN\s*=\s*([^\s/,]+)/);
-              const cn = cnMatch ? cnMatch[1] : '';
-              if (cn !== domain) {
-                failures.push(`SSL: ${domain} on S1 ${server1IP}:443 — CN=${cn || 'none'} (expected ${domain})`);
-              } else {
-                context.log(`[Step 8] OK: SSL ${domain} on S1 — CN=${cn}`);
-              }
-            } catch {
-              failures.push(`SSL: ${domain} on S1 ${server1IP}:443 — check failed`);
-            }
-          }
-          for (const domain of s2Domains) {
-            try {
-              const { stdout } = await ssh2.exec(
-                `echo | openssl s_client -connect ${server2IP}:443 -servername ${domain} 2>/dev/null | openssl x509 -noout -subject`,
-                { timeout: 15000 }
-              );
-              const cnMatch = stdout.match(/CN\s*=\s*([^\s/,]+)/);
-              const cn = cnMatch ? cnMatch[1] : '';
-              if (cn !== domain) {
-                failures.push(`SSL: ${domain} on S2 ${server2IP}:443 — CN=${cn || 'none'} (expected ${domain})`);
-              } else {
-                context.log(`[Step 8] OK: SSL ${domain} on S2 — CN=${cn}`);
-              }
-            } catch {
-              failures.push(`SSL: ${domain} on S2 ${server2IP}:443 — check failed`);
-            }
-          }
-
-          // Check blacklists for both IPs
-          const blacklists = [
-            'zen.spamhaus.org',
-            'dnsbl.sorbs.net',
-            'b.barracudacentral.org',
-          ];
-
-          for (const ip of [server1IP, server2IP]) {
-            const reversedIP = ip.split('.').reverse().join('.');
-            for (const bl of blacklists) {
-              try {
-                const { stdout } = await ssh1.exec(
-                  `dig ${reversedIP}.${bl} A +short 2>/dev/null`,
-                  { timeout: 10000 }
-                );
-                if (stdout.trim() && stdout.includes('127.0.0')) {
-                  failures.push(`${ip}: listed on ${bl}`);
-                }
-              } catch {
-                // Query failure means not listed — that's good
-              }
-            }
-          }
-
-          const warningsText = warnings.length > 0
-            ? `\n\nWarnings (non-blocking):\n${warnings.map((w) => `  [${w.code}] ${w.message}${w.remediation ? `\n    Remediation: ${w.remediation}` : ''}`).join('\n')}`
-            : '';
-
-          if (failures.length === 0 && warnings.length === 0) {
+          // Determine final result
+          if (autoFixable.length === 0 && manualRequired.length === 0) {
+            // All checks pass — pair is fully operational
+            context.log('[Step 11] ALL checks passed. Pair is fully operational.');
             return {
               success: true,
-              output: `All verification checks passed. ${allDomains.length} domains, 2 IPs, SPF/DKIM/DMARC/PTR/blacklist/subnet all clean.`,
-              metadata: { verificationWarnings: [] },
+              output: `All ${verificationResults.length} verification checks passed. Pair is fully operational.`,
+              metadata: {
+                verificationResults,
+                finalStatus: 'clean',
+              },
             };
-          } else if (failures.length === 0 && warnings.length > 0) {
+          } else if (autoFixable.length > 0) {
+            // Auto-fixable issues remain after auto-fix — this shouldn't happen
+            // but if it does, flag as manual required
+            context.log(`[Step 11] WARNING: ${autoFixable.length} auto-fixable issues remain after auto-fix. Flagging as manual-required.`);
+            if (manualRequired.length > 0) {
+              context.log(`[Step 11] Manual-required issues:\n${manualRequired.map(r => `  - ${r.check} on ${r.domain}: ${r.details}`).join('\n')}`);
+            }
             return {
               success: true,
               manualRequired: true,
-              output: `Verification passed with ${warnings.length} warning(s):${warningsText}`,
-              metadata: { verificationWarnings: warnings },
+              output: `${outputSummary}\n\nManual intervention required for remaining issues.`,
+              metadata: {
+                verificationResults,
+                finalStatus: 'manual_required',
+              },
             };
           } else {
+            // Only manual-required issues remain — pair works but has items
+            // Dean needs to address manually
+            context.log(`[Step 11] ${manualRequired.length} manual-required issues remain.`);
+            context.log(`[Step 11] Manual issues:\n${manualRequired.map(r => `  - ${r.check} on ${r.domain}: ${r.details}`).join('\n')}`);
             return {
               success: true,
               manualRequired: true,
-              output: `Verification completed with ${failures.length} issues:\n${failures.join('\n')}${warningsText}`,
+              output: `${outputSummary}\n\nPair is operational but ${manualRequired.length} issue(s) require manual intervention.`,
               metadata: {
-                verificationFailures: failures,
-                verificationWarnings: warnings,
+                verificationResults,
+                finalStatus: 'manual_required',
               },
             };
           }

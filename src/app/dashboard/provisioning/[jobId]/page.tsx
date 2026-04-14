@@ -43,8 +43,11 @@ const STEP_NAMES: Record<StepType, string> = {
   setup_dns_zones: "Setup DNS Zones",
   set_ptr: "Set PTR Records",
   setup_mail_domains: "Setup Mail Domains",
+  await_s2_dns: "Await S2 DNS Propagation",
   security_hardening: "Security Hardening",
-  verification_gate: "Verification Gate",
+  verification_gate: "Verification Gate 1",
+  auto_fix: "Auto-Fix Issues",
+  verification_gate_2: "Verification Gate 2",
 };
 
 function estimateTimeRemaining(progressPct: number, startedAt: string | null): string {

@@ -58,8 +58,11 @@ const WORKER_STEP_TYPES: StepType[] = [
   'setup_dns_zones',
   'set_ptr',
   'setup_mail_domains',
+  'await_s2_dns',
   'security_hardening',
   'verification_gate',
+  'auto_fix',
+  'verification_gate_2',
 ];
 
 // Wizard size label → provider plan ID. Mirrors the same table that
@@ -712,7 +715,11 @@ export async function handleProvisionStep(
   const sshRequiredSteps: StepType[] = [
     'setup_dns_zones',
     'setup_mail_domains',
+    'await_s2_dns',
     'security_hardening',
+    'verification_gate',
+    'auto_fix',
+    'verification_gate_2',
   ];
   if (sshRequiredSteps.includes(stepType)) {
     const ctxRec = context as unknown as Record<string, unknown>;

@@ -196,9 +196,12 @@ export async function POST(req: Request) {
       "await_dns_propagation",  // 4: Wait for NS to propagate (worker only)
       "setup_dns_zones",        // 5: A records on BIND
       "set_ptr",                // 6: Requires forward A to resolve
-      "setup_mail_domains",     // 7: DKIM/SPF/DMARC/accounts
-      "security_hardening",     // 8: Kill services + SSL certs
-      "verification_gate",      // 9: PTR↔A↔HELO + port 25 + SSL CN + blacklists
+      "setup_mail_domains",     // 7: DKIM/SPF/DMARC/accounts + mail/webmail A fix
+      "await_s2_dns",           // 8: Poll resolvers for S2 domain A records
+      "security_hardening",     // 9: Kill services + SSL certs
+      "verification_gate",      // 10: VG1 — categorized checks
+      "auto_fix",               // 11: Auto-fix all auto_fixable issues
+      "verification_gate_2",    // 12: VG2 — re-run checks, pass = done
     ] as const;
 
     for (let i = 0; i < stepTypes.length; i++) {
