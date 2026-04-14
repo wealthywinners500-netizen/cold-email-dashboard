@@ -366,8 +366,8 @@ export default function JobDetailPage() {
           continue;
         }
 
-        // Handle awaiting worker completion
-        if (data.status === "awaiting_worker" && data.step) {
+        // Handle awaiting worker completion OR step still executing
+        if ((data.status === "awaiting_worker" || data.status === "in_progress") && data.step) {
           setSteps((prev) =>
             prev.map((s) =>
               s.step_type === data.step
@@ -378,7 +378,7 @@ export default function JobDetailPage() {
           setJob((prev) =>
             prev ? { ...prev, status: "in_progress", current_step: data.step } : prev
           );
-          // Poll at 5s intervals while worker runs
+          // Poll at 5s intervals while step runs
           await new Promise((r) => setTimeout(r, 5_000));
           continue;
         }

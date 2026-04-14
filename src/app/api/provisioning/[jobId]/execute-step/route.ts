@@ -489,27 +489,33 @@ export async function POST(
       return NextResponse.json({ error: "Failed to load steps" }, { status: 500 });
     }
 
+    // CRITICAL: Steps execute SEQUENTIALLY. If any step is currently
+    // in_progress, the client must wait — never advance to the next pending
+    // step. Without this guard the loop races ahead: dispatches create_vps →
+    // dispatches install_hestiacp → tries configure_registrar inline →
+    // crashes "Server IPs not available — create_vps step must complete first".
+    const inProgressStep = steps.find(
+      (s: Record<string, unknown>) => s.status === "in_progress"
+    );
+
+    if (inProgressStep) {
+      const meta = inProgressStep.metadata as Record<string, unknown> | null;
+      const isWorkerStep = meta?.dispatched_to_worker === true;
+      return NextResponse.json({
+        jobId,
+        step: inProgressStep.step_type,
+        status: isWorkerStep ? "awaiting_worker" : "in_progress",
+        progress_pct: job.progress_pct,
+        allComplete: false,
+        output: isWorkerStep
+          ? `Step ${inProgressStep.step_type} is running on the worker VPS...`
+          : `Step ${inProgressStep.step_type} is currently executing...`,
+      });
+    }
+
     // Find first pending step
     const pendingStep = steps.find((s: Record<string, unknown>) => s.status === "pending");
     if (!pendingStep) {
-      // Check if any steps are still dispatched to worker (in_progress with dispatched_to_worker)
-      const workerStep = steps.find((s: Record<string, unknown>) => {
-        const meta = s.metadata as Record<string, unknown> | null;
-        return s.status === "in_progress" && meta?.dispatched_to_worker === true;
-      });
-
-      if (workerStep) {
-        // Worker is still processing — tell client to wait
-        return NextResponse.json({
-          jobId,
-          step: workerStep.step_type,
-          status: "awaiting_worker",
-          progress_pct: job.progress_pct,
-          allComplete: false,
-          output: `Step ${workerStep.step_type} is running on the worker VPS...`,
-        });
-      }
-
       // All steps done
       return NextResponse.json({
         jobId,
