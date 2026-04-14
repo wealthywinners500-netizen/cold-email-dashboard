@@ -25,8 +25,11 @@ const WORKER_STEPS: StepType[] = [
   "setup_dns_zones",
   "set_ptr",
   "setup_mail_domains",
+  "await_s2_dns",
   "security_hardening",
   "verification_gate",
+  "auto_fix",
+  "verification_gate_2",
 ];
 
 // ============================================
