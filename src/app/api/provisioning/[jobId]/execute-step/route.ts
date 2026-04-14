@@ -10,23 +10,23 @@ export const dynamic = "force-dynamic";
 // Vercel Hobby plan limits serverless functions to 60s; create_vps took 82s in Test #21.
 export const maxDuration = 60;
 
-// Steps that can run in serverless (API calls only, no SSH)
-// Order: configure_registrar(3), set_ptr(5), verification_gate(8)
-const SERVERLESS_STEPS: StepType[] = [
-  "configure_registrar",
-  "set_ptr",
-  "verification_gate",
-];
+// ALL steps now dispatch to the worker VPS (static IP 200.234.226.226).
+// Vercel serverless IPs are dynamic and break providers that require
+// IP whitelisting (Namecheap API rejects unknown IPs — Hard Lesson #86).
+// The worker already handles every step via SERVERLESS_STEP_RUNNERS +
+// saga engine, so there's no code to add on the worker side.
+const SERVERLESS_STEPS: StepType[] = [];
 
-// Steps that require SSH or long-running polls — dispatch to worker VPS
-// Order: create_vps(1), install_hestiacp(2), await_dns_propagation(4), setup_dns_zones(5), setup_mail_domains(7), security_hardening(8)
 const WORKER_STEPS: StepType[] = [
   "create_vps",
   "install_hestiacp",
+  "configure_registrar",
   "await_dns_propagation",
   "setup_dns_zones",
+  "set_ptr",
   "setup_mail_domains",
   "security_hardening",
+  "verification_gate",
 ];
 
 // ============================================
