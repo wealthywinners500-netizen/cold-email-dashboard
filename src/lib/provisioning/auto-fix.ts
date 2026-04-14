@@ -531,7 +531,9 @@ async function addTLSRPT(
   domain: string,
   params: { log: (msg: string) => void }
 ): Promise<void> {
-  const tlsrptValue = '"v=TLSRPTv1; rua=mailto:dean.hofer@thestealthmail.com"';
+  // Hard Lesson #95: No external rua — thestealthmail.com lacks authorization records
+  // TLS-RPT is optional and VG check is skipped, but keep the value clean just in case
+  const tlsrptValue = '"v=TLSRPTv1;"';
   const addCmd = `v-add-dns-record admin ${domain} _smtp._tls TXT ${tlsrptValue}`;
 
   for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
