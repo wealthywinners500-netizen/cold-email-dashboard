@@ -28,7 +28,7 @@ export interface CSVGeneratorParams {
  *   From email, From name, SMTP host, SMTP port, Password, IMAP host, IMAP port
  *
  * SMTP/IMAP host is mail1.nsDomain or mail2.nsDomain
- * SMTP port: 465 (SSL)
+ * SMTP port: 587 (STARTTLS — industry standard per RFC 6409)
  * IMAP port: 993 (SSL)
  */
 export function generateSnovioCSV(params: CSVGeneratorParams): string {
@@ -53,7 +53,7 @@ export function generateSnovioCSV(params: CSVGeneratorParams): string {
       account.email,
       displayName,
       mailHost,
-      '465',
+      '587',
       account.password,
       mailHost,
       '993',
@@ -97,7 +97,7 @@ export function generateCSVFromJobData(params: {
       account.email,
       displayName,
       mailHost,
-      '465',
+      '587',
       defaultPassword,
       mailHost,
       '993',
