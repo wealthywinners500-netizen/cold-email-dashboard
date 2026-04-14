@@ -192,12 +192,55 @@ async function checkViaDQS(domain: string): Promise<BlacklistResult | null> {
 // Tier 2: Direct DNSBL queries (SURBL, URIBL)
 // These zones accept domain lookups (not reversed-IP) and work from cloud IPs.
 // No authentication key needed.
+//
+// Hard Lesson #91 (2026-04-14): URIBL blocks cloud/VPS IPs and returns
+// 127.0.0.1 for EVERY query — including the test address. This causes
+// 100% false positive "listed" results. Must run access test BEFORE
+// trusting URIBL results. Test: query `2.0.0.127.multi.uribl.com` —
+// if it resolves to anything, our IP is blocked and all URIBL results
+// are garbage. Same pattern applies to `black.uribl.com`.
 // ============================================
 
 const DIRECT_DOMAIN_DNSBLS = [
   { zone: 'multi.surbl.org', name: 'SURBL' },
   { zone: 'black.uribl.com', name: 'URIBL' },
 ] as const;
+
+// Cache URIBL access test result per process lifetime — no need to recheck
+// every call since our IP doesn't change while the worker is running.
+let _uriblAccessChecked = false;
+let _uriblAccessBlocked = false;
+
+/**
+ * Test whether URIBL is blocking queries from our IP.
+ * The test address `2.0.0.127.multi.uribl.com` should return NXDOMAIN
+ * if queries are allowed. Any A-record response means we're blocked.
+ * Same logic for `black.uribl.com`.
+ */
+async function isUriblBlocked(): Promise<boolean> {
+  if (_uriblAccessChecked) return _uriblAccessBlocked;
+
+  try {
+    // Test both zones we query
+    const testAddresses = await resolveOrNxdomain('2.0.0.127.multi.uribl.com');
+    if (testAddresses.length > 0) {
+      console.warn(
+        `[domain-blacklist] URIBL access test returned ${testAddresses.join(', ')} — ` +
+        `our IP is BLOCKED. All URIBL results will be skipped to avoid false positives.`
+      );
+      _uriblAccessBlocked = true;
+    } else {
+      _uriblAccessBlocked = false;
+    }
+  } catch {
+    // DNS error on the test query — assume blocked to be safe
+    console.warn('[domain-blacklist] URIBL access test failed — assuming blocked');
+    _uriblAccessBlocked = true;
+  }
+
+  _uriblAccessChecked = true;
+  return _uriblAccessBlocked;
+}
 
 async function checkDirectDomainDNSBLs(
   domain: string
@@ -206,7 +249,16 @@ async function checkDirectDomainDNSBLs(
   const lists: string[] = [];
   const raw: Record<string, string[]> = {};
 
+  // Check if URIBL is blocking our IP before querying
+  const uriblBlocked = await isUriblBlocked();
+
   for (const { zone, name } of DIRECT_DOMAIN_DNSBLS) {
+    // Hard Lesson #91: Skip URIBL entirely if our IP is blocked
+    if (name === 'URIBL' && uriblBlocked) {
+      raw[zone] = [];
+      continue;
+    }
+
     const host = `${cleaned}.${zone}`;
     try {
       const addresses = await resolveOrNxdomain(host);

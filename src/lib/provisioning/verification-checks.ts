@@ -1725,7 +1725,31 @@ export async function runVerificationChecks(
   }
 
   // Check 32: Domain blacklist check
+  // Hard Lesson #91: URIBL blocks cloud/VPS IPs and returns 127.0.0.1 for
+  // EVERY query — causing 100% false positives. Run access test first:
+  // query test address `2.0.0.127.multi.uribl.com` via dig — if it resolves
+  // to anything, our IP is blocked and all URIBL results must be skipped.
   log('[VG] Running check 32: Domain blacklist check');
+
+  // URIBL access test — run once before domain loop
+  let uriblBlocked = false;
+  try {
+    const uriblTest = await ssh1.exec(
+      `dig 2.0.0.127.multi.uribl.com A +short @${primaryResolver} 2>/dev/null`,
+      { timeout: 10000 }
+    );
+    const testResult = uriblTest.stdout.trim();
+    if (testResult.length > 0) {
+      uriblBlocked = true;
+      log(`[VG] URIBL access test returned "${testResult}" — IP is BLOCKED. Skipping URIBL to avoid false positives (Hard Lesson #91).`);
+    } else {
+      log('[VG] URIBL access test: queries allowed');
+    }
+  } catch {
+    uriblBlocked = true;
+    log('[VG] URIBL access test failed — assuming blocked, skipping URIBL');
+  }
+
   const domainBlacklists = [
     { name: 'dbl.spamhaus.org', key: 'spamhaus_dbl' },
     { name: 'multi.surbl.org', key: 'surbl' },
@@ -1736,6 +1760,18 @@ export async function runVerificationChecks(
     const server = getServerForDomain(domain);
 
     for (const bl of domainBlacklists) {
+      // Hard Lesson #91: Skip URIBL if our IP is blocked
+      if (bl.key === 'uribl' && uriblBlocked) {
+        results.push({
+          check: 'domain_blacklist',
+          domain,
+          server,
+          status: 'pass',
+          details: `${domain} — URIBL skipped (IP blocked, false positive prevention)`,
+        });
+        continue;
+      }
+
       try {
         const result = await ssh1.exec(
           `dig ${domain}.${bl.name} A +short @${primaryResolver} 2>/dev/null`,
