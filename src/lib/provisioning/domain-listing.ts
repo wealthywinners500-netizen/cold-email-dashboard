@@ -174,9 +174,12 @@ export async function filterUsedDomains(
     const hardBlocked =
       d.blacklistStatus === "listed" &&
       (d.blacklists || []).some((list) => HARD_BLOCK_LISTS.has(list));
+    // Recalculate availability from raw fields — don't trust the cached
+    // isAvailable which may have been set by older filtering logic.
+    const baseAvailable = d.status !== "expired";
     return {
       ...d,
-      isAvailable: d.isAvailable && !inUse && !hardBlocked,
+      isAvailable: baseAvailable && !inUse && !hardBlocked,
       ...(inUse ? { inUse: true } : {}),
     };
   });
