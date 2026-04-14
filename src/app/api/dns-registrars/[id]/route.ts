@@ -165,6 +165,28 @@ export async function POST(
       });
     }
 
+    // Namecheap requires IP whitelisting — test can't run from Vercel's dynamic IPs.
+    // Validate credentials are present and return success. Real API calls happen on the worker VPS.
+    if (registrar.registrar_type === "namecheap") {
+      const config = (registrar.config as Record<string, unknown>) || {};
+      if (!apiSecret) {
+        return NextResponse.json({
+          ok: false,
+          message: "API Username is required for Namecheap.",
+        });
+      }
+      if (!config.clientIp) {
+        return NextResponse.json({
+          ok: false,
+          message: "Whitelisted Client IP is required for Namecheap.",
+        });
+      }
+      return NextResponse.json({
+        ok: true,
+        message: `Credentials saved. API calls run from worker VPS (${config.clientIp}).`,
+      });
+    }
+
     try {
       const { getDNSRegistrar } = await import(
         "@/lib/provisioning/provider-registry"
