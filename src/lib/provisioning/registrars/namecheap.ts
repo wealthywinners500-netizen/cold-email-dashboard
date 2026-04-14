@@ -17,6 +17,14 @@ export class NamecheapRegistrar extends BaseDNSRegistrar {
   private readonly requestsPerMinute = 20;
   private lastRequestTime = 0;
 
+  /**
+   * Stash for pending nameservers — same pattern as Ionos (Hard Lesson #88).
+   * Namecheap requires glue records (domains.ns.create) to exist BEFORE
+   * domains.dns.setCustom can reference them. setNameservers() stashes the
+   * NS names, and setGlueRecords() creates glue first, THEN sets nameservers.
+   */
+  private pendingNameservers = new Map<string, string[]>();
+
   protected getAuthHeaders(): Record<string, string> {
     // Namecheap uses query params for auth, not headers
     return {};
@@ -309,10 +317,33 @@ export class NamecheapRegistrar extends BaseDNSRegistrar {
   }
 
   /**
-   * Set custom nameservers for a domain.
-   * Calls domains.dns.setCustom with NameServers param.
+   * Stash nameservers for later application by setGlueRecords().
+   *
+   * Namecheap requires subordinate host records (glue) to exist BEFORE
+   * domains.dns.setCustom can reference them as nameservers. This mirrors
+   * the Ionos stashing pattern (Hard Lesson #88).
+   *
+   * Call flow: setNameservers() stashes → setGlueRecords() creates glue
+   * via domains.ns.create, THEN applies the stashed NS via domains.dns.setCustom.
+   *
+   * @deprecated Use this only for the ns_domain (where glue records are required).
+   *            For delegating sending domains (which don't need glue), use
+   *            updateNameserversOnly() instead.
    */
   async setNameservers(domain: string, nameservers: string[]): Promise<void> {
+    this.log(
+      `Stashing nameservers for ${domain}: ${nameservers.join(", ")} (will apply after glue records)`
+    );
+    this.pendingNameservers.set(domain, nameservers);
+  }
+
+  /**
+   * Update nameservers only (no glue records needed).
+   * Used for sending domains which point to ns1/ns2 of the ns_domain —
+   * those subordinate hosts already exist, so setCustom succeeds immediately.
+   * This does NOT stash; it makes the API call directly.
+   */
+  async updateNameserversOnly(domain: string, nameservers: string[]): Promise<void> {
     const { sld, tld } = this.parseDomain(domain);
 
     this.log(`Setting nameservers for ${domain}: ${nameservers.join(", ")}`);
@@ -327,21 +358,19 @@ export class NamecheapRegistrar extends BaseDNSRegistrar {
     params["Nameservers"] = nameservers.join(",");
 
     await this.rawRequest("domains.dns.setCustom", params);
-    this.log(`Nameservers set successfully`);
+    this.log(`Nameservers set successfully for ${domain}`);
   }
 
   /**
-   * Update nameservers only (no glue records).
-   * For Namecheap, this delegates to setNameservers since it already
-   * makes a direct API call (no stashing pattern like IONOS).
-   */
-  async updateNameserversOnly(domain: string, nameservers: string[]): Promise<void> {
-    return this.setNameservers(domain, nameservers);
-  }
-
-  /**
-   * Create glue records (NS records with associated IPs).
-   * Calls domains.ns.create for each glue record.
+   * Create glue records AND then set nameservers (Hard Lesson #88).
+   *
+   * Namecheap flow (two-phase, order matters):
+   *   1. domains.ns.create for each subordinate host (ns1.X, ns2.X + IPs)
+   *   2. domains.dns.setCustom with the stashed nameservers
+   *
+   * This is the reverse of the calling order in serverless-steps.ts
+   * (which calls setNameservers → setGlueRecords), but the stashing
+   * pattern ensures Namecheap's API sees glue records before NS assignment.
    */
   async setGlueRecords(
     domain: string,
@@ -349,20 +378,64 @@ export class NamecheapRegistrar extends BaseDNSRegistrar {
   ): Promise<void> {
     const { sld, tld } = this.parseDomain(domain);
 
-    this.log(`Setting ${records.length} glue records for ${domain}`);
+    // Phase 1: Create subordinate host records (glue) at the registrar
+    this.log(`Creating ${records.length} glue records for ${domain}`);
 
     for (const record of records) {
       this.log(`Creating glue record: ${record.hostname} -> ${record.ip}`);
 
-      await this.rawRequest("domains.ns.create", {
-        SLD: sld,
-        TLD: tld,
-        Nameserver: record.hostname,
-        IP: record.ip,
-      });
+      try {
+        await this.rawRequest("domains.ns.create", {
+          SLD: sld,
+          TLD: tld,
+          Nameserver: record.hostname,
+          IP: record.ip,
+        });
+      } catch (err) {
+        // If glue record already exists, update it instead
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("already exists") || msg.includes("duplicate")) {
+          this.log(`Glue record ${record.hostname} already exists, updating IP`);
+          await this.rawRequest("domains.ns.update", {
+            SLD: sld,
+            TLD: tld,
+            Nameserver: record.hostname,
+            OldIP: "", // Namecheap may require old IP — try without first
+            IP: record.ip,
+          });
+        } else {
+          throw err;
+        }
+      }
     }
 
     this.log(`All glue records created successfully`);
+
+    // Phase 2: Now set nameservers using the stashed values
+    const stashedNS = this.pendingNameservers.get(domain);
+    if (stashedNS && stashedNS.length > 0) {
+      this.log(
+        `Applying stashed nameservers for ${domain}: ${stashedNS.join(", ")}`
+      );
+
+      const params: Record<string, string> = {
+        SLD: sld,
+        TLD: tld,
+      };
+
+      // Hard Lesson #87: comma-separated, not indexed
+      params["Nameservers"] = stashedNS.join(",");
+
+      await this.rawRequest("domains.dns.setCustom", params);
+      this.log(`Nameservers set successfully for ${domain}`);
+
+      // Clear stash
+      this.pendingNameservers.delete(domain);
+    } else {
+      this.log(
+        `No stashed nameservers for ${domain} — glue records created without NS update`
+      );
+    }
   }
 
   /**
