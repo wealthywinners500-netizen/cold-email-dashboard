@@ -451,7 +451,7 @@ async function syncEmailAccountsFromCSVs(
           smtp_port: 587,
           smtp_user: row["Username"]?.trim() || email,
           smtp_pass: row["SMTP Password*"]?.trim() || "",
-          smtp_secure: true,
+          smtp_secure: false,  // Port 587 = STARTTLS = secure:false (Hard Lesson)
           imap_host: row["IMAP Host*"]?.trim() || row["SMTP Host*"]?.trim() || "",
           imap_port: 993,
           imap_secure: true,

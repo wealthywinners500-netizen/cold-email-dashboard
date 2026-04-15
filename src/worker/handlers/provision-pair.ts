@@ -255,6 +255,7 @@ export async function handleProvisionPair(
                   server_pair_id: serverPair.id,
                   smtp_host: server1IP,
                   smtp_port: 587,
+                  smtp_secure: false,  // Port 587 = STARTTLS = secure:false (Hard Lesson)
                   imap_host: server1IP,
                   imap_port: 993,
                   status: 'active',
