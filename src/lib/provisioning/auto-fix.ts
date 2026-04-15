@@ -466,39 +466,42 @@ async function reissueSSL(
   // For S2 domains where the initial LE cert fails on S1, replicateSSLCertToSecondary
   // (which adds the web domain to S2) is never reached. Without the web domain,
   // nginx has no vhost and serves the default hostname cert on port 443.
-  const webDomainResult = await targetSSH.exec(
-    `${HESTIA_PATH_PREFIX}v-add-web-domain admin ${domain}`,
-    { timeout: 60000 }
-  );
-  // Exit code 4 = domain already exists, that's fine
-  if (webDomainResult.code !== 0 && webDomainResult.code !== 4) {
-    throw new Error(`${serverName} Failed to add web domain ${domain}: ${webDomainResult.stderr || webDomainResult.stdout}`);
+  // NOTE: SSHManager.exec() throws SSHCommandError for ANY non-zero exit code,
+  // so we must use try/catch and check err.code, not check a return value.
+  try {
+    await targetSSH.exec(
+      `${HESTIA_PATH_PREFIX}v-add-web-domain admin ${domain}`,
+      { timeout: 60000 }
+    );
+  } catch (err: unknown) {
+    const exitCode = (err as { code?: number })?.code;
+    if (exitCode !== 4) {
+      // Exit code 4 = domain already exists, that's fine. Anything else is a real error.
+      throw new Error(`${serverName} Failed to add web domain ${domain}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   // Step 2: Issue the LE certificate
   const cmd = `${HESTIA_PATH_PREFIX}v-add-letsencrypt-domain admin ${domain} '' yes`;
-  const result = await targetSSH.exec(cmd, { timeout: 120000 });
-
-  if (result.code !== 0) {
-    throw new Error(`${serverName} Failed to reissue SSL for ${domain}: ${result.stderr || result.stdout}`);
-  }
+  await targetSSH.exec(cmd, { timeout: 120000 });
 
   // Step 3: Rebuild web domain so nginx loads the new cert for this vhost.
   // Without this, port 443 continues serving the hostname cert for SNI requests.
-  const rebuildWebResult = await targetSSH.exec(
+  await targetSSH.exec(
     `${HESTIA_PATH_PREFIX}v-rebuild-web-domain admin ${domain}`,
     { timeout: 60000 }
   );
-  if (rebuildWebResult.code !== 0) {
-    throw new Error(`${serverName} Failed to rebuild web domain ${domain} after SSL reissue: ${rebuildWebResult.stderr || rebuildWebResult.stdout}`);
-  }
 
   // Step 4: Rebuild mail domain if it exists, so Exim reloads TLS config.
   // Non-fatal if domain has no mail domain (e.g. NS-only domain).
-  await targetSSH.exec(
-    `${HESTIA_PATH_PREFIX}v-rebuild-mail-domain admin ${domain}`,
-    { timeout: 60000 }
-  ).catch(() => { /* mail domain may not exist — not an error */ });
+  try {
+    await targetSSH.exec(
+      `${HESTIA_PATH_PREFIX}v-rebuild-mail-domain admin ${domain}`,
+      { timeout: 60000 }
+    );
+  } catch {
+    // mail domain may not exist — not an error
+  }
 
   params.log(`[Auto-Fix] reissue_ssl/${serverName}: Reissued SSL certificate for ${domain}`);
 }
