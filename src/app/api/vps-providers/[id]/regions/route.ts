@@ -93,6 +93,7 @@ function getStaticRegions(providerType: string) {
       ];
     case "linode":
       return [
+        { id: "us-southeast", name: "Atlanta, GA, USA", slug: "us-southeast", available: true },
         { id: "us-east", name: "Newark, NJ, USA", slug: "us-east", available: true },
         { id: "us-central", name: "Dallas, TX, USA", slug: "us-central", available: true },
         { id: "us-west", name: "Fremont, CA, USA", slug: "us-west", available: true },
