@@ -470,9 +470,10 @@ async function reissueSSL(
   ssh1: SSHManager,
   ssh2: SSHManager,
   domain: string,
-  params: { server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
+  params: { server1Domains: string[]; server2Domains: string[]; server1IP: string; server2IP: string; log: (msg: string) => void }
 ): Promise<void> {
   const isS2 = params.server2Domains.includes(domain);
+  const targetIP = isS2 ? params.server2IP : params.server1IP;
 
   if (!isS2) {
     // ---- S1 domain: straightforward LE issuance on S1 ----
@@ -509,13 +510,37 @@ async function reissueSSL(
 
   // Step 2: Issue LE cert on S1 WITHOUT the mail flag.
   // S2 sending domains have no mail domain on S1, so '' 'yes' would fail exit 3.
-  // LE validation works on S1 because the dual A records include S1's IP.
-  await ssh1.exec(
-    `${HESTIA_PATH_PREFIX}v-add-letsencrypt-domain admin ${domain}`,
-    { timeout: 120000 }
-  );
+  // Dual A records (S1+S2) mean ACME validation is non-deterministic — the ACME
+  // server randomly picks S1 or S2, and only succeeds when it picks S1 (where the
+  // challenge file lives). Retry up to 3 times (87.5% cumulative success).
+  const LE_MAX_RETRIES = 3;
+  let leSuccess = false;
+  for (let attempt = 1; attempt <= LE_MAX_RETRIES; attempt++) {
+    try {
+      await ssh1.exec(
+        `${HESTIA_PATH_PREFIX}v-add-letsencrypt-domain admin ${domain}`,
+        { timeout: 120000 }
+      );
+      leSuccess = true;
+      break;
+    } catch (err: unknown) {
+      const exitCode = (err as { code?: number })?.code;
+      if (exitCode === 15 && attempt < LE_MAX_RETRIES) {
+        // Exit 15 = LE validation failed (ACME server likely hit S2 due to dual A records)
+        params.log(`[Auto-Fix] reissue_ssl/S2: LE attempt ${attempt}/${LE_MAX_RETRIES} failed for ${domain} (ACME validation), retrying...`);
+        // Brief delay before retry to let DNS round-robin rotate
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        continue;
+      }
+      throw err; // Non-retryable error or max retries exceeded
+    }
+  }
 
-  // Verify the cert was actually created on S1
+  if (!leSuccess) {
+    throw new Error(`reissue_ssl/S2: LE cert issuance failed after ${LE_MAX_RETRIES} attempts for ${domain}`);
+  }
+
+  // Verify the cert was actually created on S1 (LE can exit 0 without creating files)
   const certDir = `/home/admin/conf/web/${domain}/ssl`;
   try {
     await ssh1.exec(
@@ -593,9 +618,11 @@ async function reissueSSL(
     // mail domain may not exist on S2 in some configurations
   }
 
-  // Step 7: Verify the cert is actually served via port 443
+  // Step 7: Verify the cert is actually served via port 443 on the real IP.
+  // Use the actual server IP (not 127.0.0.1) because nginx may bind only to the
+  // external interface, and SNI routing requires hitting the correct vhost.
   const { stdout: certSubject } = await ssh2.exec(
-    `echo | openssl s_client -connect 127.0.0.1:443 -servername ${domain} 2>/dev/null | openssl x509 -noout -subject 2>/dev/null || echo "CN=UNVERIFIED"`,
+    `echo | openssl s_client -connect ${targetIP}:443 -servername ${domain} 2>/dev/null | openssl x509 -noout -subject 2>/dev/null || echo "CN=UNVERIFIED"`,
     { timeout: 15000 }
   );
   if (!certSubject || !certSubject.includes(domain)) {
