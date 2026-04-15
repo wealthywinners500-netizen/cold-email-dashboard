@@ -93,10 +93,17 @@ function getStaticRegions(providerType: string) {
       ];
     case "linode":
       return [
+        // US regions (9 total — port 25 is account-wide, not per-region)
         { id: "us-southeast", name: "Atlanta, GA, USA", slug: "us-southeast", available: true },
-        { id: "us-east", name: "Newark, NJ, USA", slug: "us-east", available: true },
+        { id: "us-ord", name: "Chicago, IL, USA", slug: "us-ord", available: true },
         { id: "us-central", name: "Dallas, TX, USA", slug: "us-central", available: true },
         { id: "us-west", name: "Fremont, CA, USA", slug: "us-west", available: true },
+        { id: "us-lax", name: "Los Angeles, CA, USA", slug: "us-lax", available: true },
+        { id: "us-mia", name: "Miami, FL, USA", slug: "us-mia", available: true },
+        { id: "us-east", name: "Newark, NJ, USA", slug: "us-east", available: true },
+        { id: "us-sea", name: "Seattle, WA, USA", slug: "us-sea", available: true },
+        { id: "us-iad", name: "Washington, DC, USA", slug: "us-iad", available: true },
+        // EU regions
         { id: "eu-west", name: "London, UK", slug: "eu-west", available: true },
         { id: "eu-central", name: "Frankfurt, Germany", slug: "eu-central", available: true },
       ];
