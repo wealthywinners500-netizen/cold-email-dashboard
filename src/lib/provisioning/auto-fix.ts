@@ -1,6 +1,6 @@
 import type { SSHManager } from './ssh-manager';
 import type { VerificationResult, VPSProvider } from './types';
-import { HESTIA_PATH_PREFIX } from './hestia-scripts';
+import { HESTIA_PATH_PREFIX, HESTIA_FULL_PATH } from './hestia-scripts';
 
 /**
  * Auto-fix module for cold email server provisioning.
@@ -449,7 +449,22 @@ async function fixPTR(
 }
 
 /**
- * Reissue SSL certificate
+ * Reissue SSL certificate.
+ *
+ * S1 domains: Issue LE cert directly on S1 (A record points to S1, ACME validates there).
+ * S2 domains: Issue LE cert on S1 (web domain exists there from security_hardening),
+ *   then replicate to S2 — because S2 sending domains have dual A records (S1+S2),
+ *   making direct ACME validation on either server non-deterministic.
+ *   The replication flow matches replicateSSLCertToSecondary in hestia-scripts.ts.
+ *
+ * Key HestiaCP behaviors discovered during testing:
+ * - v-add-web-domain returns exit 4 ("folder should not exist") when an orphan
+ *   .well-known folder remains from a prior LE attempt, even though no web domain
+ *   config exists. Fix: detect via v-list-web-domain, remove folder, retry.
+ * - v-add-letsencrypt-domain with '' 'yes' (mail flag) fails exit 3 on S1 for S2
+ *   domains because S2 sending domains have no mail domain on S1. Omit mail flag.
+ * - Copying cert files to disk is not enough — must call v-add-web-domain-ssl to
+ *   register SSL with HestiaCP, then v-rebuild-web-domain for nginx to load it.
  */
 async function reissueSSL(
   ssh1: SSHManager,
@@ -457,53 +472,191 @@ async function reissueSSL(
   domain: string,
   params: { server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
 ): Promise<void> {
-  // Determine which server to use
-  const targetSSH = params.server2Domains.includes(domain) ? ssh2 : ssh1;
-  const serverName = params.server2Domains.includes(domain) ? 'S2' : 'S1';
+  const isS2 = params.server2Domains.includes(domain);
 
-  // Step 1: Ensure the web domain exists on the target server.
-  // During security_hardening, v-add-web-domain is only run on S1 for all domains.
-  // For S2 domains where the initial LE cert fails on S1, replicateSSLCertToSecondary
-  // (which adds the web domain to S2) is never reached. Without the web domain,
-  // nginx has no vhost and serves the default hostname cert on port 443.
-  // NOTE: SSHManager.exec() throws SSHCommandError for ANY non-zero exit code,
-  // so we must use try/catch and check err.code, not check a return value.
+  if (!isS2) {
+    // ---- S1 domain: straightforward LE issuance on S1 ----
+    await ensureWebDomain(ssh1, domain, 'S1', params.log);
+
+    await ssh1.exec(
+      `${HESTIA_PATH_PREFIX}v-add-letsencrypt-domain admin ${domain} '' yes`,
+      { timeout: 120000 }
+    );
+
+    await ssh1.exec(
+      `${HESTIA_PATH_PREFIX}v-rebuild-web-domain admin ${domain}`,
+      { timeout: 60000 }
+    );
+
+    try {
+      await ssh1.exec(
+        `${HESTIA_PATH_PREFIX}v-rebuild-mail-domain admin ${domain}`,
+        { timeout: 60000 }
+      );
+    } catch {
+      // mail domain may not exist
+    }
+
+    params.log(`[Auto-Fix] reissue_ssl/S1: Reissued SSL certificate for ${domain}`);
+    return;
+  }
+
+  // ---- S2 domain: issue on S1, replicate to S2 ----
+  params.log(`[Auto-Fix] reissue_ssl/S2: ${domain} — issuing LE cert on S1, will replicate to S2`);
+
+  // Step 1: Ensure web domain exists on S1 (should already from security_hardening)
+  await ensureWebDomain(ssh1, domain, 'S1', params.log);
+
+  // Step 2: Issue LE cert on S1 WITHOUT the mail flag.
+  // S2 sending domains have no mail domain on S1, so '' 'yes' would fail exit 3.
+  // LE validation works on S1 because the dual A records include S1's IP.
+  await ssh1.exec(
+    `${HESTIA_PATH_PREFIX}v-add-letsencrypt-domain admin ${domain}`,
+    { timeout: 120000 }
+  );
+
+  // Verify the cert was actually created on S1
+  const certDir = `/home/admin/conf/web/${domain}/ssl`;
   try {
-    await targetSSH.exec(
-      `${HESTIA_PATH_PREFIX}v-add-web-domain admin ${domain}`,
+    await ssh1.exec(
+      `test -f ${certDir}/${domain}.crt && test -f ${certDir}/${domain}.key`,
+      { timeout: 10000 }
+    );
+  } catch {
+    throw new Error(
+      `reissue_ssl/S2: LE cert issuance returned success but cert files missing on S1 for ${domain}`
+    );
+  }
+
+  // Step 3: Ensure web domain exists on S2 (the main fix for the original bug)
+  await ensureWebDomain(ssh2, domain, 'S2', params.log);
+
+  // Step 4: Copy cert files from S1 to S2 via base64
+  await ssh2.exec(`mkdir -p ${certDir} && chown admin:admin ${certDir}`, { timeout: 10000 });
+
+  const certFiles = [`${domain}.crt`, `${domain}.key`, `${domain}.ca`, `${domain}.pem`];
+  for (const file of certFiles) {
+    const srcPath = `${certDir}/${file}`;
+    let b64Content: string;
+    try {
+      const { stdout } = await ssh1.exec(
+        `if [ -f ${srcPath} ]; then base64 -w0 ${srcPath}; else echo MISSING; fi`,
+        { timeout: 15000 }
+      );
+      b64Content = stdout.trim();
+    } catch (err) {
+      throw new Error(
+        `reissue_ssl/S2: failed reading ${srcPath} on S1: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    if (b64Content === 'MISSING' || !b64Content) {
+      if (file.endsWith('.crt') || file.endsWith('.key')) {
+        throw new Error(`reissue_ssl/S2: required cert file ${srcPath} missing on S1`);
+      }
+      continue; // .ca/.pem optional
+    }
+    await ssh2.exec(
+      `echo '${b64Content}' | base64 -d > ${certDir}/${file} && chown admin:admin ${certDir}/${file} && chmod 600 ${certDir}/${file}`,
+      { timeout: 15000 }
+    );
+  }
+
+  // Step 5: Register SSL with HestiaCP on S2 via v-add-web-domain-ssl.
+  // Just having cert files on disk does nothing — HestiaCP must know SSL is enabled.
+  try {
+    await ssh2.exec(
+      `${HESTIA_PATH_PREFIX}v-add-web-domain-ssl admin ${domain} ${certDir}`,
       { timeout: 60000 }
     );
   } catch (err: unknown) {
     const exitCode = (err as { code?: number })?.code;
     if (exitCode !== 4) {
-      // Exit code 4 = domain already exists, that's fine. Anything else is a real error.
-      throw new Error(`${serverName} Failed to add web domain ${domain}: ${err instanceof Error ? err.message : String(err)}`);
+      // Exit 4 = SSL already exists, that's fine. Otherwise re-throw.
+      throw new Error(
+        `reissue_ssl/S2: v-add-web-domain-ssl failed for ${domain}: ${err instanceof Error ? err.message : String(err)}`
+      );
     }
   }
 
-  // Step 2: Issue the LE certificate
-  const cmd = `${HESTIA_PATH_PREFIX}v-add-letsencrypt-domain admin ${domain} '' yes`;
-  await targetSSH.exec(cmd, { timeout: 120000 });
-
-  // Step 3: Rebuild web domain so nginx loads the new cert for this vhost.
-  // Without this, port 443 continues serving the hostname cert for SNI requests.
-  await targetSSH.exec(
+  // Step 6: Rebuild web + mail domain on S2
+  await ssh2.exec(
     `${HESTIA_PATH_PREFIX}v-rebuild-web-domain admin ${domain}`,
     { timeout: 60000 }
   );
 
-  // Step 4: Rebuild mail domain if it exists, so Exim reloads TLS config.
-  // Non-fatal if domain has no mail domain (e.g. NS-only domain).
   try {
-    await targetSSH.exec(
+    await ssh2.exec(
       `${HESTIA_PATH_PREFIX}v-rebuild-mail-domain admin ${domain}`,
       { timeout: 60000 }
     );
   } catch {
-    // mail domain may not exist — not an error
+    // mail domain may not exist on S2 in some configurations
   }
 
-  params.log(`[Auto-Fix] reissue_ssl/${serverName}: Reissued SSL certificate for ${domain}`);
+  // Step 7: Verify the cert is actually served via port 443
+  const { stdout: certSubject } = await ssh2.exec(
+    `echo | openssl s_client -connect 127.0.0.1:443 -servername ${domain} 2>/dev/null | openssl x509 -noout -subject 2>/dev/null || echo "CN=UNVERIFIED"`,
+    { timeout: 15000 }
+  );
+  if (!certSubject || !certSubject.includes(domain)) {
+    throw new Error(
+      `reissue_ssl/S2: cert replicated but SNI check shows wrong cert for ${domain}: ${certSubject.trim()}`
+    );
+  }
+
+  params.log(`[Auto-Fix] reissue_ssl/S2: Replicated SSL certificate for ${domain} (issued on S1, copied to S2)`);
+}
+
+/**
+ * Ensure a web domain exists in HestiaCP on the given server.
+ * Handles the orphan-folder case: v-add-web-domain returns exit 4 when a
+ * leftover .well-known folder exists from a prior LE attempt, even though
+ * no web domain config exists. We detect this by checking v-list-web-domain,
+ * remove the orphan folder, and retry.
+ */
+async function ensureWebDomain(
+  ssh: SSHManager,
+  domain: string,
+  serverName: string,
+  log: (msg: string) => void
+): Promise<void> {
+  try {
+    await ssh.exec(
+      `${HESTIA_PATH_PREFIX}v-add-web-domain admin ${domain}`,
+      { timeout: 60000 }
+    );
+    return; // Success — web domain created
+  } catch (err: unknown) {
+    const exitCode = (err as { code?: number })?.code;
+    if (exitCode !== 4) {
+      throw new Error(`${serverName} Failed to add web domain ${domain}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    // Exit 4: either web domain genuinely exists, or orphan folder blocks creation.
+  }
+
+  // Check if the web domain actually exists in HestiaCP config
+  try {
+    await ssh.exec(
+      `${HESTIA_PATH_PREFIX}v-list-web-domain admin ${domain}`,
+      { timeout: 15000 }
+    );
+    // Web domain exists — nothing more to do
+    return;
+  } catch {
+    // Web domain does NOT exist — orphan folder is blocking v-add-web-domain
+  }
+
+  // Remove the orphan web folder and retry
+  log(`[Auto-Fix] ${serverName}: Removing orphan web folder for ${domain} (blocks v-add-web-domain)`);
+  await ssh.exec(
+    `rm -rf /home/admin/web/${domain}`,
+    { timeout: 15000 }
+  );
+
+  await ssh.exec(
+    `${HESTIA_PATH_PREFIX}v-add-web-domain admin ${domain}`,
+    { timeout: 60000 }
+  );
 }
 
 /**
