@@ -872,7 +872,12 @@ export function createPairProvisioningSaga(
                 `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100"'`,
                 { timeout: 10000 }
               );
-              context.log(`[Step 6] SPF+DMARC fixed for ${domain} on S1`);
+              // Add BIMI record
+              await ssh1.exec(
+                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} default._bimi TXT '"v=BIMI1; l=; a="'`,
+                { timeout: 10000 }
+              );
+              context.log(`[Step 6] SPF+DMARC+BIMI fixed for ${domain} on S1`);
             } catch (err) {
               context.log(`[Step 6] Warning: SPF/DMARC fix for ${domain}: ${err}`);
             }
@@ -911,7 +916,12 @@ export function createPairProvisioningSaga(
                 `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100"'`,
                 { timeout: 10000 }
               );
-              context.log(`[Step 6] SPF+DMARC fixed for ${domain} on S2`);
+              // Add BIMI record
+              await ssh2.exec(
+                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} default._bimi TXT '"v=BIMI1; l=; a="'`,
+                { timeout: 10000 }
+              );
+              context.log(`[Step 6] SPF+DMARC+BIMI fixed for ${domain} on S2`);
             } catch (err) {
               context.log(`[Step 6] Warning: SPF/DMARC fix for ${domain}: ${err}`);
             }
@@ -1103,12 +1113,13 @@ export function createPairProvisioningSaga(
                   const rtype = rec.TYPE;
                   const value = rec.VALUE;
 
-                  // Replicate SPF (@ TXT with spf1), DKIM (mail._domainkey TXT), and DMARC (_dmarc TXT)
+                  // Replicate SPF (@ TXT with spf1), DKIM (mail._domainkey TXT), DMARC (_dmarc TXT), and BIMI (default._bimi TXT)
                   const isSPF = rtype === 'TXT' && host === '@' && value.includes('spf1');
                   const isDKIM = rtype === 'TXT' && host === 'mail._domainkey';
                   const isDMARC = rtype === 'TXT' && host === '_dmarc';
+                  const isBIMI = rtype === 'TXT' && host === 'default._bimi';
 
-                  if (isSPF || isDKIM || isDMARC) {
+                  if (isSPF || isDKIM || isDMARC || isBIMI) {
                     // Use single quotes around value to prevent shell interpretation
                     const safeValue = value.replace(/'/g, "'\\''");
                     await targetSSH.exec(

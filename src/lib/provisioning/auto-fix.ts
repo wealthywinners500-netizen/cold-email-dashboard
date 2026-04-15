@@ -554,7 +554,7 @@ async function addBIMI(
   domain: string,
   params: { log: (msg: string) => void }
 ): Promise<void> {
-  const bimiValue = '"v=BIMI1; l=; a="';
+  const bimiValue = '\'"v=BIMI1; l=; a="\'';
   const addCmd = `v-add-dns-record admin ${domain} default._bimi TXT ${bimiValue}`;
 
   for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
