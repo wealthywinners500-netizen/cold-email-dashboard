@@ -302,10 +302,10 @@ async function handleCreateVpsStep(
     // 5b. IP blacklist pre-check with re-roll (PATCH 9, Hard Lesson #74).
     // Fresh Linode IPs can carry pre-existing blacklist entries from prior
     // tenants. Check both IPs against 4 DNSBL zones. If either is listed,
-    // delete both Linodes and re-provision (up to 3 re-rolls, 4 total
-    // attempts). Prevents wasting 25-30 min of provisioning on a dirty IP
-    // that will fail the verification gate.
-    const MAX_IP_REROLL_ATTEMPTS = 3;
+    // delete both Linodes and re-provision (up to 5 re-rolls, 6 total
+    // attempts). Bumped from 3→5 after pair #12 testing burned through
+    // 3 dirty IPs in us-central + us-east before finding clean in us-southeast.
+    const MAX_IP_REROLL_ATTEMPTS = 5;
     for (let rerollAttempt = 0; rerollAttempt <= MAX_IP_REROLL_ATTEMPTS; rerollAttempt++) {
       const [bl1, bl2] = await Promise.all([
         checkIPBlacklist(server1.ip),
