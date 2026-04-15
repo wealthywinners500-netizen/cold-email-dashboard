@@ -502,108 +502,76 @@ async function reissueSSL(
     return;
   }
 
-  // ---- S2 domain: issue on S1, replicate to S2 ----
-  params.log(`[Auto-Fix] reissue_ssl/S2: ${domain} — issuing LE cert on S1, will replicate to S2`);
+  // ---- S2 domain: issue LE cert directly on S2 ----
+  // S2 sending domains often have dual A records (S1+S2 IPs) which causes LE
+  // multi-vantage validation to fail: LE validates from multiple geographic
+  // locations and ALL vantage points must see the challenge file. With dual A
+  // records, some vantage points hit S1 (no challenge file) → 404 → failure.
+  // Fix: remove the stale S1 A record from DNS zones on both servers before
+  // issuing LE, then issue directly on S2 where the A record correctly points.
+  params.log(`[Auto-Fix] reissue_ssl/S2: ${domain} — cleaning DNS + issuing LE cert on S2`);
 
-  // Step 1: Ensure web domain exists on S1 (should already from security_hardening)
-  await ensureWebDomain(ssh1, domain, 'S1', params.log);
+  // Step 1: Ensure web domain exists on S2
+  await ensureWebDomain(ssh2, domain, 'S2', params.log);
 
-  // Step 2: Issue LE cert on S1 WITHOUT the mail flag.
-  // S2 sending domains have no mail domain on S1, so '' 'yes' would fail exit 3.
-  // Dual A records (S1+S2) mean ACME validation is non-deterministic — the ACME
-  // server randomly picks S1 or S2, and only succeeds when it picks S1 (where the
-  // challenge file lives). Retry up to 3 times (87.5% cumulative success).
-  const LE_MAX_RETRIES = 3;
-  let leSuccess = false;
-  for (let attempt = 1; attempt <= LE_MAX_RETRIES; attempt++) {
+  // Step 2: Remove stale S1 A records from DNS zones on BOTH servers.
+  // The default A record (pointing to S1) was created by HestiaCP during DNS zone
+  // setup and should have been replaced by the pipeline. It's safe to remove because
+  // S2 domains' A record should only point to S2's IP.
+  const s1IP = params.server1IP;
+  for (const [ssh, sName] of [[ssh1, 'S1'], [ssh2, 'S2']] as const) {
     try {
-      await ssh1.exec(
-        `${HESTIA_PATH_PREFIX}v-add-letsencrypt-domain admin ${domain}`,
-        { timeout: 120000 }
+      const { stdout: records } = await ssh.exec(
+        `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+        { timeout: 15000 }
       );
-      leSuccess = true;
-      break;
-    } catch (err: unknown) {
-      const exitCode = (err as { code?: number })?.code;
-      if (exitCode === 15 && attempt < LE_MAX_RETRIES) {
-        // Exit 15 = LE validation failed (ACME server likely hit S2 due to dual A records)
-        params.log(`[Auto-Fix] reissue_ssl/S2: LE attempt ${attempt}/${LE_MAX_RETRIES} failed for ${domain} (ACME validation), retrying...`);
-        // Brief delay before retry to let DNS round-robin rotate
-        await new Promise(resolve => setTimeout(resolve, 5000));
-        continue;
+      // Find A records for '@' pointing to S1's IP
+      for (const line of records.split('\n')) {
+        const parts = line.trim().split(/\s+/);
+        // Format: ID  NAME  TYPE  VALUE  ...
+        if (parts.length >= 4 && parts[1] === '@' && parts[2] === 'A' && parts[3] === s1IP) {
+          const recordId = parts[0];
+          params.log(`[Auto-Fix] reissue_ssl/S2: Removing stale S1 A record (id=${recordId}) from ${sName} zone for ${domain}`);
+          try {
+            await ssh.exec(
+              `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${recordId}`,
+              { timeout: 15000 }
+            );
+          } catch {
+            // Non-fatal — record may have already been deleted
+          }
+        }
       }
-      throw err; // Non-retryable error or max retries exceeded
+    } catch {
+      // If we can't list/clean DNS, continue anyway — LE might still work
+      params.log(`[Auto-Fix] reissue_ssl/S2: Warning: could not clean DNS on ${sName} for ${domain}`);
     }
   }
 
-  if (!leSuccess) {
-    throw new Error(`reissue_ssl/S2: LE cert issuance failed after ${LE_MAX_RETRIES} attempts for ${domain}`);
-  }
+  // Brief pause for DNS propagation after record removal
+  await new Promise(resolve => setTimeout(resolve, 3000));
 
-  // Verify the cert was actually created on S1 (LE can exit 0 without creating files)
+  // Step 3: Issue LE cert directly on S2 WITH mail flag (S2 has the mail domain).
+  // Now that only S2's A record exists, all LE vantage points hit S2.
+  await ssh2.exec(
+    `${HESTIA_PATH_PREFIX}v-add-letsencrypt-domain admin ${domain} '' yes`,
+    { timeout: 120000 }
+  );
+
+  // Verify cert was actually created on S2
   const certDir = `/home/admin/conf/web/${domain}/ssl`;
   try {
-    await ssh1.exec(
+    await ssh2.exec(
       `test -f ${certDir}/${domain}.crt && test -f ${certDir}/${domain}.key`,
       { timeout: 10000 }
     );
   } catch {
     throw new Error(
-      `reissue_ssl/S2: LE cert issuance returned success but cert files missing on S1 for ${domain}`
+      `reissue_ssl/S2: LE cert issued on S2 but cert files missing for ${domain}`
     );
   }
 
-  // Step 3: Ensure web domain exists on S2 (the main fix for the original bug)
-  await ensureWebDomain(ssh2, domain, 'S2', params.log);
-
-  // Step 4: Copy cert files from S1 to S2 via base64
-  await ssh2.exec(`mkdir -p ${certDir} && chown admin:admin ${certDir}`, { timeout: 10000 });
-
-  const certFiles = [`${domain}.crt`, `${domain}.key`, `${domain}.ca`, `${domain}.pem`];
-  for (const file of certFiles) {
-    const srcPath = `${certDir}/${file}`;
-    let b64Content: string;
-    try {
-      const { stdout } = await ssh1.exec(
-        `if [ -f ${srcPath} ]; then base64 -w0 ${srcPath}; else echo MISSING; fi`,
-        { timeout: 15000 }
-      );
-      b64Content = stdout.trim();
-    } catch (err) {
-      throw new Error(
-        `reissue_ssl/S2: failed reading ${srcPath} on S1: ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
-    if (b64Content === 'MISSING' || !b64Content) {
-      if (file.endsWith('.crt') || file.endsWith('.key')) {
-        throw new Error(`reissue_ssl/S2: required cert file ${srcPath} missing on S1`);
-      }
-      continue; // .ca/.pem optional
-    }
-    await ssh2.exec(
-      `echo '${b64Content}' | base64 -d > ${certDir}/${file} && chown admin:admin ${certDir}/${file} && chmod 600 ${certDir}/${file}`,
-      { timeout: 15000 }
-    );
-  }
-
-  // Step 5: Register SSL with HestiaCP on S2 via v-add-web-domain-ssl.
-  // Just having cert files on disk does nothing — HestiaCP must know SSL is enabled.
-  try {
-    await ssh2.exec(
-      `${HESTIA_PATH_PREFIX}v-add-web-domain-ssl admin ${domain} ${certDir}`,
-      { timeout: 60000 }
-    );
-  } catch (err: unknown) {
-    const exitCode = (err as { code?: number })?.code;
-    if (exitCode !== 4) {
-      // Exit 4 = SSL already exists, that's fine. Otherwise re-throw.
-      throw new Error(
-        `reissue_ssl/S2: v-add-web-domain-ssl failed for ${domain}: ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
-  }
-
-  // Step 6: Rebuild web + mail domain on S2
+  // Step 4: Rebuild web + mail domain on S2
   await ssh2.exec(
     `${HESTIA_PATH_PREFIX}v-rebuild-web-domain admin ${domain}`,
     { timeout: 60000 }
@@ -615,23 +583,21 @@ async function reissueSSL(
       { timeout: 60000 }
     );
   } catch {
-    // mail domain may not exist on S2 in some configurations
+    // mail domain rebuild non-fatal
   }
 
-  // Step 7: Verify the cert is actually served via port 443 on the real IP.
-  // Use the actual server IP (not 127.0.0.1) because nginx may bind only to the
-  // external interface, and SNI routing requires hitting the correct vhost.
+  // Step 5: Verify the cert is actually served via port 443
   const { stdout: certSubject } = await ssh2.exec(
     `echo | openssl s_client -connect ${targetIP}:443 -servername ${domain} 2>/dev/null | openssl x509 -noout -subject 2>/dev/null || echo "CN=UNVERIFIED"`,
     { timeout: 15000 }
   );
   if (!certSubject || !certSubject.includes(domain)) {
     throw new Error(
-      `reissue_ssl/S2: cert replicated but SNI check shows wrong cert for ${domain}: ${certSubject.trim()}`
+      `reissue_ssl/S2: cert issued but SNI check shows wrong cert for ${domain}: ${certSubject.trim()}`
     );
   }
 
-  params.log(`[Auto-Fix] reissue_ssl/S2: Replicated SSL certificate for ${domain} (issued on S1, copied to S2)`);
+  params.log(`[Auto-Fix] reissue_ssl/S2: Issued SSL certificate for ${domain} directly on S2`);
 }
 
 /**
