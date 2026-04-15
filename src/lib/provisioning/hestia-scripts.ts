@@ -682,6 +682,25 @@ export async function syncZoneFiles(
     { timeout: 15000 }
   ).catch(() => {});
 
+  // Verify reload succeeded on target — query each synced domain
+  for (const domain of synced) {
+    try {
+      const verifyResult = await sourceSSH.exec(
+        `sshpass -p '${targetPassword.replace(/'/g, "'\\''")}' ssh -o StrictHostKeyChecking=no root@${targetIP} 'dig SOA ${domain} @127.0.0.1 +short 2>/dev/null'`,
+        { timeout: 10000 }
+      );
+      if (!verifyResult.stdout.trim()) {
+        // Zone not responding after reload — force rebuild
+        await sourceSSH.exec(
+          `sshpass -p '${targetPassword.replace(/'/g, "'\\''")}' ssh -o StrictHostKeyChecking=no root@${targetIP} '${HESTIA_PATH_PREFIX}v-rebuild-dns-domain admin ${domain} 2>/dev/null; rndc reload 2>/dev/null'`,
+          { timeout: 15000 }
+        ).catch(() => {});
+      }
+    } catch {
+      // Non-fatal — the zone might still be loading
+    }
+  }
+
   // Also reload source
   await sourceSSH.exec('rndc reload', { timeout: 10000 }).catch(() => {});
 

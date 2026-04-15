@@ -381,6 +381,122 @@ export async function runVerificationChecks(
     }
   }
 
+  // Check 5b: SOA serial consistency between ns1 and ns2
+  log('[VG] Running check 5b: SOA serial consistency between nameservers');
+  for (const domain of allDomains) {
+    const server = getServerForDomain(domain);
+
+    try {
+      const s1SOA = await ssh1.exec(
+        `dig SOA ${domain} @${server1IP} +short 2>/dev/null`,
+        { timeout: 15000 }
+      );
+      const s2SOA = await ssh1.exec(
+        `dig SOA ${domain} @${server2IP} +short 2>/dev/null`,
+        { timeout: 15000 }
+      );
+
+      const s1Line = s1SOA.stdout.trim();
+      const s2Line = s2SOA.stdout.trim();
+
+      if (!s1Line || !s2Line) {
+        results.push({
+          check: 'soa_serial_consistency',
+          domain,
+          server,
+          status: 'auto_fixable',
+          details: `Could not query SOA from both nameservers. S1: "${s1Line || 'empty'}", S2: "${s2Line || 'empty'}"`,
+          fixAction: 'fix_soa_serial_sync',
+        });
+        continue;
+      }
+
+      const s1Parts = s1Line.split(/\s+/);
+      const s2Parts = s2Line.split(/\s+/);
+      const s1Serial = s1Parts[2] || 'unknown';
+      const s2Serial = s2Parts[2] || 'unknown';
+
+      if (s1Serial !== s2Serial) {
+        results.push({
+          check: 'soa_serial_consistency',
+          domain,
+          server,
+          status: 'auto_fixable',
+          details: `SOA serial mismatch: ns1(${server1IP})=${s1Serial}, ns2(${server2IP})=${s2Serial}`,
+          fixAction: 'fix_soa_serial_sync',
+        });
+      } else {
+        results.push({
+          check: 'soa_serial_consistency',
+          domain,
+          server,
+          status: 'pass',
+          details: `SOA serials match on both nameservers: ${s1Serial}`,
+        });
+      }
+    } catch (err) {
+      results.push({
+        check: 'soa_serial_consistency',
+        domain,
+        server,
+        status: 'manual_required',
+        details: `Error checking SOA consistency: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  }
+
+  // Check 5c: Nameserver responsiveness (both ns1 and ns2 must respond within 5s)
+  log('[VG] Running check 5c: Nameserver responsiveness');
+  for (const [ip, name] of [
+    [server1IP, 'S1'],
+    [server2IP, 'S2'],
+  ] as const) {
+    try {
+      const startTime = Date.now();
+      const result = await ssh1.exec(
+        `dig SOA ${nsDomain} @${ip} +time=5 +tries=1 2>/dev/null`,
+        { timeout: 10000 }
+      );
+      const elapsed = Date.now() - startTime;
+
+      if (result.code !== 0 || !result.stdout.includes('ANSWER SECTION')) {
+        results.push({
+          check: 'ns_responsiveness',
+          domain: nsDomain,
+          server: name,
+          status: 'auto_fixable',
+          details: `Nameserver ${name} (${ip}) failed to respond or returned error`,
+          fixAction: 'fix_soa_serial_sync',
+        });
+      } else if (elapsed > 5000) {
+        results.push({
+          check: 'ns_responsiveness',
+          domain: nsDomain,
+          server: name,
+          status: 'auto_fixable',
+          details: `Nameserver ${name} (${ip}) responded in ${elapsed}ms (>5000ms threshold)`,
+          fixAction: 'fix_soa_serial_sync',
+        });
+      } else {
+        results.push({
+          check: 'ns_responsiveness',
+          domain: nsDomain,
+          server: name,
+          status: 'pass',
+          details: `Nameserver ${name} (${ip}) responded in ${elapsed}ms`,
+        });
+      }
+    } catch (err) {
+      results.push({
+        check: 'ns_responsiveness',
+        domain: nsDomain,
+        server: name,
+        status: 'manual_required',
+        details: `Error checking NS responsiveness: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  }
+
   // Check 6: NS record validation
   log('[VG] Running check 6: NS record validation');
   for (const domain of allDomains) {

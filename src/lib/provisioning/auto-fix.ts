@@ -567,6 +567,77 @@ async function addBIMI(
 }
 
 /**
+ * Fix SOA serial sync between S1 and S2
+ * Rebuilds zones on both servers, reloads BIND, verifies S2 responds
+ */
+async function fixSOASerialSync(
+  ssh1: SSHManager,
+  ssh2: SSHManager,
+  domain: string,
+  params: {
+    server1IP: string;
+    server2IP: string;
+    nsDomain: string;
+    server1Domains: string[];
+    server2Domains: string[];
+    log: (msg: string) => void;
+  }
+): Promise<void> {
+  // Step 1: Rebuild zone on S1 (the primary/source of truth)
+  const rebuildS1 = await ssh1.exec(
+    `${HESTIA_PATH_PREFIX}v-rebuild-dns-domain admin ${domain}`,
+    { timeout: 15000 }
+  );
+  if (rebuildS1.code !== 0) {
+    throw new Error(`S1 Failed to rebuild zone for ${domain}: ${rebuildS1.stderr}`);
+  }
+  params.log(`[Auto-Fix] fix_soa_serial_sync/S1: Rebuilt zone for ${domain}`);
+
+  // Step 2: Rebuild zone on S2
+  const rebuildS2 = await ssh2.exec(
+    `${HESTIA_PATH_PREFIX}v-rebuild-dns-domain admin ${domain}`,
+    { timeout: 15000 }
+  );
+  if (rebuildS2.code !== 0) {
+    // If domain doesn't exist on S2, add it first
+    if (rebuildS2.stderr?.includes('doesn\'t exist') || rebuildS2.stderr?.includes('not exist')) {
+      const serverIP = params.server2Domains.includes(domain) ? params.server2IP : params.server1IP;
+      const addResult = await ssh2.exec(
+        `${HESTIA_PATH_PREFIX}v-add-dns-domain admin ${domain} ${serverIP}`,
+        { timeout: 15000 }
+      );
+      if (addResult.code !== 0 && addResult.code !== 3 && addResult.code !== 4) {
+        throw new Error(`S2 Failed to add zone for ${domain}: ${addResult.stderr}`);
+      }
+      params.log(`[Auto-Fix] fix_soa_serial_sync/S2: Added missing zone for ${domain}`);
+    } else {
+      throw new Error(`S2 Failed to rebuild zone for ${domain}: ${rebuildS2.stderr}`);
+    }
+  }
+  params.log(`[Auto-Fix] fix_soa_serial_sync/S2: Rebuilt zone for ${domain}`);
+
+  // Step 3: Reload BIND on both servers
+  for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
+    const result = await ssh.exec('rndc reload', { timeout: 10000 });
+    if (result.code !== 0) {
+      params.log(`[Auto-Fix] fix_soa_serial_sync/${serverName}: rndc reload warning: ${result.stderr}`);
+    }
+  }
+
+  // Step 4: Verify S2 responds to queries for this zone
+  const verifyResult = await ssh1.exec(
+    `dig SOA ${domain} @${params.server2IP} +short +time=5 +tries=1 2>/dev/null`,
+    { timeout: 10000 }
+  );
+  const s2SOA = verifyResult.stdout.trim();
+  if (!s2SOA) {
+    throw new Error(`S2 still not responding for ${domain} after rebuild + reload`);
+  }
+
+  params.log(`[Auto-Fix] fix_soa_serial_sync: Verified — S2 responding for ${domain} (SOA: ${s2SOA})`);
+}
+
+/**
  * Main entry point: run all auto-fixes
  */
 export async function runAutoFixes(
@@ -624,6 +695,10 @@ export async function runAutoFixes(
 
         case 'fix_soa':
           await fixSOA(ssh1, ssh2, issue.domain, params);
+          break;
+
+        case 'fix_soa_serial_sync':
+          await fixSOASerialSync(ssh1, ssh2, issue.domain, params);
           break;
 
         case 'fix_zone_transfer':
