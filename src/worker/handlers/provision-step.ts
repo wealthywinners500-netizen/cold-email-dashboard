@@ -18,7 +18,11 @@ import { createPairProvisioningSaga } from '@/lib/provisioning/pair-provisioning
 import { getVPSProvider, getDNSRegistrar } from '@/lib/provisioning/provider-registry';
 import { decrypt } from '@/lib/provisioning/encryption';
 import { persistPairCredentials } from '@/lib/provisioning/persist-credentials';
-import { checkIPBlacklist } from '@/lib/provisioning/ip-blacklist-check';
+import {
+  checkIPBlacklist,
+  pairSharesSubnet,
+  PAIR_SUBNET_MIN_PREFIX,
+} from '@/lib/provisioning/ip-blacklist-check';
 import { SERVERLESS_STEP_RUNNERS } from '@/lib/provisioning/serverless-steps';
 import { createHmac, randomBytes } from 'crypto';
 import type {
@@ -299,12 +303,21 @@ async function handleCreateVpsStep(
       `[ProvisionStep][create_vps] both active: ${server1.ip} + ${server2.ip}`
     );
 
-    // 5b. IP blacklist pre-check with re-roll (PATCH 9, Hard Lesson #74).
-    // Fresh Linode IPs can carry pre-existing blacklist entries from prior
-    // tenants. Check both IPs against 4 DNSBL zones. If either is listed,
-    // delete both Linodes and re-provision (up to 5 re-rolls, 6 total
-    // attempts). Bumped from 3→5 after pair #12 testing burned through
-    // 3 dirty IPs in us-central + us-east before finding clean in us-southeast.
+    // 5b. IP blacklist + subnet-diversity pre-check with re-roll.
+    //
+    // PATCH 9 (2026-04-12), Hard Lesson #74: Fresh Linode IPs can carry
+    // pre-existing blacklist entries from prior tenants. Check both IPs
+    // against ~40 DNSBL zones (zero tolerance — any listing is fatal).
+    //
+    // PATCH 21 (2026-04-16), savini.info pair rejection: Pair IPs must
+    // ALSO be on different subnets. The savini pair s1=172.235.148.223 /
+    // s2=172.239.72.108 shared Linode's 172.224.0.0/12 block — textbook
+    // /16 was different, but /12 was the same and the pair was rejected
+    // by Dean for cold-email deliverability. See pairSharesSubnet()
+    // header comment in ip-blacklist-check.ts for the full rationale.
+    //
+    // Either condition triggers the re-roll: delete both Linodes and
+    // re-provision (up to 5 re-rolls, 6 total attempts).
     const MAX_IP_REROLL_ATTEMPTS = 5;
     for (let rerollAttempt = 0; rerollAttempt <= MAX_IP_REROLL_ATTEMPTS; rerollAttempt++) {
       const [bl1, bl2] = await Promise.all([
@@ -312,32 +325,45 @@ async function handleCreateVpsStep(
         checkIPBlacklist(server2.ip),
       ]);
       const listedIPs = [bl1, bl2].filter((r) => r.listed);
+      const sameSubnet = pairSharesSubnet(server1.ip, server2.ip);
 
-      if (listedIPs.length === 0) {
-        // Both IPs clean — proceed
+      if (listedIPs.length === 0 && !sameSubnet) {
+        // Both IPs clean AND on different /PAIR_SUBNET_MIN_PREFIX blocks — proceed
         console.log(
-          `[ProvisionStep][create_vps] IP blacklist check PASSED: ${server1.ip} clean, ${server2.ip} clean` +
+          `[ProvisionStep][create_vps] IP pre-check PASSED: ${server1.ip} clean, ${server2.ip} clean, ` +
+            `subnets distinct at /${PAIR_SUBNET_MIN_PREFIX}` +
             (rerollAttempt > 0 ? ` (after ${rerollAttempt} re-roll(s))` : '')
         );
         break;
       }
 
-      // IPs are listed
-      const listDetail = listedIPs
-        .map((r) => `${r.ip}: ${r.listings.map((l) => l.name).join(', ')}`)
-        .join('; ');
+      // Build a human-readable reason for the re-roll log line.
+      const reasons: string[] = [];
+      if (listedIPs.length > 0) {
+        const listDetail = listedIPs
+          .map((r) => `${r.ip}: ${r.listings.map((l) => l.name).join(', ')}`)
+          .join('; ');
+        reasons.push(`BLACKLISTED [${listDetail}]`);
+      }
+      if (sameSubnet) {
+        reasons.push(
+          `SAME_SUBNET [/${PAIR_SUBNET_MIN_PREFIX}: ${server1.ip} + ${server2.ip}]`
+        );
+      }
+      const reasonText = reasons.join(' + ');
 
       if (rerollAttempt === MAX_IP_REROLL_ATTEMPTS) {
         // Exhausted all retries — fail the step
         throw new Error(
-          `IP blacklist pre-check failed after ${MAX_IP_REROLL_ATTEMPTS + 1} attempts. ` +
-            `Last IPs: ${listDetail}. All ${MAX_IP_REROLL_ATTEMPTS + 1} Linode IP pairs were ` +
-            `blacklisted. Try a different region or contact Linode support.`
+          `IP pre-check failed after ${MAX_IP_REROLL_ATTEMPTS + 1} attempts. ` +
+            `Last failure: ${reasonText}. All ${MAX_IP_REROLL_ATTEMPTS + 1} Linode IP pairs ` +
+            `either had blacklist hits or shared a /${PAIR_SUBNET_MIN_PREFIX} subnet. ` +
+            `Try different regions or contact Linode support.`
         );
       }
 
       console.log(
-        `[ProvisionStep][create_vps] IP BLACKLISTED (attempt ${rerollAttempt + 1}/${MAX_IP_REROLL_ATTEMPTS + 1}): ${listDetail}. ` +
+        `[ProvisionStep][create_vps] IP pre-check FAILED (attempt ${rerollAttempt + 1}/${MAX_IP_REROLL_ATTEMPTS + 1}): ${reasonText}. ` +
           `Deleting servers and re-rolling...`
       );
 

@@ -173,3 +173,82 @@ export async function checkIPBlacklist(ip: string): Promise<IPBlacklistResult> {
     listings,
   };
 }
+
+// ============================================================================
+// Pair subnet-diversity check (Hard Lesson: pair #N / savini.info, 2026-04-16)
+// ============================================================================
+//
+// Pair IPs MUST NOT share the same subnet. Shared-subnet pairs are dangerous
+// because (a) spam blocklists frequently list at /24 or /16, so one dirty
+// IP can poison the whole pair; (b) receiving MTAs correlate sending IPs
+// by /16 /12 reputation; (c) Linode's regional allocations are adjacent
+// /16s inside the same /12 block, so even "different region" pairs like
+// us-mia + us-lax can share a /12 and behave as one reputation pool.
+//
+// Concrete example that triggered this rule:
+//   savini.info pair 2026-04-16:
+//     s1 = 172.235.148.223  (us-mia)
+//     s2 = 172.239.72.108   (us-lax)
+//   Different /24, different /16 — but both live in 172.224.0.0/12, i.e.
+//   the same Linode /12 allocation block. That is "same subnet" for cold
+//   email purposes and the pair was rejected.
+//
+// Default threshold: /12. Any pair whose IPs fall in the same /12 is
+// rejected and the create_vps re-roll loop deletes both servers and tries
+// again. Rationale for /12 over /16:
+//   - /16 would accept the savini pair above (different /16) even though
+//     it is an obviously related block.
+//   - /12 is strict enough to force genuinely different allocations, and
+//     Linode publishes IPs across many distinct /12s so this is still
+//     satisfiable within a handful of re-rolls.
+//
+// This is separate from the DNSBL check. A pair can fail EITHER check
+// independently.
+
+/**
+ * Convert a dotted-quad IPv4 string to a 32-bit unsigned integer.
+ * Throws on malformed input.
+ */
+function ipv4ToInt(ip: string): number {
+  const parts = ip.split('.').map((p) => parseInt(p, 10));
+  if (parts.length !== 4 || parts.some((p) => Number.isNaN(p) || p < 0 || p > 255)) {
+    throw new Error(`Invalid IPv4 address: ${ip}`);
+  }
+  return ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
+}
+
+/**
+ * Return true if two IPv4 addresses fall inside the same CIDR block at
+ * the given prefix length. prefixBits must be 0..32.
+ *
+ * Examples:
+ *   sharesSubnet("10.0.0.1", "10.0.0.254", 24)           -> true
+ *   sharesSubnet("172.235.148.223", "172.239.72.108", 16) -> false (different /16)
+ *   sharesSubnet("172.235.148.223", "172.239.72.108", 12) -> true  (same /12)
+ *   sharesSubnet("172.235.148.223", "172.239.72.108", 8)  -> true  (same /8)
+ */
+export function sharesSubnet(ip1: string, ip2: string, prefixBits: number): boolean {
+  if (prefixBits < 0 || prefixBits > 32) {
+    throw new Error(`prefixBits must be 0..32, got ${prefixBits}`);
+  }
+  if (prefixBits === 0) return true; // everything is in 0.0.0.0/0
+  const a = ipv4ToInt(ip1);
+  const b = ipv4ToInt(ip2);
+  const mask = (0xFFFFFFFF << (32 - prefixBits)) >>> 0;
+  return (a & mask) === (b & mask);
+}
+
+/**
+ * Default threshold for "same subnet" rejection between pair servers.
+ * /12 catches Linode's adjacent /16 allocations that would otherwise slip
+ * through a textbook /16 check. See header comment for rationale.
+ */
+export const PAIR_SUBNET_MIN_PREFIX = 12;
+
+/**
+ * Convenience wrapper: returns true if the two IPs violate pair subnet
+ * diversity (i.e., share PAIR_SUBNET_MIN_PREFIX bits of network prefix).
+ */
+export function pairSharesSubnet(ip1: string, ip2: string): boolean {
+  return sharesSubnet(ip1, ip2, PAIR_SUBNET_MIN_PREFIX);
+}
