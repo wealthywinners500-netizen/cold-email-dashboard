@@ -392,15 +392,63 @@ export class NamecheapRegistrar extends BaseDNSRegistrar {
           IP: record.ip,
         });
       } catch (err) {
-        // If glue record already exists, update it instead
+        // If glue record already exists (left over from a prior teardown/reprovision),
+        // update the IP in place instead of failing.
+        //
+        // Namecheap's actual error strings for this condition:
+        //   "Object exists."                   — what the XML <Error> body reports
+        //   "Subdomain exists"                 — older variant
+        //   "already exists" / "duplicate"     — defensive fallthrough
+        //
+        // domains.ns.update REQUIRES OldIP (empty string is rejected), so we fetch the
+        // current IP via domains.ns.getInfo before calling update.
         const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes("already exists") || msg.includes("duplicate")) {
-          this.log(`Glue record ${record.hostname} already exists, updating IP`);
+        const isExistsError =
+          msg.includes("Object exists") ||
+          msg.includes("already exists") ||
+          msg.includes("duplicate") ||
+          msg.includes("Subdomain exists");
+
+        if (isExistsError) {
+          this.log(
+            `Glue record ${record.hostname} already exists — fetching current IP to build proper ns.update`
+          );
+
+          // Fetch the current IP so we can supply OldIP to ns.update
+          let currentIp = "";
+          try {
+            const infoXml = await this.rawRequest("domains.ns.getInfo", {
+              SLD: sld,
+              TLD: tld,
+              Nameserver: record.hostname,
+            });
+            const ipMatch = infoXml.match(/\bIP="([^"]+)"/);
+            if (ipMatch) currentIp = ipMatch[1];
+            this.log(`Current IP for ${record.hostname}: ${currentIp || "(not found)"}`);
+          } catch (infoErr) {
+            this.log(
+              `ns.getInfo for ${record.hostname} failed: ${
+                infoErr instanceof Error ? infoErr.message : String(infoErr)
+              } — proceeding to ns.update with empty OldIP`
+            );
+          }
+
+          // If current IP already matches target, nothing to do.
+          if (currentIp === record.ip) {
+            this.log(
+              `Glue ${record.hostname} already points at ${record.ip} — skipping update`
+            );
+            continue;
+          }
+
+          this.log(
+            `Updating glue ${record.hostname}: ${currentIp || "(unknown)"} -> ${record.ip}`
+          );
           await this.rawRequest("domains.ns.update", {
             SLD: sld,
             TLD: tld,
             Nameserver: record.hostname,
-            OldIP: "", // Namecheap may require old IP — try without first
+            OldIP: currentIp,
             IP: record.ip,
           });
         } else {
