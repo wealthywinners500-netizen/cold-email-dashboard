@@ -217,11 +217,24 @@ export async function POST(
         // it against clerk_org_id which failed when the two diverged.
         const dbOrgId = jobRow.org_id;
 
+        // Hard Lesson #50: pair_number is NOT NULL with UNIQUE(org_id, pair_number).
+        // Must compute next pair_number before insert.
+        const { data: maxPairRow } = await supabase
+          .from("server_pairs")
+          .select("pair_number")
+          .eq("org_id", dbOrgId)
+          .order("pair_number", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        const nextPairNumber = ((maxPairRow?.pair_number as number) || 0) + 1;
+
         // Create server_pair record (column names: s1_ip, s2_ip, s1_hostname, s2_hostname)
         const { data: serverPair, error: pairError } = await supabase
           .from("server_pairs")
           .insert({
             org_id: dbOrgId,
+            pair_number: nextPairNumber,
             ns_domain: jobRow.ns_domain,
             s1_ip: server1IP,
             s2_ip: server2IP,
@@ -233,8 +246,23 @@ export async function POST(
           .select()
           .single();
 
+        // Hard Lesson #50: server_pair creation failure must be FATAL —
+        // do NOT mark job as "completed" with server_pair_id=NULL.
         if (pairError) {
           console.error(`[WorkerCallback] server_pairs insert FAILED: ${pairError.message}`);
+          await supabase
+            .from("provisioning_jobs")
+            .update({
+              status: "failed",
+              error_message: `Completion handler failed: server_pairs insert error: ${pairError.message}`,
+            })
+            .eq("id", jobId);
+          return NextResponse.json({
+            jobId,
+            stepType,
+            status: "failed",
+            message: `server_pairs insert failed: ${pairError.message}`,
+          }, { status: 500 });
         }
 
         // Create email accounts from setup_mail_domains step metadata

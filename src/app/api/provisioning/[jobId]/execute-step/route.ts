@@ -641,11 +641,24 @@ export async function POST(
           throw new Error(`Server IPs missing from create_vps metadata: s1=${server1IP}, s2=${server2IP}`);
         }
 
+        // Hard Lesson #50: pair_number is NOT NULL with UNIQUE(org_id, pair_number).
+        // Must compute next pair_number before insert.
+        const { data: maxPairRow } = await supabase
+          .from("server_pairs")
+          .select("pair_number")
+          .eq("org_id", orgId)
+          .order("pair_number", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        const nextPairNumber = ((maxPairRow?.pair_number as number) || 0) + 1;
+
         // Create server_pair record (column names: s1_ip, s2_ip, s1_hostname, s2_hostname)
         const { data: serverPair, error: pairError } = await supabase
           .from("server_pairs")
           .insert({
             org_id: orgId,
+            pair_number: nextPairNumber,
             ns_domain: job.ns_domain,
             s1_ip: server1IP,
             s2_ip: server2IP,
@@ -657,8 +670,91 @@ export async function POST(
           .select()
           .single();
 
+        // Hard Lesson #50: server_pair creation failure must be FATAL —
+        // do NOT mark job as "completed" with server_pair_id=NULL.
         if (pairError) {
-          console.error(`[ExecuteStep] server_pairs insert FAILED: ${pairError.message}`);
+          throw new Error(`server_pairs insert failed (pair_number=${nextPairNumber}): ${pairError.message}`);
+        }
+
+        // Create email accounts from setup_mail_domains step metadata
+        // (Hard Lesson #78: smtp_user + smtp_pass are NOT NULL)
+        let accountsCreated = 0;
+        const { data: mailStep } = await supabase
+          .from("provisioning_steps")
+          .select("metadata")
+          .eq("job_id", jobId)
+          .eq("step_type", "setup_mail_domains")
+          .single();
+
+        const mailMeta = (mailStep?.metadata as Record<string, unknown>) || {};
+        const allAccountsCreated = mailMeta.allAccountsCreated as Record<string, string[]> | undefined;
+        const server1Domains = (mailMeta.server1Domains as string[]) || [];
+
+        // Get server password for smtp_pass
+        const vpsMetaForAccounts = (createVpsStep?.metadata as Record<string, unknown>) || {};
+        const encryptedPassword = vpsMetaForAccounts.serverPassword_encrypted as string | undefined;
+        const serverPassword = encryptedPassword ? decrypt(encryptedPassword) : "";
+
+        if (allAccountsCreated) {
+          const accountRows = [];
+          for (const [domain, names] of Object.entries(allAccountsCreated)) {
+            const isServer1Domain = server1Domains.includes(domain);
+            const smtpHost = isServer1Domain ? server1IP : server2IP;
+            for (const name of names) {
+              accountRows.push({
+                org_id: orgId,
+                email: `${name}@${domain}`,
+                display_name: name
+                  .split(".")
+                  .map((n: string) => n.charAt(0).toUpperCase() + n.slice(1))
+                  .join(" "),
+                server_pair_id: serverPair.id,
+                smtp_host: smtpHost,
+                smtp_port: 587,
+                smtp_secure: false,
+                smtp_user: `${name}@${domain}`,
+                smtp_pass: serverPassword,
+                imap_host: smtpHost,
+                imap_port: 993,
+                status: "active",
+                daily_send_limit: 50,
+                sends_today: 0,
+              });
+            }
+          }
+          if (accountRows.length > 0) {
+            const { error: accountError } = await supabase
+              .from("email_accounts")
+              .insert(accountRows);
+            if (accountError) {
+              console.error(`[ExecuteStep] email_accounts insert failed: ${accountError.message}`);
+            } else {
+              accountsCreated = accountRows.length;
+            }
+          }
+        }
+
+        // Populate sending_domains table for domain-in-use filtering
+        const sendingDomainsList = job.sending_domains as string[] | undefined;
+        if (sendingDomainsList && sendingDomainsList.length > 0) {
+          const sdRows = sendingDomainsList.map((domain: string) => ({
+            pair_id: serverPair.id,
+            domain,
+          }));
+          const { error: sdError } = await supabase
+            .from("sending_domains")
+            .insert(sdRows);
+          if (sdError) {
+            console.error(`[ExecuteStep] sending_domains insert failed: ${sdError.message}`);
+          }
+        }
+
+        // Update server_pair total_accounts
+        if (accountsCreated > 0) {
+          await supabase
+            .from("server_pairs")
+            .update({ total_accounts: accountsCreated })
+            .eq("id", serverPair.id);
         }
 
         // Mark job as completed
@@ -668,7 +764,7 @@ export async function POST(
             status: "completed",
             progress_pct: 100,
             completed_at: new Date().toISOString(),
-            server_pair_id: serverPair?.id || null,
+            server_pair_id: serverPair.id,
             server1_ip: server1IP,
             server2_ip: server2IP,
           })
