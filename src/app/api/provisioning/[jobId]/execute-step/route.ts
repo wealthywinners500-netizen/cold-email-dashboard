@@ -342,8 +342,33 @@ async function executeServerlessStep(
         { hostname: `ns2.${job.ns_domain}`, ip: server2IP },
       ]);
 
+      // Delegate all sending domains to the pair's nameservers
+      const ns1Host = `ns1.${job.ns_domain}`;
+      const ns2Host = `ns2.${job.ns_domain}`;
+      const delegated: string[] = [];
+      const delegationErrors: string[] = [];
+
+      for (const domain of (job.sending_domains as string[] | null) || []) {
+        try {
+          await registrar.updateNameserversOnly(domain, [ns1Host, ns2Host]);
+          delegated.push(domain);
+          console.log(`[configure_registrar] Delegated sending domain: ${domain}`);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          delegationErrors.push(`${domain}: ${msg}`);
+          console.log(`[configure_registrar] Warning: Could not delegate ${domain} via ${dnsRow.registrar_type}: ${msg}`);
+        }
+      }
+
+      const delegationSummary = delegated.length > 0
+        ? `. Sending domains delegated (${delegated.length}): ${delegated.join(", ")}`
+        : "";
+      const errorSummary = delegationErrors.length > 0
+        ? `. Delegation warnings (${delegationErrors.length}): ${delegationErrors.join("; ")}`
+        : "";
+
       return {
-        output: `DNS configured for ${job.ns_domain}: NS → ns1/ns2, glue → ${server1IP}/${server2IP} (${dnsRow.registrar_type})`,
+        output: `DNS configured for ${job.ns_domain}: NS → ns1/ns2, glue → ${server1IP}/${server2IP} (${dnsRow.registrar_type})${delegationSummary}${errorSummary}`,
       };
     }
 
