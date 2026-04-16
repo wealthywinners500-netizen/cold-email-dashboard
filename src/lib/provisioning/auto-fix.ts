@@ -234,22 +234,41 @@ async function addCAA(
   domain: string,
   params: { log: (msg: string) => void }
 ): Promise<void> {
-  // Try with quotes first, then without if it fails
-  let cmd = `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ CAA '0 issue "letsencrypt.org"'`;
-
   for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
+    // Check if CAA already exists with letsencrypt.org
+    const listResult = await ssh.exec(
+      `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+      { timeout: 10000 }
+    );
+    if (listResult.code === 0) {
+      const existingCAA = listResult.stdout.split('\n').find(
+        l => l.includes('CAA') && l.includes('letsencrypt')
+      );
+      if (existingCAA) {
+        params.log(`[Auto-Fix] add_caa/${serverName}: CAA record already exists for ${domain} — skipping`);
+        continue;
+      }
+    }
+
+    // Try with quotes first, then without if it fails
+    let cmd = `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ CAA '0 issue "letsencrypt.org"'`;
     let result = await ssh.exec(cmd, { timeout: 10000 });
 
-    // If failed, try without quotes
-    if (result.code !== 0) {
+    // If failed (not "already exists"), try without quotes
+    if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
       cmd = `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ CAA 0 issue letsencrypt.org`;
       result = await ssh.exec(cmd, { timeout: 10000 });
     }
 
-    if (result.code !== 0) {
+    // Hard Lesson #97: exit 3/4 = "already exists" — non-fatal
+    if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
       throw new Error(`${serverName} Failed to add CAA record for ${domain}: ${result.stderr}`);
     }
-    params.log(`[Auto-Fix] add_caa/${serverName}: Added CAA record for ${domain}`);
+    if (result.code === 3 || result.code === 4) {
+      params.log(`[Auto-Fix] add_caa/${serverName}: CAA already exists for ${domain} (exit ${result.code}) — continuing`);
+    } else {
+      params.log(`[Auto-Fix] add_caa/${serverName}: Added CAA record for ${domain}`);
+    }
   }
 }
 
@@ -269,11 +288,31 @@ async function addSPF(
   const addCmd = `v-add-dns-record admin ${domain} @ TXT ${spfValue}`;
 
   for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
+    // Check if SPF already exists with correct content
+    const listResult = await ssh.exec(
+      `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+      { timeout: 10000 }
+    );
+    if (listResult.code === 0) {
+      const existingSPF = listResult.stdout.split('\n').find(
+        l => l.includes('TXT') && l.includes('v=spf1') && l.includes(correctIP)
+      );
+      if (existingSPF) {
+        params.log(`[Auto-Fix] add_spf/${serverName}: SPF record already exists for ${domain} — skipping`);
+        continue;
+      }
+    }
+
     const result = await ssh.exec(`${HESTIA_PATH_PREFIX}${addCmd}`, { timeout: 10000 });
-    if (result.code !== 0) {
+    // Hard Lesson #97: exit 3/4 = "already exists" — non-fatal
+    if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
       throw new Error(`${serverName} Failed to add SPF record for ${domain}: ${result.stderr}`);
     }
-    params.log(`[Auto-Fix] add_spf/${serverName}: Added SPF record for ${domain}`);
+    if (result.code === 3 || result.code === 4) {
+      params.log(`[Auto-Fix] add_spf/${serverName}: SPF already exists for ${domain} (exit ${result.code}) — continuing`);
+    } else {
+      params.log(`[Auto-Fix] add_spf/${serverName}: Added SPF record for ${domain}`);
+    }
   }
 }
 
@@ -300,7 +339,10 @@ async function fixSPF(
 }
 
 /**
- * Add DKIM record: read from source server, add to both
+ * Add DKIM record: read from source server, add to both.
+ * Hard Lesson #97: exit code 3/4 = "already exists" — non-fatal for DNS adds.
+ * Before adding, check if the record already exists with correct content on
+ * the target server. If so, skip the add (mark as already fixed).
  */
 async function addDKIM(
   ssh1: SSHManager,
@@ -311,6 +353,8 @@ async function addDKIM(
   // Determine source server
   const sourceSSH = params.server2Domains.includes(domain) ? ssh2 : ssh1;
   const sourceServer = params.server2Domains.includes(domain) ? 'S2' : 'S1';
+  const otherSSH = sourceSSH === ssh1 ? ssh2 : ssh1;
+  const otherServer = sourceServer === 'S1' ? 'S2' : 'S1';
 
   // Read DKIM from source server
   const listCmd = `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`;
@@ -321,7 +365,7 @@ async function addDKIM(
   }
 
   const lines = listResult.stdout.trim().split('\n').filter(l => l.length > 0);
-  const dkimLine = lines.find(l => l.includes('mail._domainkey') && l.includes('TXT'));
+  let dkimLine = lines.find(l => l.includes('mail._domainkey') && l.includes('TXT'));
 
   if (!dkimLine) {
     // Try to regenerate DKIM
@@ -329,53 +373,50 @@ async function addDKIM(
     const genCmd = `${HESTIA_PATH_PREFIX}v-add-mail-domain-dkim admin ${domain}`;
     const genResult = await sourceSSH.exec(genCmd, { timeout: 15000 });
 
-    if (genResult.code !== 0) {
+    // Exit 3/4 = already exists (non-fatal)
+    if (genResult.code !== 0 && genResult.code !== 3 && genResult.code !== 4) {
       throw new Error(`${sourceServer} Failed to regenerate DKIM for ${domain}: ${genResult.stderr}`);
     }
 
-    // Re-list to get the new DKIM
+    // Re-list to get the DKIM
     const relistResult = await sourceSSH.exec(listCmd, { timeout: 10000 });
     if (relistResult.code !== 0) {
       throw new Error(`${sourceServer} Failed to re-list DNS records for ${domain}: ${relistResult.stderr}`);
     }
 
     const relistLines = relistResult.stdout.trim().split('\n').filter(l => l.length > 0);
-    const newDkimLine = relistLines.find(l => l.includes('mail._domainkey') && l.includes('TXT'));
+    dkimLine = relistLines.find(l => l.includes('mail._domainkey') && l.includes('TXT'));
 
-    if (!newDkimLine) {
+    if (!dkimLine) {
       throw new Error(`${sourceServer} Failed to find DKIM record even after regeneration for ${domain}`);
     }
+  }
 
-    // Extract DKIM value from the line
-    const parts = newDkimLine.split(/\s+/);
-    const dkimValue = parts.slice(3).join(' ');
+  // Extract DKIM value
+  const parts = dkimLine.split(/\s+/);
+  const dkimValue = parts.slice(3).join(' ');
 
-    // Add to other server
-    const otherSSH = sourceSSH === ssh1 ? ssh2 : ssh1;
-    const otherServer = sourceServer === 'S1' ? 'S2' : 'S1';
-    const addCmd = `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} mail._domainkey TXT ${dkimValue}`;
-    const addResult = await otherSSH.exec(addCmd, { timeout: 10000 });
-
-    if (addResult.code !== 0) {
-      throw new Error(`${otherServer} Failed to add DKIM record for ${domain}: ${addResult.stderr}`);
+  // Check if the DKIM record already exists on the other server with correct content
+  const otherListResult = await otherSSH.exec(listCmd, { timeout: 10000 });
+  if (otherListResult.code === 0) {
+    const otherLines = otherListResult.stdout.trim().split('\n').filter(l => l.length > 0);
+    const existingDkim = otherLines.find(l => l.includes('mail._domainkey') && l.includes('TXT'));
+    if (existingDkim && existingDkim.includes('v=DKIM1')) {
+      params.log(`[Auto-Fix] add_dkim/${otherServer}: DKIM record already exists for ${domain} — skipping add`);
+      return;
     }
+  }
 
-    params.log(`[Auto-Fix] add_dkim/${otherServer}: Added DKIM record for ${domain}`);
+  // Add to other server — tolerate exit 3/4 ("already exists")
+  const addCmd = `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} mail._domainkey TXT ${dkimValue}`;
+  const addResult = await otherSSH.exec(addCmd, { timeout: 10000 });
+
+  if (addResult.code !== 0 && addResult.code !== 3 && addResult.code !== 4) {
+    throw new Error(`${otherServer} Failed to add DKIM record for ${domain}: ${addResult.stderr}`);
+  }
+  if (addResult.code === 3 || addResult.code === 4) {
+    params.log(`[Auto-Fix] add_dkim/${otherServer}: DKIM record already exists for ${domain} (exit ${addResult.code}) — continuing`);
   } else {
-    // Extract DKIM value
-    const parts = dkimLine.split(/\s+/);
-    const dkimValue = parts.slice(3).join(' ');
-
-    // Add to other server
-    const otherSSH = sourceSSH === ssh1 ? ssh2 : ssh1;
-    const otherServer = sourceServer === 'S1' ? 'S2' : 'S1';
-    const addCmd = `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} mail._domainkey TXT ${dkimValue}`;
-    const addResult = await otherSSH.exec(addCmd, { timeout: 10000 });
-
-    if (addResult.code !== 0) {
-      throw new Error(`${otherServer} Failed to add DKIM record for ${domain}: ${addResult.stderr}`);
-    }
-
     params.log(`[Auto-Fix] add_dkim/${otherServer}: Added DKIM record for ${domain}`);
   }
 }
@@ -396,11 +437,31 @@ async function addDMARC(
   const addCmd = `v-add-dns-record admin ${domain} _dmarc TXT ${dmarcValue}`;
 
   for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
+    // Check if DMARC record already exists with correct content
+    const listResult = await ssh.exec(
+      `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+      { timeout: 10000 }
+    );
+    if (listResult.code === 0) {
+      const existingDmarc = listResult.stdout.split('\n').find(
+        l => l.includes('_dmarc') && l.includes('TXT') && l.includes('v=DMARC1')
+      );
+      if (existingDmarc) {
+        params.log(`[Auto-Fix] add_dmarc/${serverName}: DMARC record already exists for ${domain} — skipping`);
+        continue;
+      }
+    }
+
     const result = await ssh.exec(`${HESTIA_PATH_PREFIX}${addCmd}`, { timeout: 10000 });
-    if (result.code !== 0) {
+    // Hard Lesson #97: exit 3/4 = "already exists" — non-fatal
+    if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
       throw new Error(`${serverName} Failed to add DMARC record for ${domain}: ${result.stderr}`);
     }
-    params.log(`[Auto-Fix] add_dmarc/${serverName}: Added DMARC record for ${domain}`);
+    if (result.code === 3 || result.code === 4) {
+      params.log(`[Auto-Fix] add_dmarc/${serverName}: DMARC already exists for ${domain} (exit ${result.code}) — continuing`);
+    } else {
+      params.log(`[Auto-Fix] add_dmarc/${serverName}: Added DMARC record for ${domain}`);
+    }
   }
 }
 
@@ -698,11 +759,29 @@ async function addMTASTS(
   const mtaStsValue = `"v=STSv1; id=${timestamp}"`;
   const addCmd = `v-add-dns-record admin ${domain} _mta-sts TXT ${mtaStsValue}`;
 
-  // Add DNS record on both servers
+  // Add DNS record on both servers — tolerate "already exists" (exit 3/4)
   for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
+    // Check if MTA-STS record already exists
+    const listResult = await ssh.exec(
+      `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+      { timeout: 10000 }
+    );
+    if (listResult.code === 0) {
+      const existingMtaSts = listResult.stdout.split('\n').find(
+        l => l.includes('_mta-sts') && l.includes('TXT') && l.includes('v=STSv1')
+      );
+      if (existingMtaSts) {
+        params.log(`[Auto-Fix] add_mta_sts/${serverName}: MTA-STS DNS record already exists for ${domain} — skipping`);
+        continue;
+      }
+    }
+
     const dnsResult = await ssh.exec(`${HESTIA_PATH_PREFIX}${addCmd}`, { timeout: 10000 });
-    if (dnsResult.code !== 0) {
+    if (dnsResult.code !== 0 && dnsResult.code !== 3 && dnsResult.code !== 4) {
       throw new Error(`${serverName} Failed to add MTA-STS DNS record for ${domain}: ${dnsResult.stderr}`);
+    }
+    if (dnsResult.code === 3 || dnsResult.code === 4) {
+      params.log(`[Auto-Fix] add_mta_sts/${serverName}: MTA-STS already exists for ${domain} (exit ${dnsResult.code}) — continuing`);
     }
   }
 
@@ -748,11 +827,31 @@ async function addTLSRPT(
   const addCmd = `v-add-dns-record admin ${domain} _smtp._tls TXT ${tlsrptValue}`;
 
   for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
+    // Check if TLSRPT already exists
+    const listResult = await ssh.exec(
+      `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+      { timeout: 10000 }
+    );
+    if (listResult.code === 0) {
+      const existingTlsrpt = listResult.stdout.split('\n').find(
+        l => l.includes('_smtp._tls') && l.includes('TXT') && l.includes('TLSRPTv1')
+      );
+      if (existingTlsrpt) {
+        params.log(`[Auto-Fix] add_tlsrpt/${serverName}: TLSRPT record already exists for ${domain} — skipping`);
+        continue;
+      }
+    }
+
     const result = await ssh.exec(`${HESTIA_PATH_PREFIX}${addCmd}`, { timeout: 10000 });
-    if (result.code !== 0) {
+    // Hard Lesson #97: exit 3/4 = "already exists" — non-fatal
+    if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
       throw new Error(`${serverName} Failed to add TLSRPT record for ${domain}: ${result.stderr}`);
     }
-    params.log(`[Auto-Fix] add_tlsrpt/${serverName}: Added TLSRPT record for ${domain}`);
+    if (result.code === 3 || result.code === 4) {
+      params.log(`[Auto-Fix] add_tlsrpt/${serverName}: TLSRPT already exists for ${domain} (exit ${result.code}) — continuing`);
+    } else {
+      params.log(`[Auto-Fix] add_tlsrpt/${serverName}: Added TLSRPT record for ${domain}`);
+    }
   }
 }
 
@@ -769,11 +868,31 @@ async function addBIMI(
   const addCmd = `v-add-dns-record admin ${domain} default._bimi TXT ${bimiValue}`;
 
   for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
+    // Check if BIMI already exists
+    const listResult = await ssh.exec(
+      `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+      { timeout: 10000 }
+    );
+    if (listResult.code === 0) {
+      const existingBIMI = listResult.stdout.split('\n').find(
+        l => l.includes('default._bimi') && l.includes('TXT') && l.includes('v=BIMI1')
+      );
+      if (existingBIMI) {
+        params.log(`[Auto-Fix] add_bimi/${serverName}: BIMI record already exists for ${domain} — skipping`);
+        continue;
+      }
+    }
+
     const result = await ssh.exec(`${HESTIA_PATH_PREFIX}${addCmd}`, { timeout: 10000 });
-    if (result.code !== 0) {
+    // Hard Lesson #97: exit 3/4 = "already exists" — non-fatal
+    if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
       throw new Error(`${serverName} Failed to add BIMI record for ${domain}: ${result.stderr}`);
     }
-    params.log(`[Auto-Fix] add_bimi/${serverName}: Added BIMI record for ${domain}`);
+    if (result.code === 3 || result.code === 4) {
+      params.log(`[Auto-Fix] add_bimi/${serverName}: BIMI already exists for ${domain} (exit ${result.code}) — continuing`);
+    } else {
+      params.log(`[Auto-Fix] add_bimi/${serverName}: Added BIMI record for ${domain}`);
+    }
   }
 }
 
