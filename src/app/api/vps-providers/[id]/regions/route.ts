@@ -92,21 +92,15 @@ function getStaticRegions(providerType: string) {
         { id: "hil", name: "Hillsboro, OR, USA", slug: "hil", available: true },
       ];
     case "linode":
+      // US-ONLY policy (2026-04-16). All Linode "new DCs" (us-ord/lax/mia/sea/iad)
+      // share 172.224.0.0/12 — pairing two of them always fails the subnet-diversity
+      // check in ip-blacklist-check.ts. Only legacy US DCs are allowed because their
+      // IP blocks (45.x/69.x/74.x/97.x/173.x/198.x) are in distinct /12s.
       return [
-        // New DCs (2023-2024) — fresh Akamai IP blocks, cleanest for email
-        { id: "us-ord", name: "Chicago, IL (new DC)", slug: "us-ord", available: true },
-        { id: "us-lax", name: "Los Angeles, CA (new DC)", slug: "us-lax", available: true },
-        { id: "us-mia", name: "Miami, FL (new DC)", slug: "us-mia", available: true },
-        { id: "us-sea", name: "Seattle, WA (new DC)", slug: "us-sea", available: true },
-        { id: "us-iad", name: "Washington, DC (new DC)", slug: "us-iad", available: true },
-        // Legacy DCs (2003-2008) — more recycled IPs, higher blacklist risk
+        { id: "us-east", name: "Newark, NJ", slug: "us-east", available: true },
         { id: "us-southeast", name: "Atlanta, GA", slug: "us-southeast", available: true },
         { id: "us-central", name: "Dallas, TX", slug: "us-central", available: true },
         { id: "us-west", name: "Fremont, CA", slug: "us-west", available: true },
-        { id: "us-east", name: "Newark, NJ", slug: "us-east", available: true },
-        // EU regions
-        { id: "eu-west", name: "London, UK", slug: "eu-west", available: true },
-        { id: "eu-central", name: "Frankfurt, Germany", slug: "eu-central", available: true },
       ];
     case "vultr":
       return [
