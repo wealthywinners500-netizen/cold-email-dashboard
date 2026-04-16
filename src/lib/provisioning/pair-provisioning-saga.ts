@@ -548,15 +548,24 @@ export function createPairProvisioningSaga(
             isNSDomain: true,
           });
 
+          // Compute domain split early so DNS A records point to the correct server
+          // S2 domains need @ A → server2IP for LE HTTP-01 validation to succeed
+          const midpoint = Math.ceil(context.sendingDomains.length / 2);
+          const s1DomainsForDNS = context.sendingDomains.slice(0, midpoint);
+          const s2DomainsForDNS = context.sendingDomains.slice(midpoint);
+          context.log(`[Step 4] Domain split for DNS: S1=${s1DomainsForDNS.length}, S2=${s2DomainsForDNS.length}`);
+
           // Create zones for all sending domains on Server 1
           for (const domain of context.sendingDomains) {
-            context.log(`[Step 4] Creating zone: ${domain}`);
+            const isS2Domain = s2DomainsForDNS.includes(domain);
+            context.log(`[Step 4] Creating zone: ${domain} (primary: ${isS2Domain ? 'S2' : 'S1'})`);
             await createDNSZone(ssh1, {
               domain,
               server1IP,
               server2IP,
               nsDomain: context.nsDomain,
               isNSDomain: false,
+              primaryIP: isS2Domain ? server2IP : server1IP,
             });
           }
 
@@ -1395,19 +1404,19 @@ export function createPairProvisioningSaga(
             }
           }
 
-          // SSL for S2's assigned sending domains — Hard Lesson #65: issue on S1
-          // (primary), then replicate to S2 to avoid ACME HTTP-01 validation race
-          // where round-robin hits the wrong server's challenge file.
+          // SSL for S2's assigned sending domains — issue directly on S2 since
+          // S2 domains' A records now correctly point to S2's IP (Fix 1A/1B).
+          // Old approach (issue on S1 + replicate) failed when LE multi-vantage
+          // validation hit S2's IP and couldn't find the challenge file on S1.
           for (const domain of server2Domains) {
             try {
-              await issueSSLCert(ssh1, { domain, isHostname: false });
-              context.log(`[Step 8] S2 domain SSL issued on S1: ${domain}`);
-              try {
-                await replicateSSLCertToSecondary(ssh1, ssh2, domain);
-                context.log(`[Step 8] SSL replicated to S2: ${domain}`);
-              } catch (repErr) {
-                sslErrors.push(`S2 ${domain} replication: ${repErr}`);
-              }
+              // Ensure web domain exists on S2 before issuing cert
+              await ssh2.exec(
+                `${HESTIA_PATH_PREFIX}v-add-web-domain admin ${domain} 2>/dev/null || true`,
+                { timeout: 30000 }
+              );
+              await issueSSLCert(ssh2, { domain, isHostname: false });
+              context.log(`[Step 8] S2 SSL issued directly on S2: ${domain}`);
             } catch (err) {
               sslErrors.push(`S2 ${domain}: ${err}`);
             }

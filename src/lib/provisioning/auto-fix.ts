@@ -608,9 +608,10 @@ async function reissueSSL(
     }
   }
 
-  // Step 3: Try LE on S2, fall back to self-signed if LE fails (DNS cache of old dual A records)
+  // Step 3: Try LE on S2 — NO self-signed fallback (self-signed certs cause MXToolbox
+  // cert chain errors). With the A-record fix (primaryIP), S2 domains now correctly
+  // resolve to S2's IP, so LE HTTP-01 validation should succeed.
   const certDir = `/home/admin/conf/web/${domain}/ssl`;
-  let usedSelfSigned = false;
 
   try {
     // Brief delay for DNS propagation
@@ -622,27 +623,11 @@ async function reissueSSL(
     // Verify cert was actually created (LE can exit 0 without creating files)
     await ssh2.exec(`test -f ${certDir}/${domain}.crt && test -f ${certDir}/${domain}.key`, { timeout: 10000 });
     params.log(`[Auto-Fix] reissue_ssl/S2: LE cert issued for ${domain}`);
-  } catch {
-    // LE failed (likely DNS cache of dual A records still in effect).
-    // Fall back to self-signed cert with correct CN. The VG check only verifies
-    // CN match, and port 443 certs don't affect email deliverability.
-    params.log(`[Auto-Fix] reissue_ssl/S2: LE failed for ${domain}, generating self-signed cert`);
-    usedSelfSigned = true;
-
-    await ssh2.exec(`mkdir -p ${certDir}`, { timeout: 10000 });
-    await ssh2.exec(
-      `openssl req -x509 -nodes -days 365 -newkey rsa:2048 ` +
-      `-keyout ${certDir}/${domain}.key ` +
-      `-out ${certDir}/${domain}.crt ` +
-      `-subj "/CN=${domain}" 2>&1`,
-      { timeout: 30000 }
-    );
-    // Create .pem (combined cert+key) for completeness
-    await ssh2.exec(
-      `cat ${certDir}/${domain}.crt ${certDir}/${domain}.key > ${certDir}/${domain}.pem && ` +
-      `chown admin:admin ${certDir}/${domain}.crt ${certDir}/${domain}.key ${certDir}/${domain}.pem && ` +
-      `chmod 600 ${certDir}/${domain}.key`,
-      { timeout: 10000 }
+  } catch (leErr) {
+    // DO NOT fall back to self-signed — it causes MXToolbox cert chain errors.
+    // Propagate the failure so it's visible as a real issue.
+    throw new Error(
+      `reissue_ssl/S2: LE cert failed for ${domain} (no self-signed fallback): ${leErr instanceof Error ? leErr.message : String(leErr)}`
     );
   }
 
@@ -687,8 +672,7 @@ async function reissueSSL(
     );
   }
 
-  const certType = usedSelfSigned ? 'self-signed' : 'LE';
-  params.log(`[Auto-Fix] reissue_ssl/S2: Installed ${certType} SSL certificate for ${domain} on S2`);
+  params.log(`[Auto-Fix] reissue_ssl/S2: Installed LE SSL certificate for ${domain} on S2`);
 }
 
 /**

@@ -60,6 +60,7 @@ export interface CreateDNSZoneParams {
   nsDomain: string;
   isNSDomain: boolean;
   records?: DNSRecord[];
+  primaryIP?: string;
 }
 
 export interface CreateMailDomainParams {
@@ -196,7 +197,7 @@ export async function createDNSZone(
   ssh: SSHManager,
   params: CreateDNSZoneParams
 ): Promise<void> {
-  const { domain, server1IP, server2IP, nsDomain, isNSDomain, records } = params;
+  const { domain, server1IP, server2IP, nsDomain, isNSDomain, records, primaryIP } = params;
 
   // Check if zone already exists (idempotent)
   try {
@@ -204,7 +205,7 @@ export async function createDNSZone(
     if (checkResult.code === 0 && checkResult.stdout.trim().length > 0) {
       // Zone exists — clean it up and ensure records are correct
       await cleanupDNSZoneDefaults(ssh, domain, nsDomain);
-      await ensureDNSRecords(ssh, domain, server1IP, server2IP, nsDomain, isNSDomain, records);
+      await ensureDNSRecords(ssh, domain, server1IP, server2IP, nsDomain, isNSDomain, records, primaryIP);
       return;
     }
   } catch {
@@ -218,7 +219,7 @@ export async function createDNSZone(
   await cleanupDNSZoneDefaults(ssh, domain, nsDomain);
 
   // Add all required records
-  await ensureDNSRecords(ssh, domain, server1IP, server2IP, nsDomain, isNSDomain, records);
+  await ensureDNSRecords(ssh, domain, server1IP, server2IP, nsDomain, isNSDomain, records, primaryIP);
 }
 
 /**
@@ -280,12 +281,14 @@ async function ensureDNSRecords(
   server2IP: string,
   nsDomain: string,
   isNSDomain: boolean,
-  extraRecords?: DNSRecord[]
+  extraRecords?: DNSRecord[],
+  primaryIP?: string
 ): Promise<void> {
   // Build the required record set
   const requiredRecords: Array<{type: string; host: string; value: string; priority?: number}> = [
-    // A records
-    { type: 'A', host: '@', value: server1IP },
+    // A records — primaryIP determines which server this domain resolves to
+    // (S2 domains need @ A → server2IP so LE HTTP-01 validation reaches the right server)
+    { type: 'A', host: '@', value: primaryIP || server1IP },
     { type: 'A', host: 'mail1', value: server1IP },
     { type: 'A', host: 'mail2', value: server2IP },
 

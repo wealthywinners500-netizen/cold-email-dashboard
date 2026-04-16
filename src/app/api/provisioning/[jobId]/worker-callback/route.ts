@@ -218,7 +218,7 @@ export async function POST(
         const dbOrgId = jobRow.org_id;
 
         // Create server_pair record (column names: s1_ip, s2_ip, s1_hostname, s2_hostname)
-        const { data: serverPair } = await supabase
+        const { data: serverPair, error: pairError } = await supabase
           .from("server_pairs")
           .insert({
             org_id: dbOrgId,
@@ -228,10 +228,14 @@ export async function POST(
             s1_hostname: `mail1.${jobRow.ns_domain}`,
             s2_hostname: `mail2.${jobRow.ns_domain}`,
             status: "active",
-            health_status: "healthy",
+            provisioning_job_id: jobId,
           })
           .select()
           .single();
+
+        if (pairError) {
+          console.error(`[WorkerCallback] server_pairs insert FAILED: ${pairError.message}`);
+        }
 
         // Create email accounts from setup_mail_domains step metadata
         let accountsCreated = 0;
@@ -274,7 +278,8 @@ export async function POST(
                     .join(" "),
                   server_pair_id: serverPair.id,
                   smtp_host: smtpHost,
-                  smtp_port: 465,
+                  smtp_port: 587,
+                  smtp_secure: false,
                   smtp_user: `${name}@${domain}`,
                   smtp_pass: serverPassword,
                   imap_host: smtpHost,

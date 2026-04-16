@@ -642,7 +642,7 @@ export async function POST(
         }
 
         // Create server_pair record (column names: s1_ip, s2_ip, s1_hostname, s2_hostname)
-        const { data: serverPair } = await supabase
+        const { data: serverPair, error: pairError } = await supabase
           .from("server_pairs")
           .insert({
             org_id: orgId,
@@ -652,10 +652,14 @@ export async function POST(
             s1_hostname: `mail1.${job.ns_domain}`,
             s2_hostname: `mail2.${job.ns_domain}`,
             status: "active",
-            health_status: "healthy",
+            provisioning_job_id: jobId,
           })
           .select()
           .single();
+
+        if (pairError) {
+          console.error(`[ExecuteStep] server_pairs insert FAILED: ${pairError.message}`);
+        }
 
         // Mark job as completed
         await supabase
