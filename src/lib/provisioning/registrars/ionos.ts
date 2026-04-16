@@ -51,6 +51,7 @@ export class IonosRegistrar extends BaseDNSRegistrar {
   protected getAuthHeaders(): Record<string, string> {
     return {
       "X-API-Key": this.apiKey,
+      "User-Agent": "cold-email-dashboard/1.0",
     };
   }
 
@@ -271,7 +272,35 @@ export class IonosRegistrar extends BaseDNSRegistrar {
       body: JSON.stringify(body),
     });
 
-    this.log(`Nameservers updated successfully (update ID: ${result?.id || "n/a"})`);
+    this.log(`Nameservers update accepted (update ID: ${result?.id || "n/a"}). Verifying delegation...`);
+
+    const maxWaitMs = 300_000;
+    const pollIntervalMs = 15_000;
+    const start = Date.now();
+    const expectedNS = nameservers.map((ns) => ns.toLowerCase()).sort();
+
+    while (Date.now() - start < maxWaitMs) {
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
+      try {
+        const info = await this.getDomainNameservers(domain);
+        const currentNS = (info.nameservers || [])
+          .map((ns: { name: string }) => ns.name.toLowerCase())
+          .sort();
+
+        if (JSON.stringify(currentNS) === JSON.stringify(expectedNS)) {
+          this.log(`NS delegation confirmed for ${domain} after ${Math.round((Date.now() - start) / 1000)}s`);
+          return;
+        }
+
+        this.log(`Waiting for NS delegation on ${domain}... current: [${currentNS.join(", ")}] expected: [${expectedNS.join(", ")}]`);
+      } catch (pollErr) {
+        this.log(`NS verification poll error for ${domain}: ${pollErr instanceof Error ? pollErr.message : String(pollErr)}`);
+      }
+    }
+
+    throw new Error(
+      `Ionos NS delegation for ${domain} not confirmed after 5 minutes. Expected: [${nameservers.join(", ")}]`
+    );
   }
 
   /**

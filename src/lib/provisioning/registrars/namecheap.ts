@@ -358,7 +358,55 @@ export class NamecheapRegistrar extends BaseDNSRegistrar {
     params["Nameservers"] = nameservers.join(",");
 
     await this.rawRequest("domains.dns.setCustom", params);
-    this.log(`Nameservers set successfully for ${domain}`);
+    this.log(`Nameservers update accepted for ${domain}. Verifying delegation...`);
+
+    const maxWaitMs = 300_000;
+    const pollIntervalMs = 15_000;
+    const start = Date.now();
+    const expectedNS = nameservers.map((ns) => ns.toLowerCase()).sort();
+
+    while (Date.now() - start < maxWaitMs) {
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
+      try {
+        const currentNS = await this.getDomainNameservers(domain);
+        const normalizedCurrent = currentNS.map((ns) => ns.toLowerCase()).sort();
+
+        if (JSON.stringify(normalizedCurrent) === JSON.stringify(expectedNS)) {
+          this.log(`NS delegation confirmed for ${domain} after ${Math.round((Date.now() - start) / 1000)}s`);
+          return;
+        }
+
+        this.log(`Waiting for NS delegation on ${domain}... current: [${normalizedCurrent.join(", ")}] expected: [${expectedNS.join(", ")}]`);
+      } catch (pollErr) {
+        this.log(`NS verification poll error for ${domain}: ${pollErr instanceof Error ? pollErr.message : String(pollErr)}`);
+      }
+    }
+
+    throw new Error(
+      `Namecheap NS delegation for ${domain} not confirmed after 5 minutes. Expected: [${nameservers.join(", ")}]`
+    );
+  }
+
+  /**
+   * Get current nameservers for a domain via domains.getInfo.
+   * Returns an array of nameserver hostnames.
+   */
+  async getDomainNameservers(domain: string): Promise<string[]> {
+    const { sld, tld } = this.parseDomain(domain);
+
+    const xml = await this.rawRequest("domains.getInfo", {
+      DomainName: domain,
+    });
+
+    const nsNames: string[] = [];
+    const nsRegex = /<Nameserver>(.*?)<\/Nameserver>/g;
+    let m;
+    while ((m = nsRegex.exec(xml)) !== null) {
+      if (m[1]) nsNames.push(m[1]);
+    }
+
+    this.log(`Current nameservers for ${domain}: [${nsNames.join(", ")}]`);
+    return nsNames;
   }
 
   /**
