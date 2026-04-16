@@ -212,8 +212,12 @@ export async function createDNSZone(
     // Zone doesn't exist, create it
   }
 
-  // Create the zone
-  await ssh.exec(`${HESTIA_PATH_PREFIX}v-add-dns-domain admin ${domain} ${server1IP}`, { timeout: 30000 });
+  // Create the zone — use primaryIP so S2 domains get @ A → server2IP from the start
+  // Hard Lesson #104: v-add-dns-domain creates a default @ A record with the IP you pass.
+  // If you always pass server1IP, S2 domains get dual @ A records (server1IP + server2IP from ensureDNSRecords)
+  // which breaks LE multi-vantage validation.
+  const zoneIP = primaryIP || server1IP;
+  await ssh.exec(`${HESTIA_PATH_PREFIX}v-add-dns-domain admin ${domain} ${zoneIP}`, { timeout: 30000 });
 
   // Clean up bad defaults (Hard Lesson #12, #13)
   await cleanupDNSZoneDefaults(ssh, domain, nsDomain);
@@ -258,6 +262,14 @@ async function cleanupDNSZoneDefaults(
     // ensureDNSRecords will add the correct both-IP SPF for NS domains,
     // and createMailDomain will add it for sending domains in Step 6.
     if (record.type === 'TXT' && record.host === '@' && record.value.toLowerCase().includes('v=spf1')) {
+      await ssh.exec(`${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${record.id}`, { timeout: 10000 });
+    }
+
+    // Hard Lesson #104: Remove default @ A record.
+    // v-add-dns-domain creates @ A → the IP we pass. Even though we now pass primaryIP,
+    // on idempotent re-runs or edge cases, stale @ A records can linger.
+    // Remove ALL @ A records here — ensureDNSRecords will add the correct one next.
+    if (record.type === 'A' && record.host === '@') {
       await ssh.exec(`${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${record.id}`, { timeout: 10000 });
     }
   }
@@ -829,7 +841,9 @@ export async function issueSSLCert(
 
     // Now issue the LE domain cert with full PATH + explicit admin arg
     // Hard Lesson #51: Full PATH required for internal hostname/date/grep/sed calls
-    await ssh.exec(`bash -lc "${HESTIA_FULL_PATH} && v-add-letsencrypt-domain admin ${domain}"`, { timeout: 120000 });
+    // Pass '' for aliases (prevent www in SAN) and 'yes' for mail subdomains
+    // Matches the auto-fix version (auto-fix.ts line 620) for consistency
+    await ssh.exec(`bash -lc "${HESTIA_FULL_PATH} && v-add-letsencrypt-domain admin ${domain} '' yes"`, { timeout: 120000 });
   }
 
   // Verify CN matches expected

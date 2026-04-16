@@ -961,7 +961,9 @@ export function createPairProvisioningSaga(
                 for (const line of lines) {
                   const cols = line.trim().split(/\s+/);
                   if (cols.length < 4) continue;
-                  const [recordId, type, host] = cols;
+                  // Hard Lesson #105: v-list-dns-records plain column order is ID HOST TYPE [PRIORITY] VALUE
+                  // NEVER use [recordId, type, host] — that has type and host SWAPPED
+                  const [recordId, host, type] = cols;
                   if (!/^\d+$/.test(recordId)) continue;
 
                   // Delete ALL @ A records (not just server1IP) — we'll add the correct one after
@@ -1003,7 +1005,8 @@ export function createPairProvisioningSaga(
                 );
                 const remainingARecords = postDeleteRecords.split('\n').filter(l => {
                   const c = l.trim().split(/\s+/);
-                  return c.length >= 4 && c[1] === 'A' && c[2] === '@';
+                  // Hard Lesson #105: column order is ID HOST TYPE — c[1]=HOST, c[2]=TYPE
+                  return c.length >= 4 && c[1] === '@' && c[2] === 'A';
                 });
                 if (remainingARecords.length > 0) {
                   context.log(`[Step 6] ERROR: ${remainingARecords.length} stale @ A record(s) still present for ${domain} on ${label} after delete — LE SSL will likely fail`);
@@ -1252,6 +1255,7 @@ export function createPairProvisioningSaga(
       async execute(context: ProvisioningContext): Promise<StepResult> {
         context.log('[Step 7] Awaiting S2 DNS propagation...');
         const ctx = ctxMeta(context);
+        const server1IP = ctx.server1IP as string;
         const server2IP = ctx.server2IP as string;
         const server2Domains = (ctx.server2Domains as string[]) || [];
 
@@ -1260,10 +1264,50 @@ export function createPairProvisioningSaga(
           return { success: true, output: 'No S2 domains — skipped.' };
         }
 
+        // PHASE 1: Verify OUR OWN authoritative NS return correct @ A for S2 domains.
+        // This is instantaneous — no propagation needed. If our own NS are wrong,
+        // LE will definitely fail. FAIL FAST here.
+        context.log('[Step 7] Phase 1: Verifying authoritative NS (our own servers)...');
+        const authFailures: string[] = [];
+        for (const domain of server2Domains) {
+          for (const [sshConn, label] of [
+            [ssh1, 'ns1/S1'],
+            [ssh2, 'ns2/S2'],
+          ] as [typeof ssh1, string][]) {
+            try {
+              const { stdout } = await sshConn.exec(
+                `dig +short ${domain} A @127.0.0.1 2>/dev/null`,
+                { timeout: 10000 }
+              );
+              const ips = stdout.trim().split('\n').map((s: string) => s.trim()).filter(Boolean);
+              if (ips.length !== 1 || ips[0] !== server2IP) {
+                authFailures.push(`${domain} on ${label}: expected [${server2IP}], got [${ips.join(',')}]`);
+              }
+            } catch (err) {
+              authFailures.push(`${domain} on ${label}: dig failed — ${err}`);
+            }
+          }
+        }
+
+        if (authFailures.length > 0) {
+          const msg = `FATAL: Our own authoritative NS return wrong A records for S2 domains. LE will fail.\n${authFailures.join('\n')}`;
+          context.log(`[Step 7] ${msg}`);
+          return {
+            success: false,
+            error: msg,
+          };
+        }
+        context.log('[Step 7] Phase 1 PASSED: All S2 domains resolve correctly on both ns1 and ns2.');
+
+        // PHASE 2: Wait for public resolvers to see correct A records.
+        // LE walks the authoritative chain (Phase 1 is sufficient), but waiting
+        // for public resolvers provides extra confidence. Timeout at 5 min.
+        // WARN but don't block — LE should work via authoritative chain.
+        context.log('[Step 7] Phase 2: Waiting for public resolver propagation (up to 5 min)...');
         const resolvers = ['8.8.8.8', '1.1.1.1', '9.9.9.9'];
-        const requiredResolvers = 2; // At least 2 of 3 must confirm
-        const pollIntervalMs = 10_000;
-        const timeoutMs = 120_000;
+        const requiredResolvers = 2;
+        const pollIntervalMs = 15_000;
+        const timeoutMs = 300_000; // 5 minutes
         const results: Array<{ domain: string; propagated: boolean }> = [];
 
         for (const domain of server2Domains) {
@@ -1278,34 +1322,34 @@ export function createPairProvisioningSaga(
                   `dig +short ${domain} A @${resolver} 2>/dev/null`,
                   { timeout: 10000 }
                 );
-                const ip = stdout.trim().split('\n')[0];
-                if (ip === server2IP) confirmCount++;
+                const ips = stdout.trim().split('\n').map((s: string) => s.trim()).filter(Boolean);
+                // Must resolve to ONLY server2IP (no dual A records)
+                if (ips.length === 1 && ips[0] === server2IP) confirmCount++;
               } catch {
-                // Resolver timeout — doesn't count
+                // Resolver timeout
               }
             }
 
             if (confirmCount >= requiredResolvers) {
               propagated = true;
-              context.log(`[Step 7] ${domain} propagated (${confirmCount}/${resolvers.length} resolvers confirm ${server2IP})`);
+              context.log(`[Step 7] ${domain} propagated (${confirmCount}/${resolvers.length} resolvers confirm only ${server2IP})`);
               break;
             }
 
-            context.log(`[Step 7] ${domain}: ${confirmCount}/${resolvers.length} resolvers see ${server2IP} — waiting ${pollIntervalMs / 1000}s...`);
+            context.log(`[Step 7] ${domain}: ${confirmCount}/${resolvers.length} resolvers see only ${server2IP} — waiting ${pollIntervalMs / 1000}s...`);
             await new Promise((r) => setTimeout(r, pollIntervalMs));
           }
 
           if (!propagated) {
-            context.log(`[Step 7] WARNING: ${domain} did not propagate within ${timeoutMs / 1000}s. LE may still work via authoritative NS.`);
+            context.log(`[Step 7] WARNING: ${domain} not fully propagated after ${timeoutMs / 1000}s. LE may still work via authoritative NS.`);
           }
           results.push({ domain, propagated });
         }
 
         const propagatedCount = results.filter(r => r.propagated).length;
-        const output = `S2 DNS propagation: ${propagatedCount}/${server2Domains.length} domains confirmed on public resolvers.`;
+        const output = `S2 DNS: Phase 1 PASS (authoritative). Phase 2: ${propagatedCount}/${server2Domains.length} on public resolvers.`;
         context.log(`[Step 7] ${output}`);
 
-        // Always succeed — this is informational, don't block the saga
         return {
           success: true,
           output,
@@ -1430,8 +1474,14 @@ export function createPairProvisioningSaga(
             const s2ip = (ctx8.server2IP as string) || context.server2?.ip || '';
             if (pw && s2ip) {
               context.log('[Step 8] Syncing zone files S1→S2 after LE certs...');
-              await syncZoneFiles(ssh1, s2ip, pw, [context.nsDomain, ...context.sendingDomains]).catch(() => {});
-              context.log('[Step 8] Zone sync complete');
+              try {
+                await syncZoneFiles(ssh1, s2ip, pw, [context.nsDomain, ...context.sendingDomains]);
+                context.log('[Step 8] Zone sync complete after LE certs');
+              } catch (syncErr) {
+                // Zone sync failure after LE is non-fatal (certs are already issued)
+                // but log it loudly for diagnostics — Hard Lesson #89: never .catch(() => {})
+                context.log(`[Step 8] WARNING: Post-LE zone sync failed: ${syncErr instanceof Error ? syncErr.message : String(syncErr)}. SOA serials may mismatch.`);
+              }
             }
           }
 

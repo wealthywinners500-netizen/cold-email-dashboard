@@ -1723,10 +1723,9 @@ export async function runVerificationChecks(
   }
 
   // Check 29: SSL self-signed check
-  // S2 sending domains intentionally use self-signed certs because LE multi-vantage
-  // validation fails with dual A records. Port 443 certs have ZERO effect on email
-  // deliverability — only ports 25/587/993 matter. Self-signed on S2 with correct
-  // CN is a pass, not an auto_fixable issue.
+  // All domains (S1 and S2) should have valid LE certs. Self-signed is always auto_fixable.
+  // The old S2 exception was STALE — written before the primaryIP fix eliminated dual A records.
+  // Self-signed certs cause MXToolbox "cert chain errors" on port 443.
   log('[VG] Running check 29: SSL self-signed check');
   for (const domain of allDomains) {
     const server = getServerForDomain(domain);
@@ -1744,26 +1743,17 @@ export async function runVerificationChecks(
       const issuerLine = output.split('\n').find((l) => l.includes('issuer='));
 
       if (subjectLine && issuerLine && subjectLine === issuerLine) {
-        // Self-signed cert detected
-        if (isS2Domain && subjectLine.includes(domain)) {
-          // S2 domain with correct CN — self-signed is expected and acceptable
-          results.push({
-            check: 'ssl_self_signed',
-            domain,
-            server,
-            status: 'pass',
-            details: `Certificate is self-signed (expected for S2 domain — LE dual A record limitation). CN matches ${domain}.`,
-          });
-        } else {
-          results.push({
-            check: 'ssl_self_signed',
-            domain,
-            server,
-            status: 'auto_fixable',
-            details: `Certificate is self-signed`,
-            fixAction: 'reissue_ssl',
-          });
-        }
+        // Self-signed cert on ANY domain is auto_fixable.
+        // S2 domains now have correct single A records so LE should work.
+        // Do NOT exempt S2 — self-signed certs cause MXToolbox cert chain errors.
+        results.push({
+          check: 'ssl_self_signed',
+          domain,
+          server,
+          status: 'auto_fixable',
+          details: `Certificate is self-signed (issuer matches subject). Needs LE cert.`,
+          fixAction: 'reissue_ssl',
+        });
       } else {
         results.push({
           check: 'ssl_self_signed',
@@ -1785,8 +1775,7 @@ export async function runVerificationChecks(
   }
 
   // Check 30: HTTPS connectivity
-  // S2 domains with self-signed certs will fail curl SSL verification — this is
-  // expected and cosmetic. Port 443 has zero effect on email deliverability.
+  // All domains should pass HTTPS. S2 domains now have valid LE certs (no more dual A records).
   log('[VG] Running check 30: HTTPS connectivity');
   for (const domain of allDomains) {
     const server = getServerForDomain(domain);
@@ -1807,22 +1796,14 @@ export async function runVerificationChecks(
           status: 'pass',
           details: `HTTPS connectivity successful: ${output}`,
         });
-      } else if (isS2Domain) {
-        // S2 domains have self-signed certs — curl SSL verification failure is expected
-        results.push({
-          check: 'https_connectivity',
-          domain,
-          server,
-          status: 'pass',
-          details: `HTTPS connectivity failed (expected for S2 self-signed cert — cosmetic, no email impact)`,
-        });
       } else {
+        // HTTPS failure on any domain — needs valid LE cert
         results.push({
           check: 'https_connectivity',
           domain,
           server,
           status: 'auto_fixable',
-          details: `HTTPS connectivity failed or no response`,
+          details: `HTTPS connectivity failed — needs valid LE cert`,
           fixAction: 'reissue_ssl',
         });
       }
