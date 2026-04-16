@@ -41,23 +41,34 @@ export async function persistPairCredentials(
   const { orgId, jobId, nsDomain, server1IP, server2IP, rootPassword } =
     params;
 
-  const passwordEncrypted = encrypt(rootPassword);
+  let passwordEncrypted: string;
+  try {
+    passwordEncrypted = encrypt(rootPassword);
+    console.log(`[persistCreds] Encryption OK for job ${jobId} (${passwordEncrypted.length} chars)`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[CRITICAL] ssh_credentials encrypt THREW for job ${jobId}: ${msg}`);
+    throw err;
+  }
 
-  await createSSHCredentials(orgId, {
-    server_ip: server1IP,
-    hostname: `mail1.${nsDomain}`,
-    username: "root",
-    password_encrypted: passwordEncrypted,
-    port: 22,
-    provisioning_job_id: jobId,
-  });
-
-  await createSSHCredentials(orgId, {
-    server_ip: server2IP,
-    hostname: `mail2.${nsDomain}`,
-    username: "root",
-    password_encrypted: passwordEncrypted,
-    port: 22,
-    provisioning_job_id: jobId,
-  });
+  for (const [serverIP, hostname, label] of [
+    [server1IP, `mail1.${nsDomain}`, "S1"],
+    [server2IP, `mail2.${nsDomain}`, "S2"],
+  ] as const) {
+    try {
+      const row = await createSSHCredentials(orgId, {
+        server_ip: serverIP,
+        hostname,
+        username: "root",
+        password_encrypted: passwordEncrypted,
+        port: 22,
+        provisioning_job_id: jobId,
+      });
+      console.log(`[persistCreds] SSH credentials saved: id=${row.id} for ${label} at ${serverIP} (job ${jobId})`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[CRITICAL] ssh_credentials insert FAILED for ${label} at ${serverIP} (job ${jobId}): ${msg}`);
+      throw err;
+    }
+  }
 }

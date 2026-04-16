@@ -348,20 +348,32 @@ export async function POST(
 
           // Create SSH credentials
           if (encryptedPassword) {
-            for (const [ip, hostname] of [
-              [server1IP, `mail1.${jobRow.ns_domain}`],
-              [server2IP, `mail2.${jobRow.ns_domain}`],
+            for (const [ip, hostname, label] of [
+              [server1IP, `mail1.${jobRow.ns_domain}`, "S1"],
+              [server2IP, `mail2.${jobRow.ns_domain}`, "S2"],
             ]) {
-              await supabase.from("ssh_credentials").insert({
-                org_id: dbOrgId,
-                server_ip: ip,
-                hostname,
-                username: "root",
-                password_encrypted: encryptedPassword,
-                port: 22,
-                provisioning_job_id: jobId,
-              });
+              const { data: credRow, error: credError } = await supabase
+                .from("ssh_credentials")
+                .insert({
+                  org_id: dbOrgId,
+                  server_ip: ip,
+                  hostname,
+                  username: "root",
+                  password_encrypted: encryptedPassword,
+                  port: 22,
+                  provisioning_job_id: jobId,
+                })
+                .select("id")
+                .single();
+
+              if (credError) {
+                console.error(`[CRITICAL] ssh_credentials insert FAILED for ${label} at ${ip} (job ${jobId}): ${JSON.stringify(credError)}`);
+              } else {
+                console.log(`[WorkerCallback] SSH credentials saved: id=${credRow.id} for ${label} at ${ip} (job ${jobId})`);
+              }
             }
+          } else {
+            console.error(`[CRITICAL] No encrypted password available for ssh_credentials insert (job ${jobId})`);
           }
 
           // Update server_pair total_accounts
