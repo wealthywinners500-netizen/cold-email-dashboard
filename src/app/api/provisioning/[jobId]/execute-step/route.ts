@@ -392,10 +392,7 @@ async function executeServerlessStep(
 
       const output = [...results, ...failures].join("\n");
       if (failures.length > 0) {
-        return {
-          output: `Verification completed with ${failures.length} issue(s):\n${output}`,
-          metadata: { failures, manualRequired: true },
-        };
+        throw new Error(`Verification gate failed with ${failures.length} issue(s):\n${failures.join("\n")}`);
       }
 
       return { output: `All verification checks passed:\n${output}` };

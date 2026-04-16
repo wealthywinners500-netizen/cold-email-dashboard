@@ -1588,15 +1588,34 @@ export function createPairProvisioningSaga(
             context.log(`[Step 9] Manual-required issues:\n${manualRequired.map(r => `  - ${r.check} on ${r.domain}: ${r.details}`).join('\n')}`);
           }
 
+          const vgMetadata = {
+            verificationResults,
+            autoFixableCount: autoFixable.length,
+            manualRequiredCount: manualRequired.length,
+            passCount: passing.length,
+          };
+
+          if (manualRequired.length > 0) {
+            return {
+              success: false,
+              error: `VG1: ${manualRequired.length} hard failures: ${manualRequired.map(r => r.check + ':' + r.domain).join(', ')}`,
+              metadata: vgMetadata,
+            };
+          }
+
+          if (autoFixable.length > 0) {
+            return {
+              success: true,
+              manualRequired: true,
+              output: `${outputSummary}\n\n${autoFixable.length} auto_fixable items for auto-fix step`,
+              metadata: vgMetadata,
+            };
+          }
+
           return {
             success: true,
             output: outputSummary,
-            metadata: {
-              verificationResults: verificationResults,
-              autoFixableCount: autoFixable.length,
-              manualRequiredCount: manualRequired.length,
-              passCount: passing.length,
-            },
+            metadata: vgMetadata,
           };
         } catch (err) {
           return {
@@ -1704,7 +1723,7 @@ export function createPairProvisioningSaga(
     // ========================================
     // Step 11: VERIFICATION_GATE_2 (~2-5 min)
     // Re-runs the same checks as VG1 to confirm fixes worked.
-    // Pass = done. Still failing = manualRequired: true.
+    // Pass = done. ANY failure = hard fail (success: false).
     // Max 2 passes total (VG1 + VG2), never loop.
     // ========================================
     {
@@ -1744,49 +1763,32 @@ export function createPairProvisioningSaga(
             `  ${manualRequired.length} manual-required`,
           ].join('\n');
 
-          // Determine final result
-          if (autoFixable.length === 0 && manualRequired.length === 0) {
-            // All checks pass — pair is fully operational
-            context.log('[Step 11] ALL checks passed. Pair is fully operational.');
-            return {
-              success: true,
-              output: `All ${verificationResults.length} verification checks passed. Pair is fully operational.`,
-              metadata: {
-                verificationResults,
-                finalStatus: 'clean',
-              },
-            };
-          } else if (autoFixable.length > 0) {
-            // Auto-fixable issues remain after auto-fix — this shouldn't happen
-            // but if it does, flag as manual required
-            context.log(`[Step 11] WARNING: ${autoFixable.length} auto-fixable issues remain after auto-fix. Flagging as manual-required.`);
-            if (manualRequired.length > 0) {
-              context.log(`[Step 11] Manual-required issues:\n${manualRequired.map(r => `  - ${r.check} on ${r.domain}: ${r.details}`).join('\n')}`);
+          const failedChecks = [...autoFixable, ...manualRequired];
+
+          if (failedChecks.length > 0) {
+            context.log(`[Step 11] VG2 FAILED: ${failedChecks.length} unresolved after auto-fix.`);
+            for (const r of failedChecks) {
+              context.log(`[Step 11]   ✗ ${r.check} on ${r.domain}: ${r.details}`);
             }
             return {
-              success: true,
-              manualRequired: true,
-              output: `${outputSummary}\n\nManual intervention required for remaining issues.`,
+              success: false,
+              error: `VG2: ${failedChecks.length} unresolved after auto-fix: ${failedChecks.map(r => r.check + ':' + r.domain).join(', ')}`,
               metadata: {
                 verificationResults,
-                finalStatus: 'manual_required',
-              },
-            };
-          } else {
-            // Only manual-required issues remain — pair works but has items
-            // Dean needs to address manually
-            context.log(`[Step 11] ${manualRequired.length} manual-required issues remain.`);
-            context.log(`[Step 11] Manual issues:\n${manualRequired.map(r => `  - ${r.check} on ${r.domain}: ${r.details}`).join('\n')}`);
-            return {
-              success: true,
-              manualRequired: true,
-              output: `${outputSummary}\n\nPair is operational but ${manualRequired.length} issue(s) require manual intervention.`,
-              metadata: {
-                verificationResults,
-                finalStatus: 'manual_required',
+                finalStatus: 'failed',
               },
             };
           }
+
+          context.log('[Step 11] ALL checks passed. Pair is fully operational.');
+          return {
+            success: true,
+            output: `All ${verificationResults.length} verification checks passed. Pair is fully operational.`,
+            metadata: {
+              verificationResults,
+              finalStatus: 'clean',
+            },
+          };
         } catch (err) {
           return {
             success: false,
