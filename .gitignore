@@ -32,3 +32,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# phase rollback backup folders (local only)
+.backup-pre-leads-phase-*
