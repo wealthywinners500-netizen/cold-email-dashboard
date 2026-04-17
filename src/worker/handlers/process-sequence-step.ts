@@ -1,4 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
+import seedrandom from "seedrandom";
 import { sendEmail } from "../../lib/email/smtp-manager";
 import { renderTemplate } from "../../lib/email/template-renderer";
 import { prepareEmail, type TrackingOptions } from "../../lib/email/email-preparer";
@@ -12,6 +13,7 @@ import {
 } from "../../lib/email/smart-sending";
 import { selectFallbackAccount } from "../../lib/email/fallback-account";
 import { buildReplyHeaders, type HistoryEntry } from "../../lib/email/threading";
+import { renderSpintax } from "../../lib/spintax";
 import { randomUUID } from "crypto";
 
 function getSupabase() {
@@ -288,9 +290,18 @@ export async function handleProcessSequenceStep(
     custom_fields: recipient.custom_fields || {},
   };
 
-  const renderedSubject = renderTemplate(subject, templateData);
-  const renderedHtml = renderTemplate(bodyHtml, templateData);
-  const renderedText = bodyText ? renderTemplate(bodyText, templateData) : undefined;
+  // Phase 3: spintax BEFORE template. Spintax resolves {{RANDOM | a | b}}
+  // branches (which may themselves contain {{first_name}} — those pass
+  // through untouched for the template renderer that follows). Seeded on
+  // (recipientId, stepNumber) so pg-boss retries produce identical output.
+  const rng = seedrandom(`${recipientId}:${stepNumber}`);
+  const spunSubject = renderSpintax(subject, rng);
+  const spunHtml = renderSpintax(bodyHtml, rng);
+  const spunText = bodyText ? renderSpintax(bodyText, rng) : undefined;
+
+  const renderedSubject = renderTemplate(spunSubject, templateData);
+  const renderedHtml = renderTemplate(spunHtml, templateData);
+  const renderedText = spunText ? renderTemplate(spunText, templateData) : undefined;
 
   // 8. Threading — real-reply headers (In-Reply-To + full References chain).
   // Parent subject is step 0's subject from the sequence; fall back to this

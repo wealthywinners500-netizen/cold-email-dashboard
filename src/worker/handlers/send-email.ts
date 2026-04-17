@@ -1,6 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
+import seedrandom from "seedrandom";
 import { sendEmail } from "../../lib/email/smtp-manager";
-import { renderTemplate, renderSubjectLine } from "../../lib/email/template-renderer";
+import { renderTemplate } from "../../lib/email/template-renderer";
 import { prepareEmail, type TrackingOptions } from "../../lib/email/email-preparer";
 import {
   normalizeSchedule,
@@ -8,6 +9,7 @@ import {
   getEffectiveCap,
 } from "../../lib/email/smart-sending";
 import { selectFallbackAccount } from "../../lib/email/fallback-account";
+import { renderSpintax } from "../../lib/spintax";
 import { randomUUID } from "crypto";
 import { handleSmtpError } from "../../lib/email/error-handler";
 
@@ -149,12 +151,24 @@ export async function handleSendEmail(payload: SendEmailPayload): Promise<void> 
     custom_fields: recipient.custom_fields || {},
   };
 
-  const subjectLines = Array.isArray(campaign.subject_lines)
+  const subjectLines: string[] = Array.isArray(campaign.subject_lines)
     ? campaign.subject_lines
     : [];
-  const subject = renderSubjectLine(subjectLines, templateData);
-  const html = renderTemplate(campaign.body_html || "", templateData);
-  const text = campaign.body_text ? renderTemplate(campaign.body_text, templateData) : undefined;
+  // Phase 3: deterministic RNG seeded on recipientId (single-shot — no step
+  // concept here). Subject pick, spintax, then template substitution in that
+  // order so spintax branches containing {{first_name}} still template.
+  const rng = seedrandom(recipientId);
+  const pickedSubject =
+    subjectLines.length > 0
+      ? subjectLines[Math.floor(rng() * subjectLines.length)]
+      : "";
+  const spunSubject = renderSpintax(pickedSubject, rng);
+  const spunHtml = renderSpintax(campaign.body_html || "", rng);
+  const spunText = campaign.body_text ? renderSpintax(campaign.body_text, rng) : undefined;
+
+  const subject = renderTemplate(spunSubject, templateData);
+  const html = renderTemplate(spunHtml, templateData);
+  const text = spunText ? renderTemplate(spunText, templateData) : undefined;
 
   // 5. Generate tracking ID
   const trackingId = randomUUID();
