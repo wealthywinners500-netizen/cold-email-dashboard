@@ -1,7 +1,8 @@
 import { auth } from "@clerk/nextjs/server";
 import { createAdminClient } from "@/lib/supabase/server";
 import { NextRequest, NextResponse } from "next/server";
-import { verifyBatch } from "@/lib/leads/verification-service";
+import { verifyBatchFallback, mapReoonStatus, type ReoonResult } from "@/lib/leads/verification-service";
+import { shouldDropByPrefix } from "@/lib/leads/prefix-filter";
 import { rateLimit } from "@/lib/rate-limit";
 
 async function getInternalOrgId(): Promise<string | null> {
@@ -17,7 +18,6 @@ async function getInternalOrgId(): Promise<string | null> {
 }
 
 export async function POST(request: NextRequest) {
-  // Rate limit: 20 requests per IP per minute
   const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
   if (!rateLimit(`verify:${ip}`, 20)) {
     return NextResponse.json(
@@ -25,7 +25,6 @@ export async function POST(request: NextRequest) {
       { status: 429, headers: { "Cache-Control": "no-store" } }
     );
   }
-
 
   const orgId = await getInternalOrgId();
   if (!orgId) {
@@ -41,7 +40,6 @@ export async function POST(request: NextRequest) {
 
     const supabase = await createAdminClient();
 
-    // Get organization integrations
     const { data: org, error: orgError } = await supabase
       .from("organizations")
       .select("integrations")
@@ -55,7 +53,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Extract Reoon API key
+    // TODO(phase-3): wrap in getDecryptedKey (BYOK via AES-256-GCM).
     const reoon_api_key = org.integrations?.reoon_api_key;
     if (!reoon_api_key) {
       return NextResponse.json(
@@ -67,10 +65,9 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Fetch contacts based on contact_ids or filter
     let contactsQuery = supabase
       .from("lead_contacts")
-      .select()
+      .select("id, email")
       .eq("org_id", orgId);
 
     if (contact_ids && contact_ids.length > 0) {
@@ -96,76 +93,113 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Get emails and filter out nulls
-    const emails = contacts
-      .filter((c: { id: string; email: string | null }) => c.email)
-      .map((c: { id: string; email: string | null }) => ({ id: c.id, email: c.email as string }));
-
-    if (emails.length === 0) {
+    if (contacts.length === 0) {
       return NextResponse.json(
-        { verified: 0, valid: 0, invalid: 0, risky: 0 },
+        { verified: 0, valid: 0, invalid: 0, risky: 0, role_account: 0, catch_all: 0, unknown: 0, suppressed: 0, prefix_dropped: 0 },
         { headers: { "Cache-Control": "no-store" } }
       );
     }
 
-    // Guard: max 5000 contacts per request
-    if (emails.length > 5000) {
+    if (contacts.length > 5000) {
       return NextResponse.json(
         { error: "Maximum 5000 contacts per verification request" },
         { status: 400, headers: { "Cache-Control": "no-store" } }
       );
     }
 
-    // Verify batch
-    const verificationResults = await verifyBatch(
-      reoon_api_key,
-      emails.map((e: { id: string; email: string }) => e.email)
-    );
-
-    // Build email-to-result map
-    const resultMap = new Map<string, string>();
-    for (const r of verificationResults) {
-      resultMap.set(r.email, r.email_status);
-    }
-
-    // Update contacts with verification results — batched for performance
     const now = new Date().toISOString();
-    let validCount = 0;
-    let invalidCount = 0;
-    let riskyCount = 0;
 
-    const updates = emails.map(({ id, email }: { id: string; email: string }) => {
-      const status = resultMap.get(email) || 'unknown';
-      if (status === 'valid') validCount++;
-      else if (status === 'invalid') invalidCount++;
-      else if (status === 'risky') riskyCount++;
-      return { id, status };
-    });
-
-    // Batch updates in chunks of 50 with Promise.all
-    const BATCH_SIZE = 50;
-    for (let i = 0; i < updates.length; i += BATCH_SIZE) {
-      const batch = updates.slice(i, i + BATCH_SIZE);
-      await Promise.all(
-        batch.map(({ id, status }) =>
-          supabase
-            .from("lead_contacts")
-            .update({
-              email_status: status,
-              verified_at: now,
-              verification_source: "reoon",
-            })
-            .eq("id", id)
-        )
-      );
+    // Pre-filter: drop null emails + drop-prefix emails (saves Reoon credits).
+    const emailToIds = new Map<string, string>();
+    const toDrop: string[] = [];
+    for (const c of contacts as { id: string; email: string | null }[]) {
+      if (!c.email || shouldDropByPrefix(c.email)) {
+        toDrop.push(c.id);
+        continue;
+      }
+      emailToIds.set(c.email, c.id);
     }
 
+    if (toDrop.length) {
+      await supabase
+        .from("lead_contacts")
+        .update({
+          email_status: "invalid",
+          verified_at: now,
+          verification_source: "prefix_filter",
+        })
+        .in("id", toDrop);
+    }
+
+    const emails = [...emailToIds.keys()];
+
+    // Small batch → parallel single. Large batch → chunked fallback until
+    // Phase 6 wires async verify_jobs polling on top of verifyBulkCreate.
+    let results: ReoonResult[];
+    if (emails.length <= 50) {
+      results = await verifyBatchFallback(reoon_api_key, emails);
+    } else {
+      results = [];
+      for (let i = 0; i < emails.length; i += 50) {
+        results.push(
+          ...(await verifyBatchFallback(reoon_api_key, emails.slice(i, i + 50)))
+        );
+      }
+    }
+
+    const counts = {
+      valid: 0,
+      role_account: 0,
+      catch_all: 0,
+      invalid: 0,
+      unknown: 0,
+      suppressed: 0,
+    };
+
+    for (const r of results) {
+      const id = emailToIds.get(r.email);
+      if (!id) continue;
+      const m = mapReoonStatus(r.status);
+      counts[m.email_status] = (counts[m.email_status] ?? 0) + 1;
+
+      await supabase
+        .from("lead_contacts")
+        .update({
+          email_status: m.email_status,
+          reoon_raw_status: r.status,
+          reoon_overall_score: r.overall_score ?? null,
+          reoon_is_role_account: !!r.is_role_account,
+          reoon_is_catch_all: !!r.is_catch_all,
+          reoon_verified_at: now,
+          verified_at: now,
+          verification_source: "reoon",
+        })
+        .eq("id", id);
+
+      if (m.auto_suppress) {
+        await supabase
+          .from("suppression_list")
+          .upsert(
+            {
+              org_id: orgId,
+              email: r.email,
+              reason: "reoon_spamtrap",
+              source: "verify",
+            },
+            { onConflict: "org_id,email", ignoreDuplicates: true }
+          );
+        counts.suppressed++;
+      }
+    }
+
+    // `risky: 0` kept for backwards-compat with lead-contacts-client.tsx toast;
+    // Phase 5 redesigns that UI and drops the field.
     return NextResponse.json(
       {
         verified: emails.length,
-        valid: validCount,
-        invalid: invalidCount,
-        risky: riskyCount,
+        prefix_dropped: toDrop.length,
+        risky: 0,
+        ...counts,
       },
       { headers: { "Cache-Control": "no-store" } }
     );
