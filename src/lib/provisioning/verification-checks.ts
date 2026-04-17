@@ -48,9 +48,13 @@ export async function runVerificationChecks(
     return server === 'S1' ? server1IP : server2IP;
   };
 
-  // DNS resolvers to check against
-  const resolvers = ['8.8.8.8', '1.1.1.1', '9.9.9.9'];
-  const primaryResolver = '8.8.8.8';
+  // DNS resolvers: query our own authoritative NS first (records are guaranteed
+  // present since Steps 5-7 just created them), fall back to public resolvers
+  // only for checks that must verify global propagation. Using 8.8.8.8 as the
+  // primary caused 34 false failures when NS delegation hadn't propagated yet.
+  const authoritativeResolver = server1IP; // S1 is ns1 — the primary authoritative NS
+  const resolvers = [server1IP, server2IP, '8.8.8.8'];
+  const primaryResolver = authoritativeResolver;
 
   // ============================================================================
   // CATEGORY 1: DNS Record Checks (1-10)

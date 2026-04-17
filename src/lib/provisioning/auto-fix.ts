@@ -537,13 +537,33 @@ async function reissueSSL(
   const targetIP = isS2 ? params.server2IP : params.server1IP;
 
   if (!isS2) {
-    // ---- S1 domain: straightforward LE issuance on S1 ----
+    // ---- S1 domain: LE issuance on S1 with retry loop ----
     await ensureWebDomain(ssh1, domain, 'S1', params.log);
 
-    await ssh1.exec(
-      `${HESTIA_PATH_PREFIX}v-add-letsencrypt-domain admin ${domain} '' yes`,
-      { timeout: 120000 }
-    );
+    const maxRetries = 5;
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        await ssh1.exec(
+          `${HESTIA_PATH_PREFIX}v-add-letsencrypt-domain admin ${domain} '' yes`,
+          { timeout: 120000 }
+        );
+        params.log(`[Auto-Fix] reissue_ssl/S1: LE cert issued for ${domain} (attempt ${attempt})`);
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < maxRetries) {
+          params.log(`[Auto-Fix] reissue_ssl/S1: LE attempt ${attempt}/${maxRetries} failed for ${domain}, retrying in 60s...`);
+          await new Promise(r => setTimeout(r, 60000));
+        }
+      }
+    }
+    if (lastErr) {
+      throw new Error(
+        `reissue_ssl/S1: LE cert failed for ${domain} after ${maxRetries} attempts: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`
+      );
+    }
 
     await ssh1.exec(
       `${HESTIA_PATH_PREFIX}v-rebuild-web-domain admin ${domain}`,
@@ -613,21 +633,35 @@ async function reissueSSL(
   // resolve to S2's IP, so LE HTTP-01 validation should succeed.
   const certDir = `/home/admin/conf/web/${domain}/ssl`;
 
-  try {
-    // Brief delay for DNS propagation
-    await new Promise(resolve => setTimeout(resolve, 3000));
-    await ssh2.exec(
-      `${HESTIA_PATH_PREFIX}v-add-letsencrypt-domain admin ${domain} '' yes`,
-      { timeout: 120000 }
-    );
-    // Verify cert was actually created (LE can exit 0 without creating files)
-    await ssh2.exec(`test -f ${certDir}/${domain}.crt && test -f ${certDir}/${domain}.key`, { timeout: 10000 });
-    params.log(`[Auto-Fix] reissue_ssl/S2: LE cert issued for ${domain}`);
-  } catch (leErr) {
+  const maxRetries = 5;
+  let lastLeErr: unknown;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      if (attempt === 1) {
+        // Brief delay on first attempt for DNS propagation
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+      await ssh2.exec(
+        `${HESTIA_PATH_PREFIX}v-add-letsencrypt-domain admin ${domain} '' yes`,
+        { timeout: 120000 }
+      );
+      // Verify cert was actually created (LE can exit 0 without creating files)
+      await ssh2.exec(`test -f ${certDir}/${domain}.crt && test -f ${certDir}/${domain}.key`, { timeout: 10000 });
+      params.log(`[Auto-Fix] reissue_ssl/S2: LE cert issued for ${domain} (attempt ${attempt})`);
+      lastLeErr = null;
+      break;
+    } catch (err) {
+      lastLeErr = err;
+      if (attempt < maxRetries) {
+        params.log(`[Auto-Fix] reissue_ssl/S2: LE attempt ${attempt}/${maxRetries} failed for ${domain}, retrying in 60s...`);
+        await new Promise(r => setTimeout(r, 60000));
+      }
+    }
+  }
+  if (lastLeErr) {
     // DO NOT fall back to self-signed — it causes MXToolbox cert chain errors.
-    // Propagate the failure so it's visible as a real issue.
     throw new Error(
-      `reissue_ssl/S2: LE cert failed for ${domain} (no self-signed fallback): ${leErr instanceof Error ? leErr.message : String(leErr)}`
+      `reissue_ssl/S2: LE cert failed for ${domain} after ${maxRetries} attempts (no self-signed fallback): ${lastLeErr instanceof Error ? lastLeErr.message : String(lastLeErr)}`
     );
   }
 
@@ -999,9 +1033,13 @@ export async function runAutoFixes(
           await fixARecord(ssh1, ssh2, issue.domain, params.server1IP, params.server1IP, params.server2IP, params);
           break;
 
-        case 'add_webmail_a':
-          await addWebmailA(ssh1, ssh2, issue.domain, params.server1IP, params.server2IP, params);
+        case 'add_webmail_a': {
+          // issue.domain may be "webmail.nelita.info" or "mail.nelita.info" —
+          // strip the subdomain prefix to get the zone name for HestiaCP commands
+          const baseDomain = issue.domain.replace(/^(webmail|mail)\./, '');
+          await addWebmailA(ssh1, ssh2, baseDomain, params.server1IP, params.server2IP, params);
           break;
+        }
 
         case 'fix_mx':
           await fixMX(ssh1, ssh2, issue.domain, params);
