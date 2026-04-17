@@ -431,6 +431,7 @@ export type Database = {
           last_error: string | null;
           last_sent_at: string | null;
           sync_state: Record<string, unknown>;
+          tags: string[];
           created_at: string;
           updated_at: string;
         };
@@ -455,6 +456,7 @@ export type Database = {
           last_error?: string | null;
           last_sent_at?: string | null;
           sync_state?: Record<string, unknown>;
+          tags?: string[];
           created_at?: string;
           updated_at?: string;
         };
@@ -479,6 +481,7 @@ export type Database = {
           last_error?: string | null;
           last_sent_at?: string | null;
           sync_state?: Record<string, unknown>;
+          tags?: string[];
           created_at?: string;
           updated_at?: string;
         };
@@ -959,6 +962,61 @@ export type Database = {
           updated_at?: string;
         };
       };
+      thread_tags: {
+        Row: {
+          id: number;
+          org_id: string;
+          thread_id: number;
+          tag: string;
+          applied_by_user_id: string | null;
+          applied_at: string;
+        };
+        Insert: {
+          id?: number;
+          org_id: string;
+          thread_id: number;
+          tag: string;
+          applied_by_user_id?: string | null;
+          applied_at?: string;
+        };
+        Update: {
+          id?: number;
+          org_id?: string;
+          thread_id?: number;
+          tag?: string;
+          applied_by_user_id?: string | null;
+          applied_at?: string;
+        };
+      };
+      autosender_training: {
+        Row: {
+          id: number;
+          org_id: string;
+          classification: string;
+          inbound_body: string;
+          dean_reply_body: string;
+          inbound_message_id: number | null;
+          created_at: string;
+        };
+        Insert: {
+          id?: number;
+          org_id: string;
+          classification: string;
+          inbound_body: string;
+          dean_reply_body: string;
+          inbound_message_id?: number | null;
+          created_at?: string;
+        };
+        Update: {
+          id?: number;
+          org_id?: string;
+          classification?: string;
+          inbound_body?: string;
+          dean_reply_body?: string;
+          inbound_message_id?: number | null;
+          created_at?: string;
+        };
+      };
     };
   };
 };
@@ -985,6 +1043,7 @@ export interface EmailAccount {
   last_error: string | null;
   last_sent_at: string | null;
   sync_state: Record<string, unknown>;
+  tags: string[];
   created_at: string;
   updated_at: string;
 }
@@ -1441,4 +1500,27 @@ export interface SSHCredentialRow {
   provisioning_job_id: string | null;
   created_at: string;
   updated_at: string;
+}
+
+// ============================================
+// Campaigns v2 (migration 015)
+// ============================================
+
+export interface ThreadTag {
+  id: number;
+  org_id: string;
+  thread_id: number;
+  tag: string;
+  applied_by_user_id: string | null;
+  applied_at: string;
+}
+
+export interface AutosenderTraining {
+  id: number;
+  org_id: string;
+  classification: string;
+  inbound_body: string;
+  dean_reply_body: string;
+  inbound_message_id: number | null;
+  created_at: string;
 }
