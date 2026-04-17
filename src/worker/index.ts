@@ -124,7 +124,12 @@ async function main() {
   // for the Vercel app's domain-blacklist helper to fall back to whenever
   // the primary Spamhaus DQS check returns 'unknown'. Auth via the shared
   // WORKER_CALLBACK_SECRET that's already used for the worker callback.
-  const blacklistServer = startBlacklistProxy();
+  //
+  // Phase 6A: gate on ops role. The send-worker lives on a Linode cloud IP
+  // which is DBL-blocked identically to Vercel's cloud IPs, so a fallback
+  // listener there would give Vercel a useless second endpoint. Only the
+  // ops VPS's non-cloud IP can answer these queries.
+  const blacklistServer = OPS_SIDE_EFFECTS_ENABLED ? startBlacklistProxy() : null;
 
   // Create all queues (required by pg-boss v12+)
   const queueNames = [
@@ -157,17 +162,27 @@ async function main() {
   console.log("[Worker] All queues created");
 
   // --- Heartbeat: pulse every 60 seconds for all orgs ---
-  const heartbeatInterval = setInterval(async () => {
-    try {
-      const supabase = getSupabase();
-      const { data: orgs } = await supabase.from("organizations").select("id");
-      for (const org of orgs || []) {
-        await updateWorkerHeartbeat(org.id);
-      }
-    } catch (err) {
-      console.error("[Worker] Heartbeat failed:", err);
-    }
-  }, 60000);
+  //
+  // Phase 6A: gate on ops role. This legacy per-org heartbeat predates the
+  // infra-level worker_heartbeats upsert added in Edit 4 below. Leaving it
+  // on both roles would double the write volume to every org row AND create
+  // dual-source ambiguity (two stores that could disagree about whether a
+  // worker is alive). Keep it ops-only to preserve pre-6A write volume; the
+  // new worker_heartbeats table is the infra-level source of truth for
+  // "which workers are alive" across both roles.
+  const heartbeatInterval = OPS_SIDE_EFFECTS_ENABLED
+    ? setInterval(async () => {
+        try {
+          const supabase = getSupabase();
+          const { data: orgs } = await supabase.from("organizations").select("id");
+          for (const org of orgs || []) {
+            await updateWorkerHeartbeat(org.id);
+          }
+        } catch (err) {
+          console.error("[Worker] Heartbeat failed:", err);
+        }
+      }, 60000)
+    : null;
 
   // --- Error handling wrapper ---
   function withErrorHandling<T extends Record<string, any>>(
@@ -970,7 +985,7 @@ async function main() {
   // Graceful shutdown
   const shutdown = async (signal: string) => {
     console.log(`[Worker] Received ${signal}, shutting down...`);
-    clearInterval(heartbeatInterval);
+    if (heartbeatInterval) clearInterval(heartbeatInterval);
     clearInterval(infraHeartbeatInterval);
     if (blacklistServer) {
       await new Promise<void>((resolve) => blacklistServer.close(() => resolve()));
