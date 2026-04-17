@@ -7,8 +7,11 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { SequenceStepEditor } from "@/components/sequence/sequence-step-editor";
 import { SequenceFlowDiagram } from "@/components/sequence/sequence-flow-diagram";
+import { SubsequenceTriggerEditor } from "@/components/sequence/subsequence-trigger-editor";
+import { CreateSubsequenceModal } from "@/components/modals/create-subsequence-modal";
+import { Button } from "@/components/ui/button";
 import { isFeatureEnabledSync } from "@/lib/featureFlags";
-import { Users, Mail, MessageCircle, AlertCircle, Eye, MousePointerClick, UserMinus, BarChart3, TrendingUp } from "lucide-react";
+import { Trash2, Users, Mail, MessageCircle, AlertCircle, Eye, MousePointerClick, UserMinus, BarChart3, TrendingUp } from "lucide-react";
 import {
   LineChart,
   Line,
@@ -97,39 +100,64 @@ export default function CampaignDetailClient({
   // Flag-off path still reads from `sequences` (the prop) to preserve identity.
   const [localSequences, setLocalSequences] = useState<CampaignSequence[]>(sequences);
 
-  // Per-sequence debounce timers for the PATCH save.
+  // Per-sequence debounce timers + pending-patch buffer. Phase 5 fix (v2):
+  // previously we had TWO debounced savers (steps and partial-patch) sharing
+  // one timer map — a clearTimeout on the second edit silently dropped the
+  // first patch's fields if they were of a different shape. The merged-patch
+  // queue below guarantees rapid edits within the 800ms window collapse into
+  // a single PATCH whose body is the union of all queued fields. On unmount
+  // we clear timers and intentionally discard pending patches (same behavior
+  // as the previous implementation — acceptable because the user still has
+  // local state in front of them; forced reload is the sole foot-gun).
   const saveTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const pendingPatches = useRef<Record<string, Partial<CampaignSequence>>>({});
   const [savingSeqId, setSavingSeqId] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
 
-  const saveSequenceSteps = useCallback(
-    (seqId: string, newSteps: SequenceStep[]) => {
-      if (saveTimers.current[seqId]) clearTimeout(saveTimers.current[seqId]);
-      saveTimers.current[seqId] = setTimeout(async () => {
-        setSavingSeqId(seqId);
-        setSaveError(null);
-        try {
-          const resp = await fetch(
-            `/api/campaigns/${campaign.id}/sequences/${seqId}`,
-            {
-              method: "PATCH",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ steps: newSteps }),
-            }
-          );
-          if (!resp.ok) {
-            const err = await resp.json().catch(() => ({}));
-            setSaveError(err?.error ?? "Failed to save sequence");
-            return;
+  const [createModalOpen, setCreateModalOpen] = useState(false);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  const flushPatch = useCallback(
+    async (seqId: string) => {
+      const patch = pendingPatches.current[seqId];
+      if (!patch || Object.keys(patch).length === 0) return;
+      delete pendingPatches.current[seqId];
+      setSavingSeqId(seqId);
+      setSaveError(null);
+      try {
+        const resp = await fetch(
+          `/api/campaigns/${campaign.id}/sequences/${seqId}`,
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(patch),
           }
-        } catch (e) {
-          setSaveError("Network error saving sequence");
-        } finally {
-          setSavingSeqId(null);
+        );
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          setSaveError(err?.error ?? "Failed to save sequence");
+          return;
         }
-      }, 800);
+      } catch {
+        setSaveError("Network error saving sequence");
+      } finally {
+        setSavingSeqId(null);
+      }
     },
     [campaign.id]
+  );
+
+  const queuePatch = useCallback(
+    (seqId: string, patch: Partial<CampaignSequence>) => {
+      pendingPatches.current[seqId] = {
+        ...pendingPatches.current[seqId],
+        ...patch,
+      };
+      if (saveTimers.current[seqId]) clearTimeout(saveTimers.current[seqId]);
+      saveTimers.current[seqId] = setTimeout(() => flushPatch(seqId), 800);
+    },
+    [flushPatch]
   );
 
   const onSequenceStepsChange = useCallback(
@@ -137,10 +165,52 @@ export default function CampaignDetailClient({
       setLocalSequences((prev) =>
         prev.map((s) => (s.id === seqId ? { ...s, steps: newSteps } : s))
       );
-      saveSequenceSteps(seqId, newSteps);
+      queuePatch(seqId, { steps: newSteps });
     },
-    [saveSequenceSteps]
+    [queuePatch]
   );
+
+  const onSubsequenceFieldChange = useCallback(
+    (seqId: string, patch: Partial<CampaignSequence>) => {
+      setLocalSequences((prev) =>
+        prev.map((s) => (s.id === seqId ? { ...s, ...patch } : s))
+      );
+      queuePatch(seqId, patch);
+    },
+    [queuePatch]
+  );
+
+  const handleDeleteSubsequence = useCallback(
+    async (seqId: string) => {
+      setDeleteError(null);
+      try {
+        const resp = await fetch(
+          `/api/campaigns/${campaign.id}/sequences/${seqId}`,
+          { method: "DELETE" }
+        );
+        if (!resp.ok) {
+          const body = await resp.json().catch(() => ({}));
+          if (typeof body?.count === "number" && body.count > 0) {
+            setDeleteError(
+              `Cannot delete — ${body.count} active lead${body.count === 1 ? "" : "s"} in this subsequence.`
+            );
+          } else {
+            setDeleteError(body?.error ?? "Failed to delete subsequence");
+          }
+          return;
+        }
+        setLocalSequences((prev) => prev.filter((s) => s.id !== seqId));
+        setPendingDeleteId(null);
+      } catch {
+        setDeleteError("Network error deleting subsequence");
+      }
+    },
+    [campaign.id]
+  );
+
+  const handleCreatedSubsequence = useCallback((seq: CampaignSequence) => {
+    setLocalSequences((prev) => [...prev, seq]);
+  }, []);
 
   useEffect(() => {
     // Capture current timer map at effect-setup time so the cleanup closure
@@ -211,6 +281,14 @@ export default function CampaignDetailClient({
           >
             Analytics
           </Tabs.Trigger>
+          {v2 && (
+            <Tabs.Trigger
+              value="follow-ups"
+              className="px-4 py-3 text-sm font-medium text-gray-400 hover:text-white transition-colors data-[state=active]:text-white data-[state=active]:border-b-2 data-[state=active]:border-blue-600"
+            >
+              Follow-Ups
+            </Tabs.Trigger>
+          )}
         </Tabs.List>
 
         {/* Overview Tab */}
@@ -789,6 +867,166 @@ export default function CampaignDetailClient({
             </Card>
           )}
         </Tabs.Content>
+
+        {/* Phase 5: Follow-Ups tab — subsequence CRUD + trigger editor. Entire
+            panel is flag-gated (the Tabs.Trigger is also gated above) so the
+            flag-off detail page renders pixel-identical to phase-4. */}
+        {v2 && (
+          <Tabs.Content value="follow-ups" className="space-y-6 pt-6">
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-semibold text-white">
+                Follow-Up Subsequences
+              </h3>
+              <Button
+                type="button"
+                onClick={() => setCreateModalOpen(true)}
+                className="bg-blue-600 hover:bg-blue-700 text-white"
+              >
+                + New follow-up subsequence
+              </Button>
+            </div>
+
+            {subsequences.length === 0 ? (
+              <Card className="bg-gray-900 border-gray-800">
+                <CardContent className="p-8 text-center text-gray-400">
+                  No follow-up subsequences yet. Click{" "}
+                  <em>New follow-up subsequence</em> to create one.
+                </CardContent>
+              </Card>
+            ) : (
+              <div className="space-y-6">
+                {subsequences.map((seq) => (
+                  <Card key={seq.id} className="bg-gray-900 border-gray-800">
+                    <CardHeader>
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="flex-1 space-y-3">
+                          <div>
+                            <label className="block text-xs text-gray-400 mb-1">
+                              Name
+                            </label>
+                            <input
+                              type="text"
+                              value={seq.name}
+                              onChange={(e) =>
+                                onSubsequenceFieldChange(seq.id, {
+                                  name: e.target.value,
+                                })
+                              }
+                              className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-xs text-gray-400 mb-1">
+                              Persona
+                            </label>
+                            <input
+                              type="text"
+                              value={seq.persona ?? ""}
+                              onChange={(e) =>
+                                onSubsequenceFieldChange(seq.id, {
+                                  persona: e.target.value,
+                                })
+                              }
+                              className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white"
+                            />
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setPendingDeleteId(seq.id);
+                            setDeleteError(null);
+                          }}
+                          className="px-3 py-2 text-sm bg-red-900 hover:bg-red-800 text-red-200 rounded-lg flex items-center gap-2"
+                        >
+                          <Trash2 size={14} />
+                          Delete
+                        </button>
+                      </div>
+                    </CardHeader>
+
+                    <CardContent className="space-y-6">
+                      <SubsequenceTriggerEditor
+                        trigger_event={seq.trigger_event}
+                        trigger_condition={seq.trigger_condition}
+                        trigger_priority={seq.trigger_priority}
+                        persona={seq.persona}
+                        onChange={(cfg) =>
+                          onSubsequenceFieldChange(seq.id, {
+                            trigger_event: cfg.trigger_event,
+                            trigger_condition: cfg.trigger_condition,
+                            trigger_priority: cfg.trigger_priority,
+                            persona: cfg.persona,
+                          })
+                        }
+                      />
+
+                      <div>
+                        <h4 className="text-sm font-semibold text-white mb-3">
+                          Steps
+                        </h4>
+                        <SequenceStepEditor
+                          steps={seq.steps}
+                          onChange={(newSteps) =>
+                            onSequenceStepsChange(seq.id, newSteps)
+                          }
+                          readOnly={false}
+                        />
+                      </div>
+
+                      {savingSeqId === seq.id && (
+                        <div className="text-xs text-gray-400">Saving…</div>
+                      )}
+                      {saveError && savingSeqId === null && (
+                        <div className="text-xs text-red-400">
+                          Save failed: {saveError}
+                        </div>
+                      )}
+
+                      {pendingDeleteId === seq.id && (
+                        <div className="rounded border border-red-800 bg-red-950/40 p-4 space-y-3">
+                          <p className="text-sm text-red-200">
+                            Delete subsequence <strong>{seq.name}</strong>? This
+                            cannot be undone.
+                          </p>
+                          {deleteError && (
+                            <p className="text-xs text-red-300">{deleteError}</p>
+                          )}
+                          <div className="flex gap-2">
+                            <Button
+                              type="button"
+                              onClick={() => handleDeleteSubsequence(seq.id)}
+                              className="bg-red-600 hover:bg-red-700 text-white"
+                            >
+                              Confirm delete
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              onClick={() => {
+                                setPendingDeleteId(null);
+                                setDeleteError(null);
+                              }}
+                            >
+                              Cancel
+                            </Button>
+                          </div>
+                        </div>
+                      )}
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
+            )}
+
+            <CreateSubsequenceModal
+              open={createModalOpen}
+              onOpenChange={setCreateModalOpen}
+              campaignId={campaign.id}
+              onCreated={handleCreatedSubsequence}
+            />
+          </Tabs.Content>
+        )}
       </Tabs.Root>
     </div>
   );
