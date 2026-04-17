@@ -5,7 +5,71 @@ import { HESTIA_PATH_PREFIX, HESTIA_FULL_PATH } from './hestia-scripts';
 /**
  * Auto-fix module for cold email server provisioning.
  * Reads verification results and applies automated fixes for auto_fixable issues.
+ *
+ * Two-phase execution (Hard Lesson from Test #25 / #26):
+ *   Phase 1: DNS record fixes (DMARC, SPF, CAA, MX, A records, DKIM, etc.)
+ *   Phase 2: SSL cert issuance (requires public DNS propagation of Phase 1 records)
+ *
+ * Between phases, a DNS propagation poll waits up to 30 min for public resolvers
+ * (8.8.8.8, 1.1.1.1) to see the domains. Without this wait, LE HTTP-01 validation
+ * fails because LE queries public DNS which still has stale/NXDOMAIN responses
+ * from before NS delegation propagated.
  */
+
+const DNS_PROPAGATION_MAX_MS = 30 * 60 * 1000; // 30 minutes
+const DNS_PROPAGATION_POLL_MS = 30 * 1000; // 30 seconds
+
+/**
+ * Poll public DNS resolvers until at least one sending domain resolves to
+ * the expected IP, proving NS delegation has propagated globally. LE's
+ * multi-vantage validation needs this before HTTP-01 can succeed.
+ */
+async function waitForPublicDNSPropagation(
+  ssh: SSHManager,
+  domains: string[],
+  getExpectedIP: (domain: string) => string,
+  log: (msg: string) => void
+): Promise<void> {
+  if (domains.length === 0) return;
+
+  const testDomain = domains[0];
+  const expectedIP = getExpectedIP(testDomain);
+  const resolvers = ['8.8.8.8', '1.1.1.1'];
+  const start = Date.now();
+
+  log(`[Auto-Fix] Waiting for public DNS propagation (testing ${testDomain} → ${expectedIP} on ${resolvers.join(', ')})...`);
+
+  while (Date.now() - start < DNS_PROPAGATION_MAX_MS) {
+    let confirmedCount = 0;
+    for (const resolver of resolvers) {
+      try {
+        const { stdout } = await ssh.exec(
+          `dig +short ${testDomain} A @${resolver} 2>/dev/null`,
+          { timeout: 10000 }
+        );
+        const ips = stdout.trim().split('\n').filter(Boolean);
+        if (ips.includes(expectedIP)) {
+          confirmedCount++;
+        }
+      } catch {
+        // resolver query failed — continue
+      }
+    }
+
+    if (confirmedCount >= 2) {
+      const elapsed = Math.round((Date.now() - start) / 1000);
+      log(`[Auto-Fix] DNS propagation confirmed: ${testDomain} → ${expectedIP} visible on ${confirmedCount}/${resolvers.length} public resolvers after ${elapsed}s`);
+      return;
+    }
+
+    const elapsed = Math.round((Date.now() - start) / 1000);
+    log(`[Auto-Fix] DNS not propagated yet (${confirmedCount}/${resolvers.length} resolvers see ${testDomain}). Elapsed ${elapsed}s / ${Math.round(DNS_PROPAGATION_MAX_MS / 1000)}s max. Retrying in 30s...`);
+    await new Promise(r => setTimeout(r, DNS_PROPAGATION_POLL_MS));
+  }
+
+  const elapsed = Math.round((Date.now() - start) / 1000);
+  log(`[Auto-Fix] WARNING: DNS propagation not confirmed after ${elapsed}s. Proceeding with SSL attempts anyway (they may fail).`);
+}
 
 /**
  * Robust DNS record replacement pattern:
@@ -540,7 +604,7 @@ async function reissueSSL(
     // ---- S1 domain: LE issuance on S1 with retry loop ----
     await ensureWebDomain(ssh1, domain, 'S1', params.log);
 
-    const maxRetries = 5;
+    const maxRetries = 3;
     let lastErr: unknown;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
@@ -554,8 +618,8 @@ async function reissueSSL(
       } catch (err) {
         lastErr = err;
         if (attempt < maxRetries) {
-          params.log(`[Auto-Fix] reissue_ssl/S1: LE attempt ${attempt}/${maxRetries} failed for ${domain}, retrying in 60s...`);
-          await new Promise(r => setTimeout(r, 60000));
+          params.log(`[Auto-Fix] reissue_ssl/S1: LE attempt ${attempt}/${maxRetries} failed for ${domain}, retrying in 30s...`);
+          await new Promise(r => setTimeout(r, 30000));
         }
       }
     }
@@ -633,12 +697,12 @@ async function reissueSSL(
   // resolve to S2's IP, so LE HTTP-01 validation should succeed.
   const certDir = `/home/admin/conf/web/${domain}/ssl`;
 
-  const maxRetries = 5;
+  const maxRetries = 3;
   let lastLeErr: unknown;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       if (attempt === 1) {
-        // Brief delay on first attempt for DNS propagation
+        // Brief delay on first attempt
         await new Promise(resolve => setTimeout(resolve, 3000));
       }
       await ssh2.exec(
@@ -653,8 +717,8 @@ async function reissueSSL(
     } catch (err) {
       lastLeErr = err;
       if (attempt < maxRetries) {
-        params.log(`[Auto-Fix] reissue_ssl/S2: LE attempt ${attempt}/${maxRetries} failed for ${domain}, retrying in 60s...`);
-        await new Promise(r => setTimeout(r, 60000));
+        params.log(`[Auto-Fix] reissue_ssl/S2: LE attempt ${attempt}/${maxRetries} failed for ${domain}, retrying in 30s...`);
+        await new Promise(r => setTimeout(r, 30000));
       }
     }
   }
@@ -1024,8 +1088,15 @@ export async function runAutoFixes(
     return true;
   });
 
-  // Process each deduped issue
-  for (const issue of dedupedIssues) {
+  // Two-phase execution: DNS fixes first, then SSL (which needs public DNS propagation)
+  const SSL_ACTIONS = new Set(['reissue_ssl']);
+  const dnsIssues = dedupedIssues.filter(i => !SSL_ACTIONS.has(i.fixAction!));
+  const sslIssues = dedupedIssues.filter(i => SSL_ACTIONS.has(i.fixAction!));
+
+  params.log(`[Auto-Fix] Phase 1: ${dnsIssues.length} DNS fixes. Phase 2: ${sslIssues.length} SSL certs.`);
+
+  // === PHASE 1: DNS record fixes ===
+  for (const issue of dnsIssues) {
     const key = `${issue.fixAction}:${issue.domain}`;
     try {
       switch (issue.fixAction) {
@@ -1114,14 +1185,37 @@ export async function runAutoFixes(
     }
   }
 
-  // Final rndc reload on both servers
-  params.log('[Auto-Fix] Running final rndc reload on both servers...');
+  // rndc reload after Phase 1 DNS fixes
+  params.log('[Auto-Fix] Phase 1 complete. Running rndc reload on both servers...');
   for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
     const result = await ssh.exec('rndc reload', { timeout: 10000 });
     if (result.code !== 0) {
       params.log(`[Auto-Fix] ✗ rndc reload failed on ${serverName}: ${result.stderr}`);
     } else {
       params.log(`[Auto-Fix] ✓ rndc reload completed on ${serverName}`);
+    }
+  }
+
+  // === DNS PROPAGATION WAIT between Phase 1 and Phase 2 ===
+  if (sslIssues.length > 0) {
+    const allSendingDomains = [...params.server1Domains, ...params.server2Domains];
+    const getExpectedIP = (domain: string): string =>
+      params.server2Domains.includes(domain) ? params.server2IP : params.server1IP;
+
+    await waitForPublicDNSPropagation(ssh1, allSendingDomains, getExpectedIP, params.log);
+  }
+
+  // === PHASE 2: SSL cert issuance (public DNS now propagated) ===
+  for (const issue of sslIssues) {
+    const key = `${issue.fixAction}:${issue.domain}`;
+    try {
+      await reissueSSL(ssh1, ssh2, issue.domain, params);
+      fixed.push(key);
+      params.log(`[Auto-Fix] ✓ Fixed ${key}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      failed.push(`${key}: ${msg}`);
+      params.log(`[Auto-Fix] ✗ Failed ${key}: ${msg}`);
     }
   }
 
