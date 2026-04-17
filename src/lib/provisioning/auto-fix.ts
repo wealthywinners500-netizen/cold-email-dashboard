@@ -1,6 +1,6 @@
 import type { SSHManager } from './ssh-manager';
 import type { VerificationResult, VPSProvider } from './types';
-import { HESTIA_PATH_PREFIX, HESTIA_FULL_PATH } from './hestia-scripts';
+import { HESTIA_PATH_PREFIX, HESTIA_FULL_PATH, checkLERateLimit } from './hestia-scripts';
 
 /**
  * Auto-fix module for cold email server provisioning.
@@ -604,6 +604,12 @@ async function reissueSSL(
     // ---- S1 domain: LE issuance on S1 with retry loop ----
     await ensureWebDomain(ssh1, domain, 'S1', params.log);
 
+    // Pre-flight: fail fast if LE rate-limited this domain recently
+    const rateLimit = await checkLERateLimit(ssh1, domain);
+    if (rateLimit.rateLimited) {
+      throw new Error(`LE_RATE_LIMIT: ${rateLimit.message}`);
+    }
+
     const maxRetries = 3;
     let lastErr: unknown;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -696,6 +702,12 @@ async function reissueSSL(
   // cert chain errors). With the A-record fix (primaryIP), S2 domains now correctly
   // resolve to S2's IP, so LE HTTP-01 validation should succeed.
   const certDir = `/home/admin/conf/web/${domain}/ssl`;
+
+  // Pre-flight: fail fast if LE rate-limited this domain recently
+  const rateLimitS2 = await checkLERateLimit(ssh2, domain);
+  if (rateLimitS2.rateLimited) {
+    throw new Error(`LE_RATE_LIMIT: ${rateLimitS2.message}`);
+  }
 
   const maxRetries = 3;
   let lastLeErr: unknown;

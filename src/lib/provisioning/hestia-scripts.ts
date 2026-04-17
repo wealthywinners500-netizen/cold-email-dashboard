@@ -799,6 +799,75 @@ export async function hardenSecurity(ssh: SSHManager): Promise<void> {
 // ============================================
 
 /**
+ * Pre-flight check: read HestiaCP's LE log files to detect if Let's Encrypt
+ * rate-limited a prior attempt for this domain. The rate limit is per-identifier
+ * with a 7-day window, so once we hit it, retrying is pointless until the
+ * retry-after timestamp. Failing fast here saves the 3-attempt × 30s retry budget
+ * when the real issue is "LE said no and won't say yes for X hours".
+ *
+ * The log format (HestiaCP writes ACME responses to /var/log/hestia/LE-*.log):
+ *   "type": "urn:ietf:params:acme:error:rateLimited",
+ *   "detail": "...retry after 2026-04-18 05:57:46 UTC: see https://..."
+ *
+ * Returns { rateLimited: false } if no relevant log exists or the retry-after
+ * has passed. Returns { rateLimited: true, retryAfter, message } if a future
+ * retry-after is found — caller should throw `LE_RATE_LIMIT: ${message}`.
+ */
+export async function checkLERateLimit(
+  ssh: SSHManager,
+  domain: string
+): Promise<{ rateLimited: boolean; retryAfter?: Date; message?: string }> {
+  try {
+    const escaped = domain.replace(/\./g, '\\.');
+    const { stdout: fileList } = await ssh.exec(
+      `ls /var/log/hestia/ 2>/dev/null | grep -E "^LE-.*${escaped}" || true`,
+      { timeout: 10000 }
+    );
+    const files = fileList.trim().split('\n').filter(Boolean);
+    if (files.length === 0) return { rateLimited: false };
+
+    for (const file of files) {
+      const { stdout: content } = await ssh.exec(
+        `tail -100 /var/log/hestia/${file} 2>/dev/null || true`,
+        { timeout: 10000 }
+      );
+
+      // Look for ACME rateLimited response with retry-after timestamp
+      if (!content.includes('rateLimited')) continue;
+
+      const retryMatch = content.match(
+        /retry after (\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}) UTC/
+      );
+      if (!retryMatch) continue;
+
+      const isoString = `${retryMatch[1]}T${retryMatch[2]}Z`;
+      const retryAfter = new Date(isoString);
+      if (isNaN(retryAfter.getTime())) continue;
+      if (retryAfter.getTime() <= Date.now()) continue;
+
+      const hoursRemaining = Math.ceil(
+        (retryAfter.getTime() - Date.now()) / 3600000
+      );
+      return {
+        rateLimited: true,
+        retryAfter,
+        message:
+          `LE rate limit active for ${domain} (per ${file}). ` +
+          `Retry after ${retryAfter.toISOString()} (~${hoursRemaining}h from now). ` +
+          `Cause: too many duplicate cert requests in the last 7 days — this usually ` +
+          `means the same domain was provisioned repeatedly. Wait for the retry window, ` +
+          `use a fresh domain, or switch HestiaCP to LE staging for testing.`,
+      };
+    }
+
+    return { rateLimited: false };
+  } catch {
+    // If we can't read logs (e.g., SSH error), proceed — LE call itself will fail
+    return { rateLimited: false };
+  }
+}
+
+/**
  * Issue Let's Encrypt SSL certificate for a domain or hostname.
  *
  * Hard Lesson #51: v-add-letsencrypt-host requires full PATH + explicit admin arg.
@@ -837,6 +906,12 @@ export async function issueSSLCert(
         throw err;
       }
       // exit 4 = already exists, continue
+    }
+
+    // Pre-flight: fail fast if LE rate-limited this domain recently
+    const rateLimit = await checkLERateLimit(ssh, domain);
+    if (rateLimit.rateLimited) {
+      throw new Error(`LE_RATE_LIMIT: ${rateLimit.message}`);
     }
 
     // Now issue the LE domain cert with full PATH + explicit admin arg
