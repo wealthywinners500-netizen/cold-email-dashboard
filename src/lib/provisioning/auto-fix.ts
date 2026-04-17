@@ -1218,14 +1218,32 @@ export async function runAutoFixes(
   }
 
   // === PHASE 2: SSL cert issuance (public DNS now propagated) ===
-  for (const issue of sslIssues) {
+  // Pacing: LE's per-account rate limit and internal queuing penalize rapid
+  // back-to-back requests from the same IP. 10s between domains spreads load
+  // without materially extending total runtime (validation itself is 30-60s).
+  const SSL_PACING_MS = 10_000;
+  for (let i = 0; i < sslIssues.length; i++) {
+    if (i > 0) await new Promise(r => setTimeout(r, SSL_PACING_MS));
+    const issue = sslIssues[i];
     const key = `${issue.fixAction}:${issue.domain}`;
     try {
       await reissueSSL(ssh1, ssh2, issue.domain, params);
       fixed.push(key);
-      params.log(`[Auto-Fix] ✓ Fixed ${key}`);
+      params.log(`[Auto-Fix] ✓ Fixed ${key} (${i + 1}/${sslIssues.length})`);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      let msg = err instanceof Error ? err.message : String(err);
+      // Enrich with LE "detail" message from the ACME log if available
+      try {
+        const targetSsh = params.server2Domains.includes(issue.domain) ? ssh2 : ssh1;
+        const { stdout } = await targetSsh.exec(
+          `tail -40 /var/log/hestia/LE-admin-${issue.domain}.log 2>/dev/null | grep -oE '"detail": *"[^"]+"' | tail -1 || echo ""`,
+          { timeout: 5000 }
+        );
+        const match = stdout.match(/"detail": *"([^"]+)"/);
+        if (match) msg += ` | LE: ${match[1]}`;
+      } catch {
+        // Non-fatal
+      }
       failed.push(`${key}: ${msg}`);
       params.log(`[Auto-Fix] ✗ Failed ${key}: ${msg}`);
     }
