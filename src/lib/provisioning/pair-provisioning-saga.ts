@@ -1438,21 +1438,59 @@ export function createPairProvisioningSaga(
           const server2Domains = (ctx7.server2Domains as string[]) || [];
           context.log(`[Step 8] SSL per-server split: S1=${server1Domains.length} domains, S2=${server2Domains.length} domains`);
 
+          // Helper: tail the LE log after a failure so the operator sees LE's
+          // actual "detail" message (429 rateLimited, DNS mismatch, etc.) instead
+          // of just the HestiaCP exit code.
+          const enrichLEError = async (ssh: typeof ssh1, domain: string, err: unknown): Promise<string> => {
+            let detail = err instanceof Error ? err.message : String(err);
+            try {
+              const { stdout } = await ssh.exec(
+                `tail -40 /var/log/hestia/LE-admin-${domain}.log 2>/dev/null | grep -oE '"detail": *"[^"]+"' | tail -1 || echo ""`,
+                { timeout: 5000 }
+              );
+              const match = stdout.match(/"detail": *"([^"]+)"/);
+              if (match) detail += ` | LE: ${match[1]}`;
+            } catch {
+              // Swallow — the base error message is still informative.
+            }
+            return detail;
+          };
+
+          // Pacing: LE's public ACME endpoint has per-account rate limits and
+          // internal request queuing. Firing 10+ cert requests back-to-back
+          // from the same IP can trigger "too many currently pending
+          // authorizations" or the 300-orders/3hr account limit. A short pause
+          // between domains spreads the load. The timeout per cert is still
+          // 120s, so total added time is ~10s × N, not 10s × N + validation.
+          const CERT_PACING_MS = 10_000;
+
           // SSL for S1's assigned sending domains (issued on S1, no replication needed)
-          for (const domain of server1Domains) {
+          for (let i = 0; i < server1Domains.length; i++) {
+            if (i > 0) await new Promise((r) => setTimeout(r, CERT_PACING_MS));
+            const domain = server1Domains[i];
             try {
               await issueSSLCert(ssh1, { domain, isHostname: false });
-              context.log(`[Step 8] S1 SSL issued for ${domain}`);
+              context.log(`[Step 8] S1 SSL issued for ${domain} (${i + 1}/${server1Domains.length})`);
             } catch (err) {
-              sslErrors.push(`S1 ${domain}: ${err}`);
+              const detail = await enrichLEError(ssh1, domain, err);
+              sslErrors.push(`S1 ${domain}: ${detail}`);
+              context.log(`[Step 8] S1 SSL failed for ${domain}: ${detail}`);
             }
+          }
+
+          // Pace before switching to S2 — S2 uses a different ACME account but
+          // the same LE servers, so the global 300-orders/3hr limit still applies.
+          if (server2Domains.length > 0) {
+            await new Promise((r) => setTimeout(r, CERT_PACING_MS));
           }
 
           // SSL for S2's assigned sending domains — issue directly on S2 since
           // S2 domains' A records now correctly point to S2's IP (Fix 1A/1B).
           // Old approach (issue on S1 + replicate) failed when LE multi-vantage
           // validation hit S2's IP and couldn't find the challenge file on S1.
-          for (const domain of server2Domains) {
+          for (let i = 0; i < server2Domains.length; i++) {
+            if (i > 0) await new Promise((r) => setTimeout(r, CERT_PACING_MS));
+            const domain = server2Domains[i];
             try {
               // Ensure web domain exists on S2 before issuing cert
               await ssh2.exec(
@@ -1460,9 +1498,11 @@ export function createPairProvisioningSaga(
                 { timeout: 30000 }
               );
               await issueSSLCert(ssh2, { domain, isHostname: false });
-              context.log(`[Step 8] S2 SSL issued directly on S2: ${domain}`);
+              context.log(`[Step 8] S2 SSL issued directly on S2: ${domain} (${i + 1}/${server2Domains.length})`);
             } catch (err) {
-              sslErrors.push(`S2 ${domain}: ${err}`);
+              const detail = await enrichLEError(ssh2, domain, err);
+              sslErrors.push(`S2 ${domain}: ${detail}`);
+              context.log(`[Step 8] S2 SSL failed for ${domain}: ${detail}`);
             }
           }
 
