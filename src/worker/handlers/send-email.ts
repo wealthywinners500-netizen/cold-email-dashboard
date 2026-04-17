@@ -121,14 +121,20 @@ export async function handleSendEmail(payload: SendEmailPayload): Promise<void> 
     campaign
   );
   if (account.sends_today >= cap) {
-    const fallbackId = await selectFallbackAccount({
+    // Non-sequence sends don't auto-fallback — they're ad-hoc campaign
+    // starts without a thread to preserve. We surface the candidate in the
+    // log (useful for operator diagnostics) but still throw to let pg-boss
+    // handle retries or the operator pick it up.
+    const fallback = await selectFallbackAccount({
       orgId,
       recipientId,
       excludeAccountId: account.id,
+      preferServerPairId: account.server_pair_id || undefined,
+      supabase,
     });
-    if (fallbackId && fallbackId !== account.id) {
+    if (fallback) {
       console.log(
-        `[SendEmail] Account ${account.email} at cap (${account.sends_today}/${cap}) — Phase 2 fallback would use ${fallbackId}`
+        `[SendEmail] Account ${account.email} at cap (${account.sends_today}/${cap}) — fallback candidate ${fallback.email} logged; non-sequence sends do not auto-fallback`
       );
     }
     throw new Error(`Daily send limit reached for ${account.email}`);

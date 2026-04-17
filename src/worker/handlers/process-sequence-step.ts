@@ -11,6 +11,7 @@ import {
   getEffectiveCap,
 } from "../../lib/email/smart-sending";
 import { selectFallbackAccount } from "../../lib/email/fallback-account";
+import { buildReplyHeaders, type HistoryEntry } from "../../lib/email/threading";
 import { randomUUID } from "crypto";
 
 function getSupabase() {
@@ -103,18 +104,71 @@ export async function handleProcessSequenceStep(
   }
 
   // 4. Fetch email_accounts by state.assigned_account_id
-  const { data: account, error: accountErr } = await supabase
+  const { data: originalAccount, error: accountErr } = await supabase
     .from("email_accounts")
     .select("*")
     .eq("id", state.assigned_account_id)
     .single();
 
-  if (accountErr || !account) {
+  if (accountErr || !originalAccount) {
     throw new Error(`Email account not found: ${state.assigned_account_id}`);
   }
 
+  // Working `account` binding — may be swapped for a fallback below.
+  let account = originalAccount;
+  const historyArr: HistoryEntry[] = Array.isArray(state.history) ? (state.history as HistoryEntry[]) : [];
+
+  // --- INACTIVE-ACCOUNT → FALLBACK (thread preservation) --------------------
+  // If the pinned account went inactive and this step is a follow-up with a
+  // real thread behind it, swap to a fallback that preserves In-Reply-To +
+  // References. Gmail / Outlook will keep grouping the new message into the
+  // original thread despite the From change. If there's no thread to
+  // preserve (step 0 or no prior sends), fail hard as before.
   if (account.status !== "active") {
-    throw new Error(`Email account ${account.email} is not active`);
+    const isFollowUpWithThread = stepNumber > 0 && historyArr.length > 0;
+
+    if (!isFollowUpWithThread) {
+      throw new Error(
+        `Email account ${account.email} is not active (status: ${account.status})`
+      );
+    }
+
+    const fallback = await selectFallbackAccount({
+      orgId,
+      recipientId,
+      excludeAccountId: account.id,
+      preferServerPairId: account.server_pair_id || undefined,
+      supabase,
+    });
+
+    if (!fallback) {
+      console.log(
+        `[Sequence] Account ${account.email} inactive and no fallback available for state ${stateId}`
+      );
+      throw new Error(`No fallback account available for inactive ${account.email}`);
+    }
+
+    console.warn(
+      `[Sequence] Account fallback: original=${account.email} (${account.status}) → replacement=${fallback.email}; preserving thread for recipient ${recipientId}`
+    );
+
+    // Refetch the full row so smtp_host/port/secure/user/pass and other
+    // fields required downstream are present — selectFallbackAccount returns
+    // a narrow candidate projection.
+    const { data: fallbackRow, error: fallbackFetchErr } = await supabase
+      .from("email_accounts")
+      .select("*")
+      .eq("id", fallback.id)
+      .single();
+    if (fallbackFetchErr || !fallbackRow) {
+      throw new Error(`Failed to refetch fallback account ${fallback.id}: ${fallbackFetchErr?.message}`);
+    }
+    account = fallbackRow;
+
+    await supabase
+      .from("lead_sequence_state")
+      .update({ assigned_account_id: fallback.id })
+      .eq("id", stateId);
   }
 
   // --- PRE-SEND GATE 2: Snov-warmup tag exclusion ---------------------------
@@ -164,21 +218,27 @@ export async function handleProcessSequenceStep(
     campaign
   );
   if (account.sends_today >= cap) {
-    // Try a fallback account (Phase 2 stub returns null).
-    const fallbackId = await selectFallbackAccount({
+    // Lazy reassignment: pick a fallback, persist on state, let the next
+    // queue-sequence-steps poll re-enqueue the job. We intentionally do NOT
+    // send from the fallback in the same invocation here — cap fallback is
+    // not thread-urgent. (Contrast: the inactive-account branch above IS
+    // urgent and swaps synchronously.)
+    const fallback = await selectFallbackAccount({
       orgId,
       recipientId,
       excludeAccountId: account.id,
+      preferServerPairId: account.server_pair_id || undefined,
+      supabase,
     });
-    if (fallbackId && fallbackId !== account.id) {
+    if (fallback && fallback.id !== account.id) {
       await supabase
         .from("lead_sequence_state")
-        .update({ assigned_account_id: fallbackId })
+        .update({ assigned_account_id: fallback.id })
         .eq("id", stateId);
       console.log(
-        `[Sequence] Account ${account.email} at cap (${account.sends_today}/${cap}) — reassigning to fallback ${fallbackId}`
+        `[Sequence] Account ${account.email} at cap (${account.sends_today}/${cap}) — reassigning to fallback ${fallback.email}`
       );
-      return; // next poll of queue-sequence-steps will pick it back up
+      return;
     }
 
     // No fallback available — leave next_send_at alone and let the midnight
@@ -232,17 +292,26 @@ export async function handleProcessSequenceStep(
   const renderedHtml = renderTemplate(bodyHtml, templateData);
   const renderedText = bodyText ? renderTemplate(bodyText, templateData) : undefined;
 
-  // 8. Handle same-thread
-  let finalSubject = renderedSubject;
-  const threadingHeaders: Record<string, string> = {};
+  // 8. Threading — real-reply headers (In-Reply-To + full References chain).
+  // Parent subject is step 0's subject from the sequence; fall back to this
+  // step's rendered subject if step 0 has no subject (pathological).
+  const parentStepRaw = (steps[0] as Record<string, unknown> | undefined) ?? {};
+  const parentSubject =
+    typeof parentStepRaw.subject === "string" && parentStepRaw.subject.length > 0
+      ? parentStepRaw.subject
+      : renderedSubject;
 
-  if (step.send_in_same_thread && state.last_message_id) {
-    if (!finalSubject.toLowerCase().startsWith("re:")) {
-      finalSubject = `Re: ${finalSubject}`;
-    }
-    threadingHeaders["In-Reply-To"] = state.last_message_id;
-    threadingHeaders["References"] = state.last_message_id;
-  }
+  const reply = buildReplyHeaders({
+    stepSubject: renderedSubject,
+    parentSubject,
+    history: historyArr,
+    sendInSameThread: step.send_in_same_thread === true,
+  });
+
+  let finalSubject = reply.subject;
+  const threadingHeaders: Record<string, string> = {};
+  if (reply.inReplyTo) threadingHeaders["In-Reply-To"] = reply.inReplyTo;
+  if (reply.references) threadingHeaders["References"] = reply.references;
 
   // 9. Tracking gate. If every toggle is false, send the raw rendered HTML
   // untouched AND skip the List-Unsubscribe header pair.
@@ -305,10 +374,23 @@ export async function handleProcessSequenceStep(
       sent_at: new Date().toISOString(),
     });
 
-    // 12. Update last_message_id on state
+    // 12. Append to history and update last_message_id in a single write.
+    // Each successful send grows the chain by one entry; Phase 7's reply
+    // classifier + Phase 8 autosender both read this to reconstruct context.
+    const newHistoryEntry: HistoryEntry = {
+      step_index: stepNumber,
+      message_id: result.messageId,
+      sent_at: new Date().toISOString(),
+      account_id: account.id,
+    };
+    const updatedHistory = [...historyArr, newHistoryEntry];
+
     await supabase
       .from("lead_sequence_state")
-      .update({ last_message_id: result.messageId })
+      .update({
+        last_message_id: result.messageId,
+        history: updatedHistory,
+      })
       .eq("id", stateId);
 
     // 13. Call advanceStep
