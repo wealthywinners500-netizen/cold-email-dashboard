@@ -107,35 +107,85 @@ export interface IPBlacklistResult {
 }
 
 /**
- * Query a single DNSBL zone for a reversed-IP lookup.
- * Returns the first A-record response if listed, or null if clean/error.
+ * Query a single DNSBL zone for a reversed-IP lookup against a specific resolver.
+ * Returns a discriminated-union result so the caller can distinguish "listed",
+ * "zone returned empty" (potential blind-zone false-negative), "NXDOMAIN"
+ * (properly not-listed), "error", or "timeout".
+ *
+ * Hard Lesson (2026-04-17): The old queryZone collapsed every non-listed
+ * outcome to `null`, hiding the case where a zone was unreachable from the
+ * worker's resolver path. `spam.spamrats.com` returned EMPTY from the worker
+ * via 8.8.8.8 while `45.79.198.71` was actually LISTED on SpamRats — that IP
+ * slipped through Step 1 because EMPTY was silently treated as "not listed".
  */
+type ZoneQueryResult =
+  | { kind: 'listed'; response: string }
+  | { kind: 'empty' }
+  | { kind: 'nxdomain' }
+  | { kind: 'error'; code: string }
+  | { kind: 'timeout' };
+
 function queryZone(
   reversedIP: string,
   zone: string,
+  resolverIP: string,
   timeoutMs: number
-): Promise<string | null> {
+): Promise<ZoneQueryResult> {
   return new Promise((resolve) => {
     const resolver = new Resolver();
-    resolver.setServers(['8.8.8.8']);
+    resolver.setServers([resolverIP]);
 
     const timer = setTimeout(() => {
       resolver.cancel();
-      resolve(null); // Timeout = treat as not listed
+      resolve({ kind: 'timeout' });
     }, timeoutMs);
 
     resolver.resolve4(`${reversedIP}.${zone}`, (err, addresses) => {
       clearTimeout(timer);
       if (err) {
-        // NXDOMAIN, ENODATA, ECANCELLED, SERVFAIL = not listed (or transient)
-        resolve(null);
+        const code = (err as NodeJS.ErrnoException).code || 'UNKNOWN';
+        if (code === 'ENOTFOUND' || code === 'ENODATA') {
+          resolve({ kind: 'nxdomain' });
+        } else {
+          resolve({ kind: 'error', code });
+        }
       } else if (addresses && addresses.length > 0) {
-        resolve(addresses[0]);
+        resolve({ kind: 'listed', response: addresses[0] });
       } else {
-        resolve(null);
+        resolve({ kind: 'empty' });
       }
     });
   });
+}
+
+/**
+ * Resolver chain — tried in order for canary verification.
+ * If a zone is blind via the first resolver, we fall back to the next.
+ * If ALL resolvers fail canary, the zone is treated as UNREACHABLE (fatal).
+ */
+const RESOLVER_CHAIN = ['8.8.8.8', '1.1.1.1', '9.9.9.9'] as const;
+
+// Standard DNSBL self-test IP: reversed 127.0.0.2 → '2.0.0.127'.
+// Every well-behaved DNSBL publishes a listing for 127.0.0.2 so clients
+// can verify the zone is reachable.
+const CANARY_REVERSED = '2.0.0.127';
+
+/**
+ * Find the first resolver in RESOLVER_CHAIN that returns a positive
+ * canary listing for the given zone. Returns null if every resolver fails
+ * the canary — in which case the zone is UNREACHABLE from this host.
+ */
+async function pickResolverWithLiveZone(
+  zone: string,
+  timeoutMs: number
+): Promise<string | null> {
+  for (const resolverIP of RESOLVER_CHAIN) {
+    const canary = await queryZone(CANARY_REVERSED, zone, resolverIP, timeoutMs);
+    if (canary.kind === 'listed') {
+      return resolverIP;
+    }
+  }
+  return null;
 }
 
 /**
@@ -157,8 +207,36 @@ export async function checkIPBlacklist(ip: string): Promise<IPBlacklistResult> {
 
   const results = await Promise.all(
     IP_BLACKLISTS.map(async ({ zone, name }) => {
-      const response = await queryZone(reversed, zone, TIMEOUT_MS);
-      return { zone, name, fatal: true, response }; // ALL are fatal
+      // Step 1: canary-verify the zone is reachable from this host.
+      // If the zone's 127.0.0.2 self-test doesn't return listed from ANY
+      // resolver in RESOLVER_CHAIN, the zone is blind from our network path
+      // and we cannot trust a "clean" answer for the real IP.
+      const resolverIP = await pickResolverWithLiveZone(zone, TIMEOUT_MS);
+      if (!resolverIP) {
+        // Fail-closed: flag as a fatal listing so the create_vps handler
+        // rerolls. An IP we can't verify clean is an IP we can't ship.
+        console.warn(
+          `[ip-blacklist] ZONE UNREACHABLE from all resolvers: ${zone} (${name}). ` +
+          `Failing IP check closed — reroll required.`
+        );
+        return {
+          zone,
+          name,
+          fatal: true,
+          response: 'ZONE_UNREACHABLE' as string | null,
+          unreachable: true as const,
+        };
+      }
+
+      // Step 2: real IP query using the resolver that proved live for this zone.
+      const r = await queryZone(reversed, zone, resolverIP, TIMEOUT_MS);
+      if (r.kind === 'listed') {
+        return { zone, name, fatal: true, response: r.response as string | null, unreachable: false as const };
+      }
+      // nxdomain, empty, error, or timeout — treat as clean for THIS zone
+      // (we already verified the zone was live via canary, so these are
+      // legitimate "not listed" responses, not blind-zone false-negatives).
+      return { zone, name, fatal: true, response: null as string | null, unreachable: false as const };
     })
   );
 
