@@ -1,8 +1,16 @@
 import { createClient } from "@supabase/supabase-js";
 import { sendEmail } from "../../lib/email/smtp-manager";
 import { renderTemplate } from "../../lib/email/template-renderer";
-import { prepareEmail } from "../../lib/email/email-preparer";
+import { prepareEmail, type TrackingOptions } from "../../lib/email/email-preparer";
 import { advanceStep } from "../../lib/email/sequence-engine";
+import { assignVariant } from "../../lib/email/variants";
+import {
+  normalizeSchedule,
+  isWithinWindow,
+  nextWindowOpen,
+  getEffectiveCap,
+} from "../../lib/email/smart-sending";
+import { selectFallbackAccount } from "../../lib/email/fallback-account";
 import { randomUUID } from "crypto";
 
 function getSupabase() {
@@ -39,7 +47,6 @@ export async function handleProcessSequenceStep(
     throw new Error(`Sequence state not found: ${stateId}`);
   }
 
-  // Skip if not active
   if (state.status !== "active") {
     console.log(`[Sequence] Skipping state ${stateId} - status is ${state.status}`);
     return;
@@ -56,7 +63,6 @@ export async function handleProcessSequenceStep(
     throw new Error(`Campaign sequence not found: ${sequenceId}`);
   }
 
-  // 3. Get step from steps array (JSONB)
   const steps = Array.isArray(sequence.steps) ? sequence.steps : [];
   const step = steps[stepNumber];
 
@@ -64,7 +70,7 @@ export async function handleProcessSequenceStep(
     throw new Error(`Step ${stepNumber} not found in sequence ${sequenceId}`);
   }
 
-  // 4. Fetch campaign_recipients by recipientId
+  // 3. Fetch campaign_recipients by recipientId
   const { data: recipient, error: recipientErr } = await supabase
     .from("campaign_recipients")
     .select("*")
@@ -75,7 +81,28 @@ export async function handleProcessSequenceStep(
     throw new Error(`Recipient not found: ${recipientId}`);
   }
 
-  // 5. Fetch email_accounts by state.assigned_account_id
+  // --- PRE-SEND GATE 1: Suppression check -----------------------------------
+  // If the recipient's email is on the org's suppression list, mark the
+  // recipient row and skip without queueing a retry.
+  const { data: suppressed } = await supabase
+    .from("suppression_list")
+    .select("id")
+    .eq("org_id", orgId)
+    .eq("email", recipient.email)
+    .maybeSingle();
+
+  if (suppressed) {
+    console.log(
+      `[Sequence] Suppressed recipient ${recipient.email} — skipping state ${stateId}`
+    );
+    await supabase
+      .from("campaign_recipients")
+      .update({ status: "suppressed" })
+      .eq("id", recipientId);
+    return;
+  }
+
+  // 4. Fetch email_accounts by state.assigned_account_id
   const { data: account, error: accountErr } = await supabase
     .from("email_accounts")
     .select("*")
@@ -90,9 +117,90 @@ export async function handleProcessSequenceStep(
     throw new Error(`Email account ${account.email} is not active`);
   }
 
-  // Check daily limit
-  if (account.sends_today >= account.daily_send_limit) {
-    throw new Error(`Daily send limit reached for ${account.email}`);
+  // --- PRE-SEND GATE 2: Snov-warmup tag exclusion ---------------------------
+  // Tag-based accounts reserved for warmup must NEVER be used to send campaign
+  // mail. Phase 4's account picker will already avoid them; this is a
+  // belt-and-suspenders check in case an older state row slipped through.
+  const accountTags: string[] = Array.isArray(account.tags) ? account.tags : [];
+  if (accountTags.includes("snov-warmup")) {
+    console.log(
+      `[Sequence] Skipping snov-warmup-tagged account ${account.email} — rescheduling state ${stateId}`
+    );
+    const rescheduleAt = new Date(Date.now() + 3600000).toISOString(); // +1h
+    await supabase
+      .from("lead_sequence_state")
+      .update({ next_send_at: rescheduleAt })
+      .eq("id", stateId);
+    return;
+  }
+
+  // Load campaign for schedule, ramp-up, tracking, and exploration threshold.
+  const { data: campaign, error: campErr } = await supabase
+    .from("campaigns")
+    .select("*")
+    .eq("id", campaignId)
+    .single();
+  if (campErr || !campaign) {
+    throw new Error(`Campaign not found: ${campaignId}`);
+  }
+
+  // --- PRE-SEND GATE 3: Sending window --------------------------------------
+  const schedule = normalizeSchedule(campaign.sending_schedule);
+  if (!isWithinWindow(schedule)) {
+    const openAt = nextWindowOpen(schedule).toISOString();
+    console.log(
+      `[Sequence] Outside window for state ${stateId} — rescheduling to ${openAt}`
+    );
+    await supabase
+      .from("lead_sequence_state")
+      .update({ next_send_at: openAt })
+      .eq("id", stateId);
+    return;
+  }
+
+  // --- PRE-SEND GATE 4: Effective daily cap ---------------------------------
+  const cap = getEffectiveCap(
+    { daily_send_limit: account.daily_send_limit, sends_today: account.sends_today },
+    campaign
+  );
+  if (account.sends_today >= cap) {
+    // Try a fallback account (Phase 2 stub returns null).
+    const fallbackId = await selectFallbackAccount({
+      orgId,
+      recipientId,
+      excludeAccountId: account.id,
+    });
+    if (fallbackId && fallbackId !== account.id) {
+      await supabase
+        .from("lead_sequence_state")
+        .update({ assigned_account_id: fallbackId })
+        .eq("id", stateId);
+      console.log(
+        `[Sequence] Account ${account.email} at cap (${account.sends_today}/${cap}) — reassigning to fallback ${fallbackId}`
+      );
+      return; // next poll of queue-sequence-steps will pick it back up
+    }
+
+    // No fallback available — leave next_send_at alone and let the midnight
+    // reset (`reset-daily-counts` cron) pick it back up tomorrow.
+    console.log(
+      `[Sequence] Account ${account.email} at cap (${account.sends_today}/${cap}) — deferring state ${stateId}`
+    );
+    return;
+  }
+
+  // --- VARIANT ASSIGNMENT ---------------------------------------------------
+  // Re-assign on every step >0 (per-step Thompson bandit) and also if the
+  // state row has no variant yet (legacy rows from before Phase 1).
+  let assignedVariant: string | null = state.assigned_variant;
+  if (!assignedVariant || stepNumber > 0) {
+    assignedVariant = await assignVariant(campaignId, sequenceId, stepNumber, recipientId, {
+      supabase,
+    });
+    await supabase
+      .from("lead_sequence_state")
+      .update({ assigned_variant: assignedVariant })
+      .eq("id", stateId);
   }
 
   // 6. Pick variant content
@@ -100,18 +208,14 @@ export async function handleProcessSequenceStep(
   let bodyHtml = step.body_html || "";
   let bodyText = step.body_text || "";
 
-  if (
-    step.ab_variants &&
-    Array.isArray(step.ab_variants) &&
-    state.assigned_variant
-  ) {
+  if (step.ab_variants && Array.isArray(step.ab_variants) && assignedVariant) {
     const variant = step.ab_variants.find(
-      (v: any) => v.variant === state.assigned_variant
+      (v: Record<string, unknown>) => v.variant === assignedVariant
     );
     if (variant) {
-      subject = variant.subject || subject;
-      bodyHtml = variant.body_html || bodyHtml;
-      bodyText = variant.body_text || bodyText;
+      subject = (variant.subject as string) || subject;
+      bodyHtml = (variant.body_html as string) || bodyHtml;
+      bodyText = (variant.body_text as string) || bodyText;
     }
   }
 
@@ -133,7 +237,6 @@ export async function handleProcessSequenceStep(
   const threadingHeaders: Record<string, string> = {};
 
   if (step.send_in_same_thread && state.last_message_id) {
-    // Prefix subject with "Re: " if not already prefixed
     if (!finalSubject.toLowerCase().startsWith("re:")) {
       finalSubject = `Re: ${finalSubject}`;
     }
@@ -141,19 +244,32 @@ export async function handleProcessSequenceStep(
     threadingHeaders["References"] = state.last_message_id;
   }
 
-  // 9. Generate tracking ID
+  // 9. Tracking gate. If every toggle is false, send the raw rendered HTML
+  // untouched AND skip the List-Unsubscribe header pair.
+  const trackOpens = campaign.track_opens === true;
+  const trackClicks = campaign.track_clicks === true;
+  const includeUnsubscribe = campaign.include_unsubscribe === true;
+
   const trackingId = randomUUID();
-
-  // 9b. Prepare email with tracking (pixel, click rewrite, unsub link + headers)
   const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://cold-email-dashboard.vercel.app";
-  const prepared = prepareEmail(renderedHtml, trackingId, baseUrl);
-  const trackedHtml = prepared.html;
-  const extraHeaders: Record<string, string> = {
-    "List-Unsubscribe": prepared.listUnsubscribe,
-    "List-Unsubscribe-Post": prepared.listUnsubscribePost,
-  };
 
-  // Add threading headers on top
+  let finalHtml = renderedHtml;
+  const extraHeaders: Record<string, string> = {};
+
+  if (trackOpens || trackClicks || includeUnsubscribe) {
+    const opts: TrackingOptions = {
+      injectOpenPixel: trackOpens,
+      rewriteClickLinks: trackClicks,
+      addUnsubscribeLink: includeUnsubscribe,
+      addUnsubscribeHeader: includeUnsubscribe,
+    };
+    const prepared = prepareEmail(renderedHtml, trackingId, baseUrl, opts);
+    finalHtml = prepared.html;
+    if (prepared.listUnsubscribe) extraHeaders["List-Unsubscribe"] = prepared.listUnsubscribe;
+    if (prepared.listUnsubscribePost)
+      extraHeaders["List-Unsubscribe-Post"] = prepared.listUnsubscribePost;
+  }
+
   if (Object.keys(threadingHeaders).length > 0) {
     Object.assign(extraHeaders, threadingHeaders);
   }
@@ -164,7 +280,7 @@ export async function handleProcessSequenceStep(
       account,
       recipient.email,
       finalSubject,
-      trackedHtml,
+      finalHtml,
       renderedText,
       trackingId,
       extraHeaders
@@ -180,7 +296,7 @@ export async function handleProcessSequenceStep(
       from_name: account.display_name,
       to_email: recipient.email,
       subject: finalSubject,
-      body_html: trackedHtml,
+      body_html: finalHtml,
       body_text: renderedText || null,
       message_id: result.messageId,
       smtp_response: result.response,
@@ -209,12 +325,11 @@ export async function handleProcessSequenceStep(
       .eq("id", account.id);
 
     console.log(
-      `[Sequence] Step ${stepNumber} sent for state ${stateId}, recipient ${recipientId}`
+      `[Sequence] Step ${stepNumber} sent for state ${stateId}, recipient ${recipientId}, variant=${assignedVariant}`
     );
   } catch (sendErr) {
     const errorMessage = sendErr instanceof Error ? sendErr.message : "Unknown send error";
 
-    // Log failure
     await supabase.from("email_send_log").insert({
       org_id: orgId,
       campaign_id: campaignId,
@@ -224,19 +339,18 @@ export async function handleProcessSequenceStep(
       from_name: account.display_name,
       to_email: recipient.email,
       subject: finalSubject,
-      body_html: trackedHtml,
+      body_html: finalHtml,
       body_text: renderedText || null,
       status: "failed",
       error_message: errorMessage,
       tracking_id: trackingId,
     });
 
-    // Update account last_error
     await supabase
       .from("email_accounts")
       .update({ last_error: errorMessage })
       .eq("id", account.id);
 
-    throw sendErr; // Re-throw for pg-boss retry
+    throw sendErr;
   }
 }

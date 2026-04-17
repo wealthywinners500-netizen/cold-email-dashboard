@@ -1116,6 +1116,27 @@ export interface Campaign {
   started_at: string | null;
   completed_at: string | null;
   created_at: string;
+  // Phase 1 (migration 016) additions — all nullable/default-bearing on DB.
+  fallback_variables?: Record<string, unknown>;
+  ramp_enabled?: boolean;
+  ramp_start_rate?: number | null;
+  ramp_increment?: number | null;
+  ramp_target_rate?: number | null;
+  ramp_started_at?: string | null;
+  html_body_enabled?: boolean;
+  track_opens?: boolean;
+  track_clicks?: boolean;
+  include_unsubscribe?: boolean;
+  autosender_mode?: 'require_approval' | 'send_immediately' | 'disabled';
+  variant_exploration_threshold?: number;
+}
+
+// Phase 1 (migration 016) — org-level defaults.
+export interface OrgSettings {
+  org_id: string;
+  default_autosender_mode: 'require_approval' | 'send_immediately' | 'disabled';
+  created_at: string;
+  updated_at: string;
 }
 
 export interface CampaignStats {

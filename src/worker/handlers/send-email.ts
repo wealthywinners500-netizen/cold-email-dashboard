@@ -1,7 +1,13 @@
 import { createClient } from "@supabase/supabase-js";
 import { sendEmail } from "../../lib/email/smtp-manager";
 import { renderTemplate, renderSubjectLine } from "../../lib/email/template-renderer";
-import { prepareEmail } from "../../lib/email/email-preparer";
+import { prepareEmail, type TrackingOptions } from "../../lib/email/email-preparer";
+import {
+  normalizeSchedule,
+  isWithinWindow,
+  getEffectiveCap,
+} from "../../lib/email/smart-sending";
+import { selectFallbackAccount } from "../../lib/email/fallback-account";
 import { randomUUID } from "crypto";
 import { handleSmtpError } from "../../lib/email/error-handler";
 
@@ -44,9 +50,13 @@ export async function handleSendEmail(payload: SendEmailPayload): Promise<void> 
     throw new Error(`Email account ${account.email} is not active (status: ${account.status})`);
   }
 
-  // Check daily limit
-  if (account.sends_today >= account.daily_send_limit) {
-    throw new Error(`Daily send limit reached for ${account.email}`);
+  // --- PRE-SEND GATE: Snov-warmup tag exclusion -----------------------------
+  const accountTags: string[] = Array.isArray(account.tags) ? account.tags : [];
+  if (accountTags.includes("snov-warmup")) {
+    console.log(
+      `[SendEmail] Skipping snov-warmup-tagged account ${account.email}`
+    );
+    return;
   }
 
   // 2. Fetch recipient
@@ -64,6 +74,23 @@ export async function handleSendEmail(payload: SendEmailPayload): Promise<void> 
     return; // Already sent, skip
   }
 
+  // --- PRE-SEND GATE: Suppression check -------------------------------------
+  const { data: suppressed } = await supabase
+    .from("suppression_list")
+    .select("id")
+    .eq("org_id", orgId)
+    .eq("email", recipient.email)
+    .maybeSingle();
+
+  if (suppressed) {
+    console.log(`[SendEmail] Suppressed recipient ${recipient.email} — skipping`);
+    await supabase
+      .from("campaign_recipients")
+      .update({ status: "suppressed" })
+      .eq("id", recipientId);
+    return;
+  }
+
   // 3. Fetch campaign
   const { data: campaign, error: campaignErr } = await supabase
     .from("campaigns")
@@ -75,9 +102,36 @@ export async function handleSendEmail(payload: SendEmailPayload): Promise<void> 
     throw new Error(`Campaign not found: ${campaignId}`);
   }
 
-  // Check if campaign is still sending
   if (campaign.status !== "sending") {
     return; // Campaign was paused/stopped
+  }
+
+  // --- PRE-SEND GATE: Sending window ----------------------------------------
+  const schedule = normalizeSchedule(campaign.sending_schedule);
+  if (!isWithinWindow(schedule)) {
+    console.log(
+      `[SendEmail] Outside window for recipient ${recipientId} — deferring (pg-boss will retry)`
+    );
+    throw new Error("outside_sending_window");
+  }
+
+  // --- PRE-SEND GATE: Effective daily cap -----------------------------------
+  const cap = getEffectiveCap(
+    { daily_send_limit: account.daily_send_limit, sends_today: account.sends_today },
+    campaign
+  );
+  if (account.sends_today >= cap) {
+    const fallbackId = await selectFallbackAccount({
+      orgId,
+      recipientId,
+      excludeAccountId: account.id,
+    });
+    if (fallbackId && fallbackId !== account.id) {
+      console.log(
+        `[SendEmail] Account ${account.email} at cap (${account.sends_today}/${cap}) — Phase 2 fallback would use ${fallbackId}`
+      );
+    }
+    throw new Error(`Daily send limit reached for ${account.email}`);
   }
 
   // 4. Render template
@@ -99,18 +153,40 @@ export async function handleSendEmail(payload: SendEmailPayload): Promise<void> 
   // 5. Generate tracking ID
   const trackingId = randomUUID();
 
-  // 6. Prepare email with tracking (pixel, click rewrite, unsub link + headers)
+  // 6. Tracking gate (independent toggles). No opts = no mutation.
+  const trackOpens = campaign.track_opens === true;
+  const trackClicks = campaign.track_clicks === true;
+  const includeUnsubscribe = campaign.include_unsubscribe === true;
+
   const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://cold-email-dashboard.vercel.app";
-  const prepared = prepareEmail(html, trackingId, baseUrl);
-  const trackedHtml = prepared.html;
-  const extraHeaders: Record<string, string> = {
-    "List-Unsubscribe": prepared.listUnsubscribe,
-    "List-Unsubscribe-Post": prepared.listUnsubscribePost,
-  };
+  let finalHtml = html;
+  const extraHeaders: Record<string, string> = {};
+
+  if (trackOpens || trackClicks || includeUnsubscribe) {
+    const opts: TrackingOptions = {
+      injectOpenPixel: trackOpens,
+      rewriteClickLinks: trackClicks,
+      addUnsubscribeLink: includeUnsubscribe,
+      addUnsubscribeHeader: includeUnsubscribe,
+    };
+    const prepared = prepareEmail(html, trackingId, baseUrl, opts);
+    finalHtml = prepared.html;
+    if (prepared.listUnsubscribe) extraHeaders["List-Unsubscribe"] = prepared.listUnsubscribe;
+    if (prepared.listUnsubscribePost)
+      extraHeaders["List-Unsubscribe-Post"] = prepared.listUnsubscribePost;
+  }
 
   // 7. Send email
   try {
-    const result = await sendEmail(account, recipient.email, subject, trackedHtml, text, trackingId, extraHeaders);
+    const result = await sendEmail(
+      account,
+      recipient.email,
+      subject,
+      finalHtml,
+      text,
+      trackingId,
+      Object.keys(extraHeaders).length > 0 ? extraHeaders : undefined
+    );
 
     // 8a. Success: update recipient
     await supabase
@@ -132,7 +208,7 @@ export async function handleSendEmail(payload: SendEmailPayload): Promise<void> 
       from_name: account.display_name,
       to_email: recipient.email,
       subject,
-      body_html: trackedHtml,
+      body_html: finalHtml,
       body_text: text || null,
       message_id: result.messageId,
       smtp_response: result.response,
@@ -169,22 +245,20 @@ export async function handleSendEmail(payload: SendEmailPayload): Promise<void> 
       from_name: account.display_name,
       to_email: recipient.email,
       subject,
-      body_html: trackedHtml,
+      body_html: finalHtml,
       body_text: text || null,
       status: "failed",
       error_message: errorMessage,
       tracking_id: trackingId,
     });
 
-    // Update account last_error
     await supabase
       .from("email_accounts")
       .update({ last_error: errorMessage })
       .eq("id", accountId);
 
-    // Log SMTP error
     await handleSmtpError(sendErr instanceof Error ? sendErr : new Error(String(sendErr)), accountId, orgId);
 
-    throw sendErr; // Re-throw for pg-boss retry
+    throw sendErr;
   }
 }

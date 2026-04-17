@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import { getBoss } from './campaign-queue';
+import { assignVariant } from './variants';
 import type {
   CampaignSequence,
   LeadSequenceState,
@@ -89,11 +90,21 @@ export async function initializeSequence(
 
   // Prepare state records
   const statesToInsert: LeadSequenceState[] = [];
-  const variants = ['A', 'B', 'C', 'D'];
   let accountRoundRobinIndex = 0;
 
   for (const recipient of recipients || []) {
-    const assignedVariant = variants[Math.floor(Math.random() * variants.length)];
+    // Phase 1: bandit-driven variant assignment instead of Math.random(). At
+    // step 0 before any sends have happened, every variant has 0 prior sends
+    // so this uniformly picks among the variants defined on step 0 (or
+    // returns 'A' when the step has no ab_variants array). On subsequent
+    // steps, process-sequence-step re-runs the bandit per-step.
+    const assignedVariant = await assignVariant(
+      campaignId,
+      sequence.id,
+      0,
+      recipient.id,
+      { supabase }
+    );
     const assignedAccount =
       activeAccounts[accountRoundRobinIndex % activeAccounts.length];
     accountRoundRobinIndex++;
