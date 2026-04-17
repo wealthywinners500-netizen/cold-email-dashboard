@@ -5,6 +5,13 @@ import * as Tabs from "@radix-ui/react-tabs";
 import { SequenceStep, ABVariant } from "@/lib/supabase/types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Trash2, Plus } from "lucide-react";
+import { isFeatureEnabledSync } from "@/lib/featureFlags";
+import { AddRandomSpintaxButton } from "@/components/campaigns/add-random-spintax-button";
+import {
+  AICopyBuilderModal,
+  type GeneratedVariant,
+} from "@/components/campaigns/ai-copy-builder-modal";
+import { GrammarCheck } from "@/components/campaigns/grammar-check";
 
 interface SequenceStepEditorProps {
   steps: SequenceStep[];
@@ -19,6 +26,10 @@ export function SequenceStepEditor({
 }: SequenceStepEditorProps) {
   const [selectedStep, setSelectedStep] = useState<number>(0);
   const [selectedVariant, setSelectedVariant] = useState<string>("A");
+  const [aiModalOpen, setAiModalOpen] = useState<boolean>(false);
+  // Phase 4: gate new spintax / AI / grammar UI behind FEATURE_CAMPAIGNS_V2.
+  // Flag off → renders pixel-identical to pre-phase-4 (existing merge buttons unchanged).
+  const v2 = isFeatureEnabledSync("campaigns_v2");
 
   const currentStep = steps[selectedStep];
   if (!currentStep) {
@@ -291,6 +302,39 @@ export function SequenceStepEditor({
                   </button>
                 </div>
               )}
+
+              {/* Phase 4: spintax / AI / grammar — flag-gated, not readOnly */}
+              {!readOnly && v2 && variant.variant === selectedVariant && (
+                <div className="flex flex-wrap gap-2 items-center">
+                  <AddRandomSpintaxButton
+                    value={variant.body_text || ""}
+                    onChange={(next) => handleVariantChange("body_text", next)}
+                    intensity="minimal"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setAiModalOpen(true)}
+                    className="px-3 py-1 text-xs bg-purple-700 hover:bg-purple-600 text-white rounded transition-colors"
+                  >
+                    AI Copy Builder
+                  </button>
+                </div>
+              )}
+
+              {/* Phase 4: grammar panel below body */}
+              {!readOnly && v2 && variant.variant === selectedVariant && variant.body_text && (
+                <div className="mt-2">
+                  <GrammarCheck
+                    text={variant.body_text || ""}
+                    onApplySuggestion={(offset, length, replacement) => {
+                      const current = variant.body_text || "";
+                      const next =
+                        current.slice(0, offset) + replacement + current.slice(offset + length);
+                      handleVariantChange("body_text", next);
+                    }}
+                  />
+                </div>
+              )}
             </Tabs.Content>
           ))}
         </Tabs.Root>
@@ -315,6 +359,39 @@ export function SequenceStepEditor({
           <Trash2 size={16} />
           Delete Step
         </button>
+      )}
+
+      {/* Phase 4: AI Copy Builder modal — mounted ONCE outside the variant loop
+          so it isn't remounted per variant. Gated on v2 + not readOnly. */}
+      {v2 && !readOnly && (
+        <AICopyBuilderModal
+          open={aiModalOpen}
+          onOpenChange={setAiModalOpen}
+          onPick={(variants: GeneratedVariant[]) => {
+            if (variants.length === 1) {
+              // Replace current variant's subject + body.
+              handleVariantChange("subject", variants[0].subject);
+              handleVariantChange("body_text", variants[0].body);
+            } else {
+              // Replace all A/B/C/D variants in order, creating rows as needed.
+              const variantLetters = ["A", "B", "C", "D"];
+              const updatedSteps = [...steps];
+              const newVariants: ABVariant[] = variants.slice(0, 4).map((gv, i) => ({
+                variant: variantLetters[i],
+                subject: gv.subject,
+                body_html: "",
+                body_text: gv.body,
+              }));
+              updatedSteps[selectedStep] = {
+                ...currentStep,
+                ab_variants: newVariants,
+              };
+              onChange(updatedSteps);
+              setSelectedVariant("A");
+            }
+          }}
+          availableVariables={["first_name", "last_name", "company_name"]}
+        />
       )}
     </div>
   );

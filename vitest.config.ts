@@ -1,7 +1,12 @@
 import { defineConfig } from 'vitest/config';
+import react from '@vitejs/plugin-react';
 import path from 'node:path';
 
 export default defineConfig({
+  // Next.js's tsconfig sets jsx: "preserve" for the Next compiler. Vitest
+  // runs on its own bundler (rolldown under vitest v4), so we need a real
+  // JSX transform. The React plugin handles this regardless of rolldown/esbuild.
+  plugins: [react()],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
@@ -9,7 +14,8 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
-    include: ['src/**/__tests__/**/*.test.ts'],
+    setupFiles: ['src/test-setup.ts'],
+    include: ['src/**/__tests__/**/*.test.ts', 'src/**/__tests__/**/*.test.tsx'],
     exclude: [
       'node_modules',
       '.next',

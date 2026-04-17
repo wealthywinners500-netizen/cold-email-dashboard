@@ -1,12 +1,13 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { Campaign, CampaignSequence, LeadSequenceState, CampaignStats, CampaignAnalytics } from "@/lib/supabase/types";
+import { Campaign, CampaignSequence, LeadSequenceState, CampaignStats, CampaignAnalytics, SequenceStep } from "@/lib/supabase/types";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { SequenceStepEditor } from "@/components/sequence/sequence-step-editor";
 import { SequenceFlowDiagram } from "@/components/sequence/sequence-flow-diagram";
+import { isFeatureEnabledSync } from "@/lib/featureFlags";
 import { Users, Mail, MessageCircle, AlertCircle, Eye, MousePointerClick, UserMinus, BarChart3, TrendingUp } from "lucide-react";
 import {
   LineChart,
@@ -87,6 +88,69 @@ export default function CampaignDetailClient({
   const [expandedSequence, setExpandedSequence] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState("overview");
 
+  // Phase 4: flag-gated editable sequences. When off, the SequenceStepEditor
+  // is rendered readOnly with a noop onChange (pixel-identical to pre-phase-4).
+  const v2 = isFeatureEnabledSync("campaigns_v2");
+
+  // Local sequences state so the editor's onChange mutations re-render the UI
+  // without a router.refresh() round-trip. Initial value = server-rendered prop.
+  // Flag-off path still reads from `sequences` (the prop) to preserve identity.
+  const [localSequences, setLocalSequences] = useState<CampaignSequence[]>(sequences);
+
+  // Per-sequence debounce timers for the PATCH save.
+  const saveTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const [savingSeqId, setSavingSeqId] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  const saveSequenceSteps = useCallback(
+    (seqId: string, newSteps: SequenceStep[]) => {
+      if (saveTimers.current[seqId]) clearTimeout(saveTimers.current[seqId]);
+      saveTimers.current[seqId] = setTimeout(async () => {
+        setSavingSeqId(seqId);
+        setSaveError(null);
+        try {
+          const resp = await fetch(
+            `/api/campaigns/${campaign.id}/sequences/${seqId}`,
+            {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ steps: newSteps }),
+            }
+          );
+          if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            setSaveError(err?.error ?? "Failed to save sequence");
+            return;
+          }
+        } catch (e) {
+          setSaveError("Network error saving sequence");
+        } finally {
+          setSavingSeqId(null);
+        }
+      }, 800);
+    },
+    [campaign.id]
+  );
+
+  const onSequenceStepsChange = useCallback(
+    (seqId: string, newSteps: SequenceStep[]) => {
+      setLocalSequences((prev) =>
+        prev.map((s) => (s.id === seqId ? { ...s, steps: newSteps } : s))
+      );
+      saveSequenceSteps(seqId, newSteps);
+    },
+    [saveSequenceSteps]
+  );
+
+  useEffect(() => {
+    // Capture current timer map at effect-setup time so the cleanup closure
+    // doesn't depend on a ref that could change identity between mount/unmount.
+    const timers = saveTimers.current;
+    return () => {
+      Object.values(timers).forEach((t) => clearTimeout(t));
+    };
+  }, []);
+
   const statusBadge = statusColorMap[campaign.status] || "bg-gray-700 text-gray-200";
 
   const sendingSchedule = campaign.sending_schedule as any || {};
@@ -94,8 +158,11 @@ export default function CampaignDetailClient({
   const timezone = sendingSchedule.timezone || "UTC";
   const dailyLimit = sendingSchedule.daily_limit || "Unlimited";
 
-  const primarySequence = sequences.find((s) => s.sequence_type === "primary");
-  const subsequences = sequences.filter((s) => s.sequence_type === "subsequence");
+  // Flag-on path reads from local state (so edits re-render); flag-off reads
+  // from the prop directly (zero behavior change).
+  const sequenceSource = v2 ? localSequences : sequences;
+  const primarySequence = sequenceSource.find((s) => s.sequence_type === "primary");
+  const subsequences = sequenceSource.filter((s) => s.sequence_type === "subsequence");
 
   return (
     <div className="space-y-6">
@@ -261,9 +328,22 @@ export default function CampaignDetailClient({
                   <CardContent className="space-y-4">
                     <SequenceStepEditor
                       steps={primarySequence.steps}
-                      onChange={() => {}}
-                      readOnly={true}
+                      onChange={
+                        v2
+                          ? (newSteps) =>
+                              onSequenceStepsChange(primarySequence.id, newSteps)
+                          : () => {}
+                      }
+                      readOnly={!v2}
                     />
+                    {v2 && savingSeqId === primarySequence.id && (
+                      <div className="text-xs text-gray-400">Saving…</div>
+                    )}
+                    {v2 && saveError && savingSeqId === null && (
+                      <div className="text-xs text-red-400">
+                        Save failed: {saveError}
+                      </div>
+                    )}
                   </CardContent>
                 )}
               </Card>
@@ -317,9 +397,21 @@ export default function CampaignDetailClient({
                       <CardContent className="space-y-4">
                         <SequenceStepEditor
                           steps={seq.steps}
-                          onChange={() => {}}
-                          readOnly={true}
+                          onChange={
+                            v2
+                              ? (newSteps) => onSequenceStepsChange(seq.id, newSteps)
+                              : () => {}
+                          }
+                          readOnly={!v2}
                         />
+                        {v2 && savingSeqId === seq.id && (
+                          <div className="text-xs text-gray-400">Saving…</div>
+                        )}
+                        {v2 && saveError && savingSeqId === null && (
+                          <div className="text-xs text-red-400">
+                            Save failed: {saveError}
+                          </div>
+                        )}
                       </CardContent>
                     )}
                   </Card>
