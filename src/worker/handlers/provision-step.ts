@@ -20,9 +20,10 @@ import { decrypt } from '@/lib/provisioning/encryption';
 import { persistPairCredentials } from '@/lib/provisioning/persist-credentials';
 import {
   checkIPBlacklist,
-  pairSharesSubnet,
+  pairSharesSubnet, // kept for fallback + backward-compat logging
   PAIR_SUBNET_MIN_PREFIX,
 } from '@/lib/provisioning/ip-blacklist-check';
+import { pairSharesAsn } from '@/lib/provisioning/asn-diversity';
 import { SERVERLESS_STEP_RUNNERS } from '@/lib/provisioning/serverless-steps';
 import { createHmac, randomBytes } from 'crypto';
 import type {
@@ -303,35 +304,51 @@ async function handleCreateVpsStep(
       `[ProvisionStep][create_vps] both active: ${server1.ip} + ${server2.ip}`
     );
 
-    // 5b. IP blacklist + subnet-diversity pre-check with re-roll.
+    // 5b. IP blacklist + pair-diversity pre-check with re-roll.
     //
     // PATCH 9 (2026-04-12), Hard Lesson #74: Fresh Linode IPs can carry
     // pre-existing blacklist entries from prior tenants. Check both IPs
     // against ~40 DNSBL zones (zero tolerance — any listing is fatal).
     //
-    // PATCH 21 (2026-04-16), savini.info pair rejection: Pair IPs must
-    // ALSO be on different subnets. The savini pair s1=172.235.148.223 /
-    // s2=172.239.72.108 shared Linode's 172.224.0.0/12 block — textbook
-    // /16 was different, but /12 was the same and the pair was rejected
-    // by Dean for cold-email deliverability. See pairSharesSubnet()
-    // header comment in ip-blacklist-check.ts for the full rationale.
+    // Gate 0 regression B (2026-04-17): Pair diversity is now enforced by
+    // BGP-ASN lookup via Team Cymru whois, replacing the /12 CIDR
+    // bit-width heuristic. Same-ASN pairs fail diversity. If the ASN
+    // lookup times out, we log a warning but do NOT block (fail-open on
+    // timeouts — Cymru is a best-effort signal, not a gate). The old
+    // CIDR check is retained as a secondary belt-and-suspenders log only.
     //
-    // Either condition triggers the re-roll: delete both Linodes and
-    // re-provision (up to 5 re-rolls, 6 total attempts).
+    // Either a blacklist hit OR same-ASN triggers re-roll: delete both
+    // Linodes and re-provision (up to 5 re-rolls, 6 total attempts).
     const MAX_IP_REROLL_ATTEMPTS = 5;
     for (let rerollAttempt = 0; rerollAttempt <= MAX_IP_REROLL_ATTEMPTS; rerollAttempt++) {
-      const [bl1, bl2] = await Promise.all([
+      const [bl1, bl2, asnDiv] = await Promise.all([
         checkIPBlacklist(server1.ip),
         checkIPBlacklist(server2.ip),
+        pairSharesAsn(server1.ip, server2.ip),
       ]);
       const listedIPs = [bl1, bl2].filter((r) => r.listed);
-      const sameSubnet = pairSharesSubnet(server1.ip, server2.ip);
+      const sameAsn = asnDiv.reason === 'same_asn';
+      // Legacy subnet check — logged only, no longer gates the re-roll.
+      const sameSubnetLegacy = pairSharesSubnet(server1.ip, server2.ip);
 
-      if (listedIPs.length === 0 && !sameSubnet) {
-        // Both IPs clean AND on different /PAIR_SUBNET_MIN_PREFIX blocks — proceed
+      if (asnDiv.warning) {
+        console.warn(
+          `[ProvisionStep][create_vps] ASN diversity warning: ${asnDiv.warning} ` +
+            `(ip1Asn=${asnDiv.ip1Asn ?? 'null'}, ip2Asn=${asnDiv.ip2Asn ?? 'null'}). ` +
+            `Proceeding (fail-open on timeouts).`
+        );
+      }
+
+      if (listedIPs.length === 0 && !sameAsn) {
+        const asnNote = asnDiv.reason === 'different_asn'
+          ? `ASNs distinct (AS${asnDiv.ip1Asn} vs AS${asnDiv.ip2Asn})`
+          : `ASN diversity accepted (${asnDiv.reason})`;
         console.log(
           `[ProvisionStep][create_vps] IP pre-check PASSED: ${server1.ip} clean, ${server2.ip} clean, ` +
-            `subnets distinct at /${PAIR_SUBNET_MIN_PREFIX}` +
+            asnNote +
+            (sameSubnetLegacy
+              ? ` [legacy /${PAIR_SUBNET_MIN_PREFIX} also same, ASN gate passed]`
+              : '') +
             (rerollAttempt > 0 ? ` (after ${rerollAttempt} re-roll(s))` : '')
         );
         break;
@@ -345,9 +362,9 @@ async function handleCreateVpsStep(
           .join('; ');
         reasons.push(`BLACKLISTED [${listDetail}]`);
       }
-      if (sameSubnet) {
+      if (sameAsn) {
         reasons.push(
-          `SAME_SUBNET [/${PAIR_SUBNET_MIN_PREFIX}: ${server1.ip} + ${server2.ip}]`
+          `SAME_ASN [AS${asnDiv.ip1Asn}: ${server1.ip} + ${server2.ip}]`
         );
       }
       const reasonText = reasons.join(' + ');
@@ -357,7 +374,7 @@ async function handleCreateVpsStep(
         throw new Error(
           `IP pre-check failed after ${MAX_IP_REROLL_ATTEMPTS + 1} attempts. ` +
             `Last failure: ${reasonText}. All ${MAX_IP_REROLL_ATTEMPTS + 1} Linode IP pairs ` +
-            `either had blacklist hits or shared a /${PAIR_SUBNET_MIN_PREFIX} subnet. ` +
+            `either had blacklist hits or shared a BGP ASN. ` +
             `Try different regions or contact Linode support.`
         );
       }
