@@ -876,9 +876,11 @@ export function createPairProvisioningSaga(
                 `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ TXT '"v=spf1 ip4:${server1IP} -all"'`,
                 { timeout: 10000 }
               );
-              // Add correct DMARC with rua
+              // Add correct DMARC with rua/ruf — reports to dmarc@<ns_domain>
+              // (INTERNAL reporting mailbox on the same NS zone cluster — RFC 7489
+              // same-org reporting, no external DKIM-authorization record needed).
               await ssh1.exec(
-                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100"'`,
+                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@${context.nsDomain}; ruf=mailto:dmarc@${context.nsDomain}; fo=1"'`,
                 { timeout: 10000 }
               );
               // Add BIMI record
@@ -922,7 +924,7 @@ export function createPairProvisioningSaga(
                 { timeout: 10000 }
               );
               await ssh2.exec(
-                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100"'`,
+                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@${context.nsDomain}; ruf=mailto:dmarc@${context.nsDomain}; fo=1"'`,
                 { timeout: 10000 }
               );
               // Add BIMI record
@@ -1147,6 +1149,42 @@ export function createPairProvisioningSaga(
                 context.log(`[Step 6] Warning: DNS replication for ${domain} ${sourceLabel}→${targetLabel}: ${err}`);
               }
             }
+          }
+
+          // DMARC rua/ruf reporting mailbox — collects aggregate reports from Gmail,
+          // Microsoft, Yahoo, etc. The rua/ruf tags in the DMARC TXT records point
+          // here. Nothing consumes the mailbox automatically yet; reports can be
+          // reviewed manually or wired to an aggregator later.
+          // The NS domain has a DNS zone but is NOT set up as a mail domain during
+          // normal provisioning (sending happens on sendingDomains, not the NS domain),
+          // so v-add-mail-domain runs first on both servers. Exit codes 3/4 = "already
+          // exists" — non-fatal (HL #97).
+          context.log(`[Step 6] Creating DMARC reporting mailbox dmarc@${context.nsDomain} on both servers...`);
+          try {
+            const escapedDmarcPassword = password.replace(/'/g, "'\\''");
+            for (const [mailboxSSH, mailboxLabel] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
+              // Ensure NS domain is registered as a mail domain on this server
+              const addMailDomainResult = await mailboxSSH.exec(
+                `${HESTIA_PATH_PREFIX}v-add-mail-domain admin ${context.nsDomain}`,
+                { timeout: 15000 }
+              );
+              if (addMailDomainResult.code !== 0 && addMailDomainResult.code !== 3 && addMailDomainResult.code !== 4) {
+                context.log(`[Step 6] Warning: v-add-mail-domain ${context.nsDomain} on ${mailboxLabel}: exit ${addMailDomainResult.code} — ${addMailDomainResult.stderr}`);
+              }
+              // Create the dmarc@<ns_domain> mailbox
+              const addMailAccountResult = await mailboxSSH.exec(
+                `${HESTIA_PATH_PREFIX}v-add-mail-account admin ${context.nsDomain} dmarc '${escapedDmarcPassword}'`,
+                { timeout: 15000 }
+              );
+              if (addMailAccountResult.code !== 0 && addMailAccountResult.code !== 3 && addMailAccountResult.code !== 4) {
+                context.log(`[Step 6] Warning: v-add-mail-account dmarc@${context.nsDomain} on ${mailboxLabel}: exit ${addMailAccountResult.code} — ${addMailAccountResult.stderr}`);
+              } else {
+                context.log(`[Step 6] DMARC reporting mailbox ready on ${mailboxLabel}: dmarc@${context.nsDomain}`);
+              }
+            }
+          } catch (mailboxErr) {
+            // Non-fatal: reports won't land, but sending still works
+            context.log(`[Step 6] Warning: DMARC reporting mailbox setup failed: ${mailboxErr instanceof Error ? mailboxErr.message : String(mailboxErr)}`);
           }
 
           // Hard Lesson #95: Sync zone files from S1 → S2 so SOA serials match.
