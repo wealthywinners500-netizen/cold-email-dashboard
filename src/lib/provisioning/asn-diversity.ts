@@ -36,6 +36,7 @@
 
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { getDryRunAsn } from './providers/dry-run';
 
 const execFileAsync = promisify(execFile);
 
@@ -152,6 +153,22 @@ export async function getAsn(
     if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
       return cached.result;
     }
+  }
+
+  // DryRunProvider short-circuit: IPs minted by dry-run provisioning come
+  // out of RFC-5737 documentation pools (TEST-NET-1/2) and map to two
+  // distinct RFC-5398 documentation ASNs. Skipping whois here means a
+  // dry-run pair reliably reports different_asn rather than "unrouted".
+  const synthetic = getDryRunAsn(ip);
+  if (synthetic !== null) {
+    const result: AsnLookupResult = {
+      ip,
+      asn: synthetic,
+      asName: 'DRY_RUN_DOCUMENTATION',
+      timedOut: false,
+    };
+    asnCache.set(ip, { timestamp: Date.now(), result });
+    return result;
   }
 
   // The leading space in " -v <ip>" is required by Cymru to enable verbose
