@@ -119,12 +119,65 @@ export interface IPBlacklistResult {
  * via 8.8.8.8 while `45.79.198.71` was actually LISTED on SpamRats — that IP
  * slipped through Step 1 because EMPTY was silently treated as "not listed".
  */
-type ZoneQueryResult =
+export type ZoneQueryResult =
   | { kind: 'listed'; response: string }
   | { kind: 'empty' }
   | { kind: 'nxdomain' }
   | { kind: 'error'; code: string }
   | { kind: 'timeout' };
+
+/**
+ * Classify a raw DNSBL resolver reply into a ZoneQueryResult.
+ *
+ * Hard Lesson #R1 (2026-04-18 — job 1e41871a): the previous version of
+ * this file treated ANY non-empty A-record as `kind: 'listed'`, which
+ * caused Spamhaus's `127.255.255.254` "anonymous public resolver denied"
+ * sentinel (returned to Cloudflare/Google recursors) to be misread as a
+ * real blacklist hit. That exact bug rejected six consecutive pairs of
+ * clean Linode IPs for the launta.info job, wasting ~10 min of Step 1
+ * before bailing out. The Session 02 canary PR fixed this classification
+ * in `dnsbl-liveness.realResolve`, but missed the parallel path here.
+ *
+ * Classification rules:
+ *   - Node error ENOTFOUND / ENODATA → `nxdomain` (properly not-listed)
+ *   - Any other node error           → `error` with the node code
+ *   - Empty answer section            → `empty` (rare — mostly zone quirks)
+ *   - A-record in 127.0.0.0/24        → `listed` (the ONLY real listing range;
+ *                                       every well-behaved DNSBL answers here)
+ *   - A-record in 127.255.255.0/24    → `error` with code `RESOLVER_DENIED`
+ *                                       (Spamhaus sentinel set for blocked
+ *                                       public recursors and rate-limits)
+ *   - Any other A-record              → `error` with code `UNEXPECTED_<addr>`
+ *                                       (unknown — conservatively treated as
+ *                                       not-listed per Hard Lesson #74)
+ *
+ * Keeping this as a pure helper makes it trivially unit-testable without
+ * touching the network. Mirrors the semantics of
+ * `dnsbl-liveness.realResolve` for consistency across the two call sites.
+ */
+export function classifyDnsblReply(
+  err: NodeJS.ErrnoException | null,
+  addresses: readonly string[] | null
+): ZoneQueryResult {
+  if (err) {
+    const code = err.code || 'UNKNOWN';
+    if (code === 'ENOTFOUND' || code === 'ENODATA') {
+      return { kind: 'nxdomain' };
+    }
+    return { kind: 'error', code };
+  }
+  if (!addresses || addresses.length === 0) {
+    return { kind: 'empty' };
+  }
+  const addr = addresses[0];
+  if (addr.startsWith('127.0.0.')) {
+    return { kind: 'listed', response: addr };
+  }
+  if (addr.startsWith('127.255.255.')) {
+    return { kind: 'error', code: 'RESOLVER_DENIED' };
+  }
+  return { kind: 'error', code: `UNEXPECTED_${addr}` };
+}
 
 function queryZone(
   reversedIP: string,
@@ -143,18 +196,7 @@ function queryZone(
 
     resolver.resolve4(`${reversedIP}.${zone}`, (err, addresses) => {
       clearTimeout(timer);
-      if (err) {
-        const code = (err as NodeJS.ErrnoException).code || 'UNKNOWN';
-        if (code === 'ENOTFOUND' || code === 'ENODATA') {
-          resolve({ kind: 'nxdomain' });
-        } else {
-          resolve({ kind: 'error', code });
-        }
-      } else if (addresses && addresses.length > 0) {
-        resolve({ kind: 'listed', response: addresses[0] });
-      } else {
-        resolve({ kind: 'empty' });
-      }
+      resolve(classifyDnsblReply(err ?? null, addresses ?? null));
     });
   });
 }
