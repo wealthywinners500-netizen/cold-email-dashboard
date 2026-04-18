@@ -4,6 +4,27 @@ import { HESTIA_PATH_PREFIX } from './hestia-scripts';
 import { createAdminClient } from '@/lib/supabase/server';
 
 /**
+ * Normalize a `dig +short` TXT record line.
+ *
+ * `dig +short` wraps TXT content in quotes. TXT records >255 bytes get stored
+ * as multiple string chunks in BIND and come out as `"chunk1" "chunk2"` on a
+ * single line. This helper extracts all quoted chunks and joins them in order,
+ * falling back to the raw line if no quotes are present.
+ *
+ * Fixes Session 04b VG2 false positives (HL #R2):
+ *   - 11/11 dmarc_syntax false-fails — `startsWith('v=DMARC1')` failed on the
+ *     leading `"` that dig prepends.
+ *   - 11/11 dkim_key_validation false-fails — the `p=([A-Za-z0-9+/=]+)` regex
+ *     stops at the first chunk boundary `"`, so multi-chunk 2048-bit DKIM
+ *     public keys appeared ~192 bytes (under the 256-byte threshold).
+ */
+function normalizeTxtRecord(line: string): string {
+  const chunks = line.match(/"([^"]*)"/g);
+  if (!chunks || chunks.length === 0) return line;
+  return chunks.map((c) => c.slice(1, -1)).join('');
+}
+
+/**
  * Comprehensive verification checks for HestiaCP mail server provisioning.
  * Implements 36 checks across DNS, authentication, SMTP, SSL, and blacklist categories.
  * Called by both Verification Gate 1 (VG1) and Verification Gate 2 (VG2).
@@ -969,7 +990,11 @@ export async function runVerificationChecks(
         `dig +short mail._domainkey.${domain} TXT @${primaryResolver} 2>/dev/null`,
         { timeout: 15000 }
       );
-      const dkimLines = dkimResult.stdout.trim().split('\n').filter(Boolean);
+      const dkimLines = dkimResult.stdout
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map(normalizeTxtRecord);
       const hasDKIM = dkimLines.some((txt) => txt.includes('v=DKIM1'));
 
       if (!hasDKIM) {
@@ -1011,7 +1036,12 @@ export async function runVerificationChecks(
         `dig +short mail._domainkey.${domain} TXT @${primaryResolver} 2>/dev/null`,
         { timeout: 15000 }
       );
-      const dkimLine = dkimResult.stdout.trim();
+      // HL #R2: 2048-bit DKIM keys exceed BIND's 255-char TXT chunk limit.
+      // dig returns them as `"chunk1" "chunk2"` which must be joined before
+      // the p= regex extraction — otherwise the regex stops at the first `"`
+      // and the estimated key length is ~192 bytes (under the 256 threshold),
+      // false-flagging every record as "auto_fixable — key too short".
+      const dkimLine = normalizeTxtRecord(dkimResult.stdout.trim());
 
       if (!dkimLine || !dkimLine.includes('v=DKIM1')) {
         results.push({
@@ -1082,7 +1112,11 @@ export async function runVerificationChecks(
         `dig +short _dmarc.${domain} TXT @${primaryResolver} 2>/dev/null`,
         { timeout: 15000 }
       );
-      const dmarcLines = dmarcResult.stdout.trim().split('\n').filter(Boolean);
+      const dmarcLines = dmarcResult.stdout
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map(normalizeTxtRecord);
       const hasDMARC = dmarcLines.some((txt) => txt.includes('v=DMARC1'));
 
       if (!hasDMARC) {
@@ -1124,7 +1158,16 @@ export async function runVerificationChecks(
         `dig +short _dmarc.${domain} TXT @${primaryResolver} 2>/dev/null`,
         { timeout: 15000 }
       );
-      const dmarcLines = dmarcResult.stdout.trim().split('\n').filter(Boolean);
+      // HL #R2: dig +short wraps TXT content in quotes. Without
+      // normalization, `dmarcLine.startsWith('v=DMARC1')` below fails on the
+      // leading `"`, flagging all 11 DMARC records as syntax failures even
+      // when the content is valid. Root cause of 11/11 VG2 dmarc_syntax
+      // false-fails in Session 04.
+      const dmarcLines = dmarcResult.stdout
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map(normalizeTxtRecord);
       const dmarcLine = dmarcLines.find((txt) => txt.includes('v=DMARC1'));
 
       if (!dmarcLine) {
