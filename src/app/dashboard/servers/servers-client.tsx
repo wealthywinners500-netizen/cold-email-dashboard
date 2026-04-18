@@ -1,15 +1,17 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
-import { AlertCircle, Server } from "lucide-react";
+import { AlertCircle, ExternalLink, Server } from "lucide-react";
 import CreateServerPairModal from "@/components/modals/create-server-pair-modal";
 import { useRealtimeRefresh } from "@/hooks/use-realtime";
 
 interface ServerPair {
+  id?: string;
   pair_number: number;
   ns_domain: string;
   s1_ip: string;
@@ -170,6 +172,7 @@ export default function ServersClient({ serverPairs }: ServersClientProps) {
                   <th className='text-left py-3 px-4 text-gray-400'>Accounts</th>
                   <th className='text-left py-3 px-4 text-gray-400'>Warmup</th>
                   <th className='text-left py-3 px-4 text-gray-400'>Progress</th>
+                  <th className='text-left py-3 px-4 text-gray-400'>Details</th>
                 </tr>
               </thead>
               <tbody>
@@ -209,6 +212,20 @@ export default function ServersClient({ serverPairs }: ServersClientProps) {
                             <Progress value={progress} className='h-1 flex-1' />
                             <span className='text-xs text-gray-400'>{progress}%</span>
                           </div>
+                        )}
+                      </td>
+                      <td className='py-3 px-4'>
+                        {pair.id ? (
+                          <Link
+                            href={`/dashboard/servers/${pair.id}`}
+                            onClick={(e) => e.stopPropagation()}
+                            className='inline-flex items-center gap-1 text-blue-400 hover:text-blue-300 text-xs font-medium'
+                          >
+                            <ExternalLink className='w-3 h-3' />
+                            View
+                          </Link>
+                        ) : (
+                          <span className='text-gray-600 text-xs'>—</span>
                         )}
                       </td>
                     </tr>
