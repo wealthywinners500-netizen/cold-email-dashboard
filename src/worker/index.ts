@@ -15,6 +15,7 @@ import { handleProvisionPair } from "./handlers/provision-pair";
 import { handleProvisionStep } from "./handlers/provision-step";
 import { handleRollbackProvision } from "./handlers/rollback-provision";
 import { handleHealthCheck } from "./handlers/health-check";
+import { handlePairVerify, type PairVerifyPayload } from "./handlers/pair-verify";
 import {
   handleListRegistrarDomains,
   type ListRegistrarDomainsPayload,
@@ -69,6 +70,7 @@ async function main() {
     "server-health-check",
     "poll-provisioning-jobs",
     "list-registrar-domains",
+    "pair-verify",
   ];
   for (const name of queueNames) {
     await boss.createQueue(name);
@@ -303,6 +305,14 @@ async function main() {
   await boss.work<VerifyNewLeadsPayload>(
     "verify-new-leads",
     withErrorHandling(handleVerifyNewLeads, "verify-new-leads")
+  );
+
+  // Register pair-verify handler (in-app Pair Verify feature).
+  // Runs the 4-check deliverability audit and writes results back to
+  // pair_verifications. See src/lib/provisioning/pair-verify.ts.
+  await boss.work<PairVerifyPayload>(
+    "pair-verify",
+    withErrorHandling(handlePairVerify, "pair-verify")
   );
 
   // Register provision-server-pair handler (B15-3, B16-hands-free)
