@@ -14,6 +14,7 @@ import {
   pairSharesAsn,
   clearAsnCache,
 } from "../asn-diversity";
+import { DryRunProvider, DRY_RUN_ASN_1, DRY_RUN_ASN_2 } from "../providers/dry-run";
 
 // ============================================
 // Canned Cymru verbose responses
@@ -158,6 +159,58 @@ async function testDifferentAsnPassesDiversity(): Promise<void> {
   console.log("✓ different-ASN pair passes diversity with reason=different_asn");
 }
 
+async function testDryRunPairHasDistinctAsns(): Promise<void> {
+  console.log("\n=== DryRunProvider pair ASN diversity ===\n");
+  clearAsnCache();
+
+  // Create two servers the same way the saga does — two sequential
+  // createServer() calls. The provider is responsible for handing out IPs
+  // from pools that map to different documentation ASNs.
+  const provider = new DryRunProvider();
+  const s1 = await provider.createServer({ name: "p-s1", region: "r1", size: "s1", image: "u22" });
+  const s2 = await provider.createServer({ name: "p-s2", region: "r1", size: "s1", image: "u22" });
+
+  assert(
+    s1.ip !== s2.ip,
+    `expected distinct IPs, got ${s1.ip} and ${s2.ip}`
+  );
+
+  // Run the real getAsn() — it must short-circuit to the documentation ASN
+  // without hitting the network. The default exec path is available but
+  // should never be called for DryRun-minted IPs.
+  const r1 = await getAsn(s1.ip, { skipCache: true });
+  const r2 = await getAsn(s2.ip, { skipCache: true });
+
+  const validAsns = new Set([DRY_RUN_ASN_1, DRY_RUN_ASN_2]);
+  assert(
+    r1.asn !== null && validAsns.has(r1.asn),
+    `s1 asn should be 64496 or 64497, got ${r1.asn}`
+  );
+  assert(
+    r2.asn !== null && validAsns.has(r2.asn),
+    `s2 asn should be 64496 or 64497, got ${r2.asn}`
+  );
+  assert(
+    r1.asn !== r2.asn,
+    `DryRun pair must resolve to two DIFFERENT ASNs — got ${r1.asn} and ${r2.asn}`
+  );
+
+  // pairSharesAsn must treat the dry-run pair as diverse.
+  const diversity = await pairSharesAsn(s1.ip, s2.ip);
+  assert(
+    diversity.diverse === true,
+    "dry-run pair must pass diversity check"
+  );
+  assert(
+    diversity.reason === "different_asn",
+    `expected reason=different_asn, got ${diversity.reason}`
+  );
+
+  console.log(
+    `✓ DryRunProvider fake pair ${s1.ip} (AS${r1.asn}) / ${s2.ip} (AS${r2.asn}) passes diversity`
+  );
+}
+
 async function testTimeoutWarnsAndPasses(): Promise<void> {
   console.log("\n=== Timeout case (should WARN but PASS) ===\n");
   clearAsnCache();
@@ -199,6 +252,7 @@ export async function testAsnDiversity(): Promise<void> {
   await testSameAsnFailsDiversity();
   await testDifferentAsnPassesDiversity();
   await testTimeoutWarnsAndPasses();
+  await testDryRunPairHasDistinctAsns();
 
   console.log("\n====================================");
   console.log("ALL TESTS PASSED ✓");

@@ -18,8 +18,49 @@ import type {
 
 type LogCallback = (message: string) => void;
 
+// RFC 5398 reserves AS 64496–64511 for documentation/example use. They'll
+// never collide with a real allocation, and surfacing two *distinct*
+// documentation ASNs (rather than dropping both fake IPs into 10.x.x.x
+// which all come back "unrouted") lets the BGP-ASN diversity check in
+// asn-diversity.ts return a meaningful different_asn verdict on dry runs.
+// DryRunProvider assigns these in round-robin to the fake IPs it generates;
+// getDryRunAsn() is consumed by the Cymru helper when it recognizes a
+// DryRun-minted IP.
+export const DRY_RUN_ASN_1 = 64496;
+export const DRY_RUN_ASN_2 = 64497;
+
+// Fake public-range IP pool — keeps us out of RFC1918 so the Cymru helper's
+// "unrouted" path doesn't swallow both IPs. These live in RFC 5737's
+// TEST-NET-1 (192.0.2.0/24) and TEST-NET-2 (198.51.100.0/24) — explicitly
+// reserved for documentation, won't appear in real BGP tables.
+const DRY_RUN_POOL_1 = "192.0.2."; // → DRY_RUN_ASN_1 (64496)
+const DRY_RUN_POOL_2 = "198.51.100."; // → DRY_RUN_ASN_2 (64497)
+
+// Alternating counter so two sequential createServer() calls (the common
+// case — one pair = two servers) produce IPs from different pools, yielding
+// distinct ASNs and passing the diversity check.
+let dryRunCreateSeq = 0;
+
+function nextDryRunIp(): string {
+  const pool = dryRunCreateSeq++ % 2 === 0 ? DRY_RUN_POOL_1 : DRY_RUN_POOL_2;
+  return `${pool}${Math.floor(Math.random() * 254) + 1}`;
+}
+
+/**
+ * Returns the synthetic ASN for a DryRunProvider-minted IP. Returns null if
+ * the IP didn't come from the DryRun pools — the Cymru helper falls back to
+ * a real whois lookup in that case.
+ */
+export function getDryRunAsn(ip: string): number | null {
+  if (ip.startsWith(DRY_RUN_POOL_1)) return DRY_RUN_ASN_1;
+  if (ip.startsWith(DRY_RUN_POOL_2)) return DRY_RUN_ASN_2;
+  return null;
+}
+
+// Legacy shim retained for getServer()'s synthetic-not-found fallback.
+// The two-server-per-pair path goes through createServer() / nextDryRunIp().
 function randomIP(): string {
-  return `10.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
+  return nextDryRunIp();
 }
 
 function randomId(): string {
