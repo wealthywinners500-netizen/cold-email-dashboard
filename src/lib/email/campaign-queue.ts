@@ -18,7 +18,21 @@ export function getBoss(): PgBoss {
     if (!connectionString) {
       throw new Error("DATABASE_URL environment variable is required for pg-boss");
     }
-    bossInstance = new PgBoss(connectionString);
+    // Hard Lesson #R3 (2026-04-18, job b920c716): pg-boss's default
+    // connection pool (`max: 10`) plus its internal Bam/Timekeeper/Monitor
+    // pools can collectively open 20-30 session-mode connections. Supabase's
+    // session pooler at port 5432 caps us at ~30 clients per project, so a
+    // single busy pg-boss worker can exhaust the pool and every tick after
+    // that dies with "MaxClientsInSessionMode: max clients reached". The
+    // worker then restarts, blows the session pool again, repeat.
+    //
+    // Capping `max: 4` keeps pg-boss under budget so there's still headroom
+    // for the wizard routes, poll-dispatch crons, and the direct Supabase
+    // queries the app makes via @supabase/supabase-js (those go through the
+    // REST endpoint, not the pooler, so they don't count — but DATABASE_URL
+    // session connections do). 4 is enough for pg-boss to make progress on
+    // dequeue + a handler's own queries without serializing everything.
+    bossInstance = new PgBoss({ connectionString, max: 4 });
   }
   return bossInstance;
 }
