@@ -38,6 +38,73 @@ export type ProgressCallback = (
 ) => void;
 
 // ============================================
+// Cascade guard (Regression C, Gate 0 fix 2026-04-17)
+// ============================================
+//
+// Before executing step N+1, verify that step N is in an "ok" terminal state
+// ('completed', 'manual_required', or 'skipped'). If step N is 'failed',
+// 'pending', or 'in_progress', the saga must not silently roll forward into
+// step N+1 — that cascade was the original bug: a failed step's error got
+// overwritten by the downstream step's failure, and the true first failure
+// was lost in the job's error_message.
+//
+// The contract on SagaAborted:
+//   - It is raised BEFORE step N+1's execute() runs — no side effects from
+//     N+1 hit the world.
+//   - The job-level error_message is updated to a cascade marker
+//     ("Saga aborted at step X: <reason>"), but the PREVIOUS step's
+//     error_message is left untouched — whoever marked step N failed owns
+//     that field and we must not clobber it.
+
+/**
+ * Thrown by the saga loop when a predecessor step is not in an "ok" state.
+ * Caught at the top of the step loop; triggers rollback without overwriting
+ * the predecessor step's error_message.
+ */
+export class SagaAborted extends Error {
+  readonly abortedAt: string;
+  readonly reason: string;
+  constructor(abortedAt: string, reason: string) {
+    super(`Saga aborted at step "${abortedAt}": ${reason}`);
+    this.name = 'SagaAborted';
+    this.abortedAt = abortedAt;
+    this.reason = reason;
+  }
+}
+
+/**
+ * Pure cascade-guard check. Given the previous step's DB record, throw
+ * SagaAborted if that step isn't in an "ok" state. Exported for unit tests.
+ *
+ * Accepted predecessor states (no throw):
+ *   - 'completed'         — normal success
+ *   - 'manual_required'   — success-with-intervention (saga continues)
+ *   - 'skipped'           — explicitly skipped via rollback; caller opted in
+ *
+ * Thrown-on states:
+ *   - 'failed'      — predecessor failed; downstream must not proceed
+ *   - 'pending'     — predecessor not started (stale state / DB corruption)
+ *   - 'in_progress' — predecessor still running (concurrent writer suspected)
+ *   - anything else — defensive: unknown states abort to be safe
+ */
+export function assertPreviousStepOk(
+  prev:
+    | { step_type: string; status: string; error_message?: string | null }
+    | null
+    | undefined,
+  _currentStepName: string
+): void {
+  if (!prev) return; // first step has no predecessor — nothing to check
+  const okStates = new Set(['completed', 'manual_required', 'skipped']);
+  if (okStates.has(prev.status)) return;
+  const reason =
+    prev.error_message && prev.error_message.length > 0
+      ? prev.error_message
+      : `previous step in status "${prev.status}"`;
+  throw new SagaAborted(prev.step_type, reason);
+}
+
+// ============================================
 // SagaEngine Class
 // ============================================
 
@@ -93,10 +160,13 @@ export class SagaEngine {
       }
     }
 
-    // Load existing step rows (for idempotent retry)
+    // Load existing step rows (for idempotent retry).
+    // The stepMap is kept in sync with each step's status change so the
+    // cascade guard below can read the predecessor's current state
+    // without a fresh DB round-trip per step.
     const existingSteps = await getProvisioningSteps(this.jobId);
     const stepMap = new Map(
-      existingSteps.map((s: { step_type: string; id: string; status: string; metadata: Record<string, unknown> }) => [s.step_type, s])
+      existingSteps.map((s: { step_type: string; id: string; status: string; metadata: Record<string, unknown>; error_message?: string | null }) => [s.step_type, s])
     );
 
     // Ensure all step rows exist in DB
@@ -152,6 +222,44 @@ export class SagaEngine {
         continue;
       }
 
+      // Cascade guard (Gate 0 regression C): before running step N+1,
+      // assert step N is ok. If it isn't, SagaAborted bubbles out without
+      // touching step N's error_message — only the job-level field gets
+      // the cascade marker.
+      if (i > 0) {
+        const prevType = this.steps[i - 1].type;
+        const prevDbStep = stepMap.get(prevType);
+        try {
+          assertPreviousStepOk(prevDbStep, step.name);
+        } catch (err) {
+          if (err instanceof SagaAborted) {
+            await supabase
+              .from('provisioning_jobs')
+              .update({
+                status: 'failed',
+                error_message: `Saga aborted at step "${err.abortedAt}": ${err.reason}`,
+              })
+              .eq('id', this.jobId);
+
+            this.onProgress?.(
+              this.calculateProgress(completedStepIndices.length),
+              step.type,
+              `Aborted: predecessor "${err.abortedAt}" not ok (${err.reason})`
+            );
+
+            context.log(
+              `[saga] Cascade abort: step "${step.type}" skipped because predecessor "${err.abortedAt}" is not ok. ` +
+                `Preserving predecessor's error_message; job-level error updated.`
+            );
+
+            await this.rollback(context, completedStepIndices);
+
+            return { success: false, error: err.message };
+          }
+          throw err;
+        }
+      }
+
       // Mark step as in_progress
       const startTime = Date.now();
       await updateProvisioningStep(dbStep.id, {
@@ -194,6 +302,15 @@ export class SagaEngine {
             metadata: result.metadata || {},
           });
 
+          // Keep the in-memory stepMap current so the cascade guard on the
+          // NEXT iteration sees the fresh 'completed'/'manual_required'
+          // status without a DB round-trip.
+          stepMap.set(step.type, {
+            ...dbStep,
+            status: finalStatus,
+            metadata: result.metadata || {},
+          });
+
           completedStepIndices.push(i);
           const pct = this.calculateProgress(completedStepIndices.length);
 
@@ -214,12 +331,22 @@ export class SagaEngine {
             );
           }
         } else {
+          const stepError = result.error || 'Unknown error';
           await updateProvisioningStep(dbStep.id, {
             status: 'failed' as StepStatus,
             completed_at: new Date().toISOString(),
             duration_ms: durationMs,
-            error_message: result.error || 'Unknown error',
+            error_message: stepError,
             output: result.output,
+          });
+
+          // Sync stepMap so any downstream loop iteration (or re-entry) sees
+          // the failure and triggers the cascade guard rather than rolling
+          // forward blindly.
+          stepMap.set(step.type, {
+            ...dbStep,
+            status: 'failed',
+            error_message: stepError,
           });
 
           await supabase
@@ -251,6 +378,13 @@ export class SagaEngine {
           status: 'failed' as StepStatus,
           completed_at: new Date().toISOString(),
           duration_ms: durationMs,
+          error_message: errorMsg,
+        });
+
+        // Sync stepMap so downstream iterations / retries see the failure.
+        stepMap.set(step.type, {
+          ...dbStep,
+          status: 'failed',
           error_message: errorMsg,
         });
 

@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "seed": "npx tsx src/seed/seed-dean-org.ts"
+    "seed": "npx tsx src/seed/seed-dean-org.ts",
+    "test:gate0": "tsx src/lib/provisioning/__tests__/dnsbl-liveness.test.ts && tsx src/lib/provisioning/__tests__/asn-diversity.test.ts && tsx src/lib/provisioning/__tests__/saga-cascade-guard.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.82.0",
