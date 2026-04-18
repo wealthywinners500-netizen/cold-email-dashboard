@@ -1,6 +1,7 @@
 import type { SSHManager } from './ssh-manager';
 import type { VerificationResult } from './types';
 import { HESTIA_PATH_PREFIX } from './hestia-scripts';
+import { createAdminClient } from '@/lib/supabase/server';
 
 /**
  * Comprehensive verification checks for HestiaCP mail server provisioning.
@@ -18,6 +19,12 @@ export async function runVerificationChecks(
     server1Domains: string[];
     server2Domains: string[];
     log: (msg: string) => void;
+    // Optional pair_id — when provided, split-aware checks (ssl_cert_existence,
+    // https_connectivity) prefer the DB-stored primary_server_id from
+    // sending_domains. Falls back to in-memory server1Domains/server2Domains
+    // for legacy callers (e.g. the saga itself, where the pair row doesn't
+    // exist yet at VG1/VG2 time). HL #R1 (Session 04b).
+    pairId?: string;
   }
 ): Promise<VerificationResult[]> {
   const results: VerificationResult[] = [];
@@ -30,14 +37,44 @@ export async function runVerificationChecks(
     server1Domains,
     server2Domains,
     log,
+    pairId,
   } = params;
 
   // All domains to check: NS domain + all sending domains
   const allDomains = [nsDomain, ...sendingDomains];
 
+  // Load per-domain primary_server_id from sending_domains when pairId is
+  // provided. When empty (no rows, NULL column, or no pairId), split-aware
+  // checks fall back to the in-memory server1Domains/server2Domains params.
+  // HL #R1 (Session 04b): the ssl_cert_existence check needs an authoritative
+  // split — an empty in-memory list caused 10/10 false positives.
+  const dbPrimaryServerMap = new Map<string, 's1' | 's2'>();
+  if (pairId) {
+    try {
+      const supabase = await createAdminClient();
+      const { data: domainAssignments } = await supabase
+        .from('sending_domains')
+        .select('domain, primary_server_id')
+        .eq('pair_id', pairId);
+      for (const row of domainAssignments || []) {
+        const pid = (row as { primary_server_id: string | null }).primary_server_id;
+        const dom = (row as { domain: string }).domain;
+        if (pid === 's1' || pid === 's2') {
+          dbPrimaryServerMap.set(dom, pid);
+        }
+      }
+      log(`[VG] Loaded ${dbPrimaryServerMap.size} primary_server_id assignments from sending_domains`);
+    } catch (err) {
+      log(`[VG] Warning: failed to load sending_domains primary_server_id (falling back to in-memory split): ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   // Helper to determine which server a domain belongs to
   const getServerForDomain = (domain: string): 'S1' | 'S2' => {
     if (domain === nsDomain) return 'S1';
+    // DB is authoritative when present (split-aware, HL #R1).
+    const dbAssigned = dbPrimaryServerMap.get(domain);
+    if (dbAssigned) return dbAssigned === 's1' ? 'S1' : 'S2';
     if (server1Domains.includes(domain)) return 'S1';
     if (server2Domains.includes(domain)) return 'S2';
     return 'S1'; // Default to S1 if not found
