@@ -1,4 +1,4 @@
-import { initBoss, stopBoss } from "../lib/email/campaign-queue";
+import { initBoss } from "../lib/email/campaign-queue";
 import { handleSendEmail } from "./handlers/send-email";
 import { handleProcessSequenceStep } from "./handlers/process-sequence-step";
 import { handleCheckNoReply } from "./handlers/check-no-reply";
@@ -64,7 +64,8 @@ async function main() {
     "distribute-campaign-sends",
     "verify-new-leads",
     "provision-server-pair",
-    "provision-step",
+    // NOTE: "provision-step" is created separately below with retryLimit=0
+    // and expireInSeconds=1800 to prevent pg-boss zombie-retry (HL #94).
     "rollback-provision",
     "server-health-check-cron",
     "server-health-check",
@@ -75,6 +76,17 @@ async function main() {
   for (const name of queueNames) {
     await boss.createQueue(name);
   }
+
+  // HL #94 (job b920c716, 2026-04-18): disable pg-boss queue-level retry on
+  // provision-step. The saga owns retry/rollback; a queue-level retry after
+  // a worker restart re-runs the provider/SSH side-effects (e.g. Linode
+  // createServer — "Label must be unique") and the failed callback then
+  // overwrites the already-completed step row, cascading the saga. Also cap
+  // expireInSeconds at 30 min so dead jobs don't sit "active" forever.
+  await boss.createQueue("provision-step", {
+    retryLimit: 0,
+    expireInSeconds: 1800,
+  });
   console.log("[Worker] All queues created");
 
   // --- Heartbeat: pulse every 60 seconds for all orgs ---
@@ -373,6 +385,11 @@ async function main() {
   // be delivered twice in parallel while it's still running. pg-boss would
   // otherwise re-deliver on ack timeout and trigger the same race condition
   // that poisoned Test #11. (pg-boss v12 uses localConcurrency, not teamSize.)
+  //
+  // HL #94 (job b920c716, 2026-04-18): queue-level retryLimit=0 /
+  // expireInSeconds=1800 are set on the queue itself via createQueue above —
+  // pg-boss v12 moved those off the work() options and onto the queue
+  // definition. WorkOptions here only control fetch/polling/concurrency.
   await boss.work<ProvisionStepPayload>(
     "provision-step",
     {
@@ -818,20 +835,30 @@ async function main() {
 
   console.log("[Worker] Email worker is running. Waiting for jobs...");
 
-  // Graceful shutdown
-  const shutdown = async (signal: string) => {
-    console.log(`[Worker] Received ${signal}, shutting down...`);
+  // Graceful shutdown — lets in-flight provision-step SSH work finish before
+  // the process exits. pg-boss v12 StopOptions: { graceful, close, timeout }
+  // (no `wait` flag — that was v9). With graceful:true pg-boss stops
+  // fetching new jobs and waits up to `timeout` ms for active handlers to
+  // finish; close:true tears down the connection pool after. HL #94:
+  // premature SIGTERM kills are the zombie-retry trigger.
+  const shutdownHandler = async (signal: string) => {
+    console.log(`[Worker] ${signal} received, draining pg-boss (up to 5 min)...`);
     clearInterval(heartbeatInterval);
     if (blacklistServer) {
       await new Promise<void>((resolve) => blacklistServer.close(() => resolve()));
     }
     closeAll();
-    await stopBoss();
+    try {
+      await boss.stop({ graceful: true, close: true, timeout: 300_000 });
+      console.log("[Worker] pg-boss drained cleanly, exiting.");
+    } catch (err) {
+      console.error("[Worker] Error during drain:", err);
+    }
     process.exit(0);
   };
 
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdownHandler("SIGTERM"));
+  process.on("SIGINT", () => shutdownHandler("SIGINT"));
 }
 
 main().catch((err) => {

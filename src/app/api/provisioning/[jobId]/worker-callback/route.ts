@@ -117,6 +117,25 @@ export async function POST(
       );
     }
 
+    // STALE-CALLBACK REJECT (HL #94) — a zombie retry's failure must not overwrite
+    // a successful completion. Drop the callback silently, 200 OK so pg-boss acks.
+    if (step.status === "completed" && status === "failed") {
+      console.warn(`[WorkerCallback] Dropping stale failed callback for completed step`, {
+        jobId, stepType, stepId: step.id,
+        completed_at: step.completed_at,
+      });
+      return NextResponse.json({ accepted: false, reason: "stale_callback" }, { status: 200 });
+    }
+
+    // Symmetric: if step is already 'failed' and callback is 'completed', also drop.
+    // A second attempt might succeed but we've already closed the saga on failure.
+    if (step.status === "failed" && status === "completed") {
+      console.warn(`[WorkerCallback] Dropping stale completed callback for failed step`, {
+        jobId, stepType, stepId: step.id,
+      });
+      return NextResponse.json({ accepted: false, reason: "stale_callback" }, { status: 200 });
+    }
+
     // Update step with worker result
     const now = new Date().toISOString();
 
