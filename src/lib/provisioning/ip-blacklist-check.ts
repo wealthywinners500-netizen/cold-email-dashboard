@@ -16,6 +16,7 @@
 // ============================================
 
 import { Resolver } from 'dns';
+import { isDnsblZoneLive } from './dnsbl-liveness';
 
 // PATCH 20: Complete DNSBL coverage matching MXToolbox's blacklist checker.
 // ALL are fatal — Dean's rule: zero blacklists on any launched server.
@@ -207,17 +208,23 @@ export async function checkIPBlacklist(ip: string): Promise<IPBlacklistResult> {
 
   const results = await Promise.all(
     IP_BLACKLISTS.map(async ({ zone, name }) => {
-      // Step 1: canary-verify the zone is reachable from this host.
-      // If the zone's 127.0.0.2 self-test doesn't return listed from ANY
-      // resolver in RESOLVER_CHAIN, the zone is blind from our network path
-      // and we cannot trust a "clean" answer for the real IP.
-      const resolverIP = await pickResolverWithLiveZone(zone, TIMEOUT_MS);
-      if (!resolverIP) {
-        // Fail-closed: flag as a fatal listing so the create_vps handler
-        // rerolls. An IP we can't verify clean is an IP we can't ship.
+      // Step 1 (Gate 0 regression A, 2026-04-17): Check DB-backed liveness
+      // cache. `isDnsblZoneLive` queries all 3 resolvers with the canary
+      // (127.0.0.2) and caches the result for 6h. If the zone is confirmed
+      // dead for ≥24h continuously, it's treated as decommissioned and
+      // SKIPPED (not counted as a listing) — previously a transient
+      // 3-resolver glitch would nuke fresh IPs with ZONE_UNREACHABLE.
+      let liveness: Awaited<ReturnType<typeof isDnsblZoneLive>>;
+      try {
+        liveness = await isDnsblZoneLive(zone, { timeoutMs: TIMEOUT_MS });
+      } catch (err) {
+        // Cache lookup itself failed catastrophically — fall back to the
+        // old behavior (fail-closed). This branch should be unreachable
+        // because isDnsblZoneLive swallows its own DB errors.
         console.warn(
-          `[ip-blacklist] ZONE UNREACHABLE from all resolvers: ${zone} (${name}). ` +
-          `Failing IP check closed — reroll required.`
+          `[ip-blacklist] isDnsblZoneLive threw unexpectedly for ${zone}: ${
+            err instanceof Error ? err.message : String(err)
+          }. Failing closed.`
         );
         return {
           zone,
@@ -228,15 +235,49 @@ export async function checkIPBlacklist(ip: string): Promise<IPBlacklistResult> {
         };
       }
 
-      // Step 2: real IP query using the resolver that proved live for this zone.
-      const r = await queryZone(reversed, zone, resolverIP, TIMEOUT_MS);
-      if (r.kind === 'listed') {
-        return { zone, name, fatal: true, response: r.response as string | null, unreachable: false as const };
+      if (!liveness.live) {
+        // Zone has been dead across all 3 resolvers for ≥24h continuously.
+        // Skip silently — a genuinely decommissioned DNSBL should not
+        // permanently block new IP provisioning. NOT fatal, NOT counted.
+        console.warn(
+          `[ip-blacklist] Zone ${zone} (${name}) confirmed dead for ≥24h; ` +
+            `skipping (not fatal). Remove from IP_BLACKLISTS if permanent.`
+        );
+        return {
+          zone,
+          name,
+          fatal: false,
+          response: null as string | null,
+          unreachable: true as const,
+        };
       }
-      // nxdomain, empty, error, or timeout — treat as clean for THIS zone
-      // (we already verified the zone was live via canary, so these are
-      // legitimate "not listed" responses, not blind-zone false-negatives).
-      return { zone, name, fatal: true, response: null as string | null, unreachable: false as const };
+
+      // Step 2: pick a resolver that saw the zone live (from evidence),
+      // falling back to the first resolver if none did (grace-window case
+      // where all 3 returned NXDOMAIN but we haven't tripped the fail-safe).
+      const livingResolver =
+        RESOLVER_CHAIN.find((r) => liveness.evidence[r] === 'listed') ??
+        RESOLVER_CHAIN[0];
+
+      // Step 3: query the real IP using the picked resolver.
+      const r = await queryZone(reversed, zone, livingResolver, TIMEOUT_MS);
+      if (r.kind === 'listed') {
+        return {
+          zone,
+          name,
+          fatal: true,
+          response: r.response as string | null,
+          unreachable: false as const,
+        };
+      }
+      // nxdomain, empty, error, or timeout on the real IP — treat as clean.
+      return {
+        zone,
+        name,
+        fatal: true,
+        response: null as string | null,
+        unreachable: false as const,
+      };
     })
   );
 
