@@ -1365,29 +1365,36 @@ export function computeZonePartition(
 }
 
 /**
- * Add `allow-transfer { peerIP; }; also-notify { peerIP; };` to each zone's
- * master stanza in /etc/bind/named.conf. HestiaCP writes one-line stanzas of
- * the form `zone "DOMAIN" {type master; file "PATH";};` — this sed edit
- * inserts between the file directive and the closing brace.
+ * Set `allow-transfer` and `also-notify` GLOBALLY in /etc/bind/named.conf.options,
+ * scoped to the peer IP. These act as defaults for every master zone on this
+ * server (per-zone overrides win, but Hestia doesn't write per-zone options).
  *
- * Idempotent: if allow-transfer is already present for this peer, sed leaves
- * the line unchanged (the match includes the bare default form only).
+ * HL #105 (Session 04d): Per-zone stanzas in /etc/bind/named.conf are NOT
+ * durable. HestiaCP's `v-add-letsencrypt-domain`, `v-add-dns-record`, and
+ * `v-rebuild-dns-domain` regenerate each zone stanza from a template that
+ * emits the bare `{type master; file "...";};` form — any per-zone
+ * allow-transfer/also-notify added via sed is wiped on the next operation.
+ * HestiaCP does NOT touch /etc/bind/named.conf.options (only on the user-
+ * triggered `v-change-sys-service-config bind9-opt` path). Put cluster-wide
+ * BIND policy there.
  *
- * Follows rndc reload on primary so the new policy takes effect and
- * also-notify fires on subsequent record changes.
+ * Replaces the HestiaCP default `allow-transfer {"none";};` with a peer-IP-
+ * scoped allow list and adds `also-notify` so record changes on any master
+ * zone automatically propagate via AXFR to the peer.
+ *
+ * Uses `rndc reconfig` (not `reload`) — options-block changes need a
+ * configuration re-parse; `reload` only reloads zones.
  */
-export async function configureZoneTransferPolicy(
+export async function setGlobalZoneTransferPolicy(
   ssh: SSHManager,
-  zones: string[],
   peerIP: string,
 ): Promise<void> {
-  for (const zone of zones) {
-    const bareStanza = `zone "${zone}" {type master; file "/home/admin/conf/dns/${zone}.db";};`;
-    const withPolicy = `zone "${zone}" {type master; file "/home/admin/conf/dns/${zone}.db"; allow-transfer { ${peerIP}; }; also-notify { ${peerIP}; };};`;
-    const sedCmd = `sed -i 's|${bareStanza.replace(/"/g, '\\"')}|${withPolicy.replace(/"/g, '\\"')}|' /etc/bind/named.conf`;
-    await ssh.exec(sedCmd, { timeout: 10000 });
-  }
-  await ssh.exec('rndc reload', { timeout: 10000 }).catch(() => {});
+  // Idempotent: if the peer-IP allow-transfer is already present, sed is a no-op.
+  await ssh.exec(
+    `sed -i 's|allow-transfer {"none";};|allow-transfer { ${peerIP}; };\\n        also-notify { ${peerIP}; };|' /etc/bind/named.conf.options`,
+    { timeout: 10000 }
+  );
+  await ssh.exec('rndc reconfig', { timeout: 10000 }).catch(() => {});
 }
 
 /**

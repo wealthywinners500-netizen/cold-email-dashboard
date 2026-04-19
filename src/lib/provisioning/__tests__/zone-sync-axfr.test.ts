@@ -92,12 +92,12 @@ assert(
   'setup_dns_zones calls computeZonePartition'
 );
 assert(
-  /configureZoneTransferPolicy\(ssh1, s1Primary, server2IP\)/.test(sagaSrc),
-  'setup_dns_zones configures S1 allow-transfer to S2'
+  /setGlobalZoneTransferPolicy\(ssh1, server2IP\)/.test(sagaSrc),
+  'setup_dns_zones sets S1 global allow-transfer to S2 (named.conf.options)'
 );
 assert(
-  /configureZoneTransferPolicy\(ssh2, s2Primary, server1IP\)/.test(sagaSrc),
-  'setup_dns_zones configures S2 allow-transfer to S1'
+  /setGlobalZoneTransferPolicy\(ssh2, server1IP\)/.test(sagaSrc),
+  'setup_dns_zones sets S2 global allow-transfer to S1 (named.conf.options)'
 );
 assert(
   /installSlaveZones\(ssh2, s1Primary, server1IP\)/.test(sagaSrc),
@@ -146,10 +146,24 @@ assert(
   'installSlaveZones triggers initial AXFR via rndc retransfer'
 );
 
-// 9. configureZoneTransferPolicy sed edit form
+// 9. setGlobalZoneTransferPolicy edits named.conf.options (NOT per-zone stanzas)
+//    HL #105: per-zone allow-transfer in /etc/bind/named.conf is wiped by
+//    Hestia on zone regeneration. Global options are durable.
 assert(
-  /allow-transfer \{ \$\{peerIP\}; \}; also-notify \{ \$\{peerIP\}; \}/.test(hestiaSrc),
-  'configureZoneTransferPolicy writes allow-transfer + also-notify scoped to peer IP'
+  /setGlobalZoneTransferPolicy\([^)]*peerIP[^)]*\)/.test(hestiaSrc),
+  'setGlobalZoneTransferPolicy helper exported from hestia-scripts.ts'
+);
+assert(
+  /named\.conf\.options/.test(hestiaSrc) && /allow-transfer \{ \$\{peerIP\}; \}/.test(hestiaSrc),
+  'setGlobalZoneTransferPolicy writes allow-transfer to named.conf.options'
+);
+assert(
+  /rndc reconfig/.test(hestiaSrc),
+  'setGlobalZoneTransferPolicy uses rndc reconfig (options changes need reconfig, not reload)'
+);
+assert(
+  /HL #105/.test(hestiaSrc),
+  'HL #105 cited so the per-zone-edit anti-pattern does not reappear'
 );
 
 // 10. openBindFirewall idempotency pattern
