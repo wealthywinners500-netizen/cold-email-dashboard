@@ -106,6 +106,20 @@ export async function runVerificationChecks(
     return server === 'S1' ? server1IP : server2IP;
   };
 
+  // HL #R3 (Session 04c): SSL checks 27–30 must probe the mail hostname for
+  // sending domains, because LE certs are issued for `mail.{domain}` by
+  // `setup_mail_domains`, not for the web-vhost bare domain. Probing
+  // `{domain}:443` with SNI `{domain}` hits Apache's default vhost and
+  // returns `mail{1|2}.{nsDomain}` — a CN mismatch that VG2 flagged as
+  // `auto_fixable`. Auto-fix then called `v-add-letsencrypt-domain admin
+  // {domain} '' yes`, which issued a fresh cert for the SAN set
+  // `[mail.{domain}, webmail.{domain}]`. Repeated retries burned the
+  // "duplicate certs per exact set of identifiers" LE rate limit (5/168h)
+  // and produced the Session 04 "S2 LE silent-exit" symptom. Fix: probe
+  // the hostname that already has a valid cert.
+  const getSSLProbeHost = (domain: string): string =>
+    domain === nsDomain ? domain : `mail.${domain}`;
+
   // DNS resolvers: query our own authoritative NS first (records are guaranteed
   // present since Steps 5-7 just created them), fall back to public resolvers
   // only for checks that must verify global propagation. Using 8.8.8.8 as the
@@ -1693,10 +1707,11 @@ export async function runVerificationChecks(
     const server = getServerForDomain(domain);
     const ip = getServerIPForDomain(domain);
     const sshn = server === 'S1' ? ssh1 : ssh2;
+    const probeHost = getSSLProbeHost(domain);
 
     try {
       const result = await sshn.exec(
-        `echo | openssl s_client -connect ${ip}:443 -servername ${domain} 2>/dev/null | openssl x509 -noout -subject -dates`,
+        `echo | openssl s_client -connect ${ip}:443 -servername ${probeHost} 2>/dev/null | openssl x509 -noout -subject -dates`,
         { timeout: 15000 }
       );
       const output = result.stdout;
@@ -1707,10 +1722,10 @@ export async function runVerificationChecks(
           domain,
           server,
           status: 'auto_fixable',
-          details: `No SSL certificate or certificate error for ${domain}`,
+          details: `No SSL certificate or certificate error for ${probeHost}`,
           fixAction: 'reissue_ssl',
         });
-      } else if (output.includes(domain)) {
+      } else if (output.includes(probeHost)) {
         results.push({
           check: 'ssl_cert_existence',
           domain,
@@ -1745,10 +1760,11 @@ export async function runVerificationChecks(
     const server = getServerForDomain(domain);
     const ip = getServerIPForDomain(domain);
     const sshn = server === 'S1' ? ssh1 : ssh2;
+    const probeHost = getSSLProbeHost(domain);
 
     try {
       const result = await sshn.exec(
-        `echo | openssl s_client -connect ${ip}:443 -servername ${domain} 2>/dev/null | openssl x509 -noout -enddate`,
+        `echo | openssl s_client -connect ${ip}:443 -servername ${probeHost} 2>/dev/null | openssl x509 -noout -enddate`,
         { timeout: 15000 }
       );
       const endDateLine = result.stdout.trim();
@@ -1816,10 +1832,11 @@ export async function runVerificationChecks(
     const ip = getServerIPForDomain(domain);
     const sshn = server === 'S1' ? ssh1 : ssh2;
     const isS2Domain = server2Domains.includes(domain);
+    const probeHost = getSSLProbeHost(domain);
 
     try {
       const result = await sshn.exec(
-        `echo | openssl s_client -connect ${ip}:443 -servername ${domain} 2>/dev/null | openssl x509 -noout -subject -issuer`,
+        `echo | openssl s_client -connect ${ip}:443 -servername ${probeHost} 2>/dev/null | openssl x509 -noout -subject -issuer`,
         { timeout: 15000 }
       );
       const output = result.stdout;
@@ -1860,14 +1877,16 @@ export async function runVerificationChecks(
 
   // Check 30: HTTPS connectivity
   // All domains should pass HTTPS. S2 domains now have valid LE certs (no more dual A records).
+  // Probe the mail hostname for sending domains — HL #R3 (Session 04c).
   log('[VG] Running check 30: HTTPS connectivity');
   for (const domain of allDomains) {
     const server = getServerForDomain(domain);
     const sshn = server === 'S1' ? ssh1 : ssh2;
     const isS2Domain = server2Domains.includes(domain);
+    const probeHost = getSSLProbeHost(domain);
 
     try {
-      const result = await sshn.exec(`curl -sI --max-time 10 https://${domain}/ 2>&1 | head -1`, {
+      const result = await sshn.exec(`curl -sI --max-time 10 https://${probeHost}/ 2>&1 | head -1`, {
         timeout: 15000,
       });
       const output = result.stdout.trim();
