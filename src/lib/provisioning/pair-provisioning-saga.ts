@@ -35,6 +35,10 @@ import {
   unmaskExim4,
   syncZoneFiles,
   replicateSSLCertToSecondary,
+  computeZonePartition,
+  configureZoneTransferPolicy,
+  installSlaveZones,
+  openBindFirewall,
   HESTIA_PATH_PREFIX,
 } from './hestia-scripts';
 import { generateAccountNamesForPair } from './name-generator';
@@ -539,59 +543,74 @@ export function createPairProvisioningSaga(
         const server2IP = ctx.server2IP as string;
 
         try {
-          // Create NS domain zone on Server 1
-          context.log(`[Step 4] Creating NS zone: ${context.nsDomain}`);
-          await createDNSZone(ssh1, {
-            domain: context.nsDomain,
-            server1IP,
-            server2IP,
-            nsDomain: context.nsDomain,
-            isNSDomain: true,
-          });
+          // Session 04d Option A (HL #101): zone-ownership partition + AXFR/NOTIFY.
+          // Old dual-primary flow (createDNSZone on S1 for every zone + replicateZone
+          // to S2 as another master) diverged SOA serials and never propagated DKIM.
+          // New flow: each zone has exactly one primary; the peer is a BIND slave.
+          const { s1Primary, s2Primary } = computeZonePartition(
+            context.nsDomain,
+            context.sendingDomains
+          );
+          context.log(
+            `[Step 4] Zone partition: S1 primary=${s1Primary.length} (NS + ${s1Primary.length - 1} sending), S2 primary=${s2Primary.length} sending`
+          );
+          context.log(`[Step 4] S1 primary zones: ${s1Primary.join(', ')}`);
+          context.log(`[Step 4] S2 primary zones: ${s2Primary.join(', ')}`);
 
-          // Compute domain split early so DNS A records point to the correct server
-          // S2 domains need @ A → server2IP for LE HTTP-01 validation to succeed
-          const midpoint = Math.ceil(context.sendingDomains.length / 2);
-          const s1DomainsForDNS = context.sendingDomains.slice(0, midpoint);
-          const s2DomainsForDNS = context.sendingDomains.slice(midpoint);
-          context.log(`[Step 4] Domain split for DNS: S1=${s1DomainsForDNS.length}, S2=${s2DomainsForDNS.length}`);
-
-          // Create zones for all sending domains on Server 1
-          for (const domain of context.sendingDomains) {
-            const isS2Domain = s2DomainsForDNS.includes(domain);
-            context.log(`[Step 4] Creating zone: ${domain} (primary: ${isS2Domain ? 'S2' : 'S1'})`);
+          // Create S1-primary zones on S1 (NS + alphabetically-first half of sending domains)
+          for (const domain of s1Primary) {
+            const isNS = domain === context.nsDomain;
+            context.log(`[Step 4] Creating S1-primary zone: ${domain}${isNS ? ' (NS)' : ''}`);
             await createDNSZone(ssh1, {
               domain,
               server1IP,
               server2IP,
               nsDomain: context.nsDomain,
-              isNSDomain: false,
-              primaryIP: isS2Domain ? server2IP : server1IP,
+              isNSDomain: isNS,
+              primaryIP: server1IP,
             });
           }
 
-          // Replicate ALL zones to Server 2
-          context.log('[Step 4] Replicating NS zone to Server 2...');
-          await replicateZone(ssh1, ssh2, {
-            domain: context.nsDomain,
-            includeMailDomains: false,
-          });
-
-          for (const domain of context.sendingDomains) {
-            context.log(`[Step 4] Replicating zone ${domain} to Server 2...`);
-            await replicateZone(ssh1, ssh2, {
+          // Create S2-primary zones on S2 (alphabetically-last half of sending domains)
+          for (const domain of s2Primary) {
+            context.log(`[Step 4] Creating S2-primary zone: ${domain}`);
+            await createDNSZone(ssh2, {
               domain,
-              includeMailDomains: false,
+              server1IP,
+              server2IP,
+              nsDomain: context.nsDomain,
+              isNSDomain: false,
+              primaryIP: server2IP,
             });
           }
 
-          // Hard Lesson #16b: rndc reload on both servers
+          // Open peer-scoped port 53 firewall (no-op on current infra — port 53
+          // is already world-open for authoritative DNS — but keeps contract
+          // explicit for future tighter firewalls).
+          await openBindFirewall(ssh1, server2IP);
+          await openBindFirewall(ssh2, server1IP);
+
+          // Configure allow-transfer + also-notify on each primary to its peer.
+          await configureZoneTransferPolicy(ssh1, s1Primary, server2IP);
+          await configureZoneTransferPolicy(ssh2, s2Primary, server1IP);
+
+          // Install slave zones on peer via /etc/bind/named.conf.cluster include.
+          // S2 slaves S1's primary zones; S1 slaves S2's primary zones.
+          await installSlaveZones(ssh2, s1Primary, server1IP);
+          await installSlaveZones(ssh1, s2Primary, server2IP);
+
+          // Hard Lesson #16b: rndc reload on both servers (already done inside
+          // installSlaveZones and configureZoneTransferPolicy, but belt-and-suspenders).
           await ssh1.exec('rndc reload', { timeout: 10000 }).catch(() => {});
           await ssh2.exec('rndc reload', { timeout: 10000 }).catch(() => {});
 
           return {
             success: true,
-            output: `DNS zones created: ${context.nsDomain} + ${context.sendingDomains.length} sending domains. Replicated to Server 2.`,
+            output: `DNS zones partitioned: S1 primary=${s1Primary.length} (incl. NS), S2 primary=${s2Primary.length}. Peers configured as slaves via AXFR/NOTIFY.`,
+            metadata: {
+              s1PrimaryZones: s1Primary,
+              s2PrimaryZones: s2Primary,
+            },
           };
         } catch (err) {
           return {
@@ -788,10 +807,16 @@ export function createPairProvisioningSaga(
             );
           }
 
-          // PATCH 10: Split sending domains between servers
-          const midpoint = Math.ceil(context.sendingDomains.length / 2);
-          const server1Domains = context.sendingDomains.slice(0, midpoint);
-          const server2Domains = context.sendingDomains.slice(midpoint);
+          // PATCH 10 (Session 04d update): deterministic alphabetical partition
+          // shared with setup_dns_zones (step 4) via computeZonePartition. This
+          // guarantees the server that hosts the DNS zone also hosts the mail
+          // domain — required for DKIM: Hestia writes the DKIM TXT into the
+          // domain's zone file on whichever server created the mail domain,
+          // and slave AXFR propagates it to the peer.
+          const partition = computeZonePartition(context.nsDomain, context.sendingDomains);
+          const server1Domains = partition.s1Primary.filter((d) => d !== context.nsDomain);
+          const server2Domains = partition.s2Primary;
+          const midpoint = server1Domains.length;
 
           context.log(`[Step 6] Domain split: S1 gets ${server1Domains.length} domains (${server1Domains.join(', ')})`);
           context.log(`[Step 6] Domain split: S2 gets ${server2Domains.length} domains (${server2Domains.join(', ')})`);
@@ -1020,9 +1045,9 @@ export function createPairProvisioningSaga(
                   `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ A ${server2IP}`,
                   { timeout: 10000 }
                 );
-                // Add correct MX → mail2.domain
+                // Add correct MX → mail2.{nsDomain}  (HL #100: Option A centralized gateway)
                 await sshConn.exec(
-                  `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ MX mail2.${domain} 10`,
+                  `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ MX mail2.${context.nsDomain} 10`,
                   { timeout: 10000 }
                 );
               } catch (err) {
@@ -1031,7 +1056,48 @@ export function createPairProvisioningSaga(
                 throw new Error(`Failed to fix @ A/MX for S2 domain ${domain} on ${label}: ${err}`);
               }
             }
-            context.log(`[Step 6] A/MX fixed for ${domain}: @ A → ${server2IP}, MX → mail2.${domain}`);
+            context.log(`[Step 6] A/MX fixed for ${domain}: @ A → ${server2IP}, MX → mail2.${context.nsDomain}`);
+          }
+
+          // PATCH 11d (HL #100, Option A): MX rewrite for S1 domains on BOTH servers.
+          // Hestia's v-add-mail-domain writes `@ MX mail.{domain}` as default. The VG2
+          // check expects `mail1.{nsDomain}` for S1-owned domains (centralized gateway).
+          // For parity with the S2 block above, delete all @ MX and add the canonical.
+          context.log(`[Step 6] Rewriting MX records for S1 domains → mail1.${context.nsDomain} on both DNS servers...`);
+          for (const domain of server1Domains) {
+            for (const [sshConn, label] of [[ssh1, 'S1'], [ssh2, 'S2']] as [typeof ssh1, string][]) {
+              try {
+                const { stdout: records } = await sshConn.exec(
+                  `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+                  { timeout: 15000 }
+                );
+                const mxRecordIds: string[] = [];
+                for (const line of records.split('\n')) {
+                  const cols = line.trim().split(/\s+/);
+                  if (cols.length < 4) continue;
+                  const [recordId, host, type] = cols;
+                  if (!/^\d+$/.test(recordId)) continue;
+                  if (type === 'MX' && host === '@') mxRecordIds.push(recordId);
+                }
+                for (const rid of mxRecordIds) {
+                  const delResult = await sshConn.exec(
+                    `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${rid}`,
+                    { timeout: 10000 }
+                  );
+                  if (delResult.code !== 0) {
+                    context.log(`[Step 6] WARNING: Failed to delete MX record ${rid} for S1 domain ${domain} on ${label}: exit ${delResult.code} ${delResult.stderr}`);
+                  }
+                }
+                await sshConn.exec(
+                  `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ MX mail1.${context.nsDomain} 10`,
+                  { timeout: 10000 }
+                );
+              } catch (err) {
+                context.log(`[Step 6] ERROR: MX rewrite for S1 domain ${domain} on ${label} FAILED: ${err}`);
+                throw new Error(`Failed to rewrite MX for S1 domain ${domain} on ${label}: ${err}`);
+              }
+            }
+            context.log(`[Step 6] MX rewritten for ${domain}: → mail1.${context.nsDomain}`);
           }
 
           // PATCH 15: Fix mail/webmail A records for S2 domains on BOTH servers

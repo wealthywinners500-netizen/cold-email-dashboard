@@ -1301,6 +1301,146 @@ export async function setHostname(ssh: SSHManager, hostname: string): Promise<vo
 }
 
 // ============================================
+// h) Zone replication via BIND AXFR/NOTIFY (HL #101, Session 04d)
+//
+// The HestiaCP DNS cluster is non-functional (#16a). Prior approach was
+// dual-primary: both servers ran `type master` for the same zones and
+// attempted record-by-record replication via v-add-dns-record — which drifts
+// SOA serials (#46), never syncs DKIM (#2), and exhibits random write
+// conflicts when both sides edit concurrently.
+//
+// Session 04d Option A resolution: per-pair zone ownership partition.
+// Each zone has ONE primary server; the peer runs `type slave` and pulls
+// via AXFR on the primary's `also-notify` trigger. allow-transfer is scoped
+// to the peer IP only, so the zone is not world-transferable.
+//
+// Partition rule: alphabetical sort by sending domain, split at ceil(N/2).
+// NS domain always lives on S1 primary (by convention — S1 is created first
+// and holds the registrar glue). Partition is idempotent across re-runs.
+// ============================================
+
+export function computeZonePartition(
+  nsDomain: string,
+  sendingDomains: string[],
+): { s1Primary: string[]; s2Primary: string[] } {
+  const sorted = [...sendingDomains].sort();
+  const midpoint = Math.ceil(sorted.length / 2);
+  return {
+    s1Primary: [nsDomain, ...sorted.slice(0, midpoint)],
+    s2Primary: sorted.slice(midpoint),
+  };
+}
+
+/**
+ * Add `allow-transfer { peerIP; }; also-notify { peerIP; };` to each zone's
+ * master stanza in /etc/bind/named.conf. HestiaCP writes one-line stanzas of
+ * the form `zone "DOMAIN" {type master; file "PATH";};` — this sed edit
+ * inserts between the file directive and the closing brace.
+ *
+ * Idempotent: if allow-transfer is already present for this peer, sed leaves
+ * the line unchanged (the match includes the bare default form only).
+ *
+ * Follows rndc reload on primary so the new policy takes effect and
+ * also-notify fires on subsequent record changes.
+ */
+export async function configureZoneTransferPolicy(
+  ssh: SSHManager,
+  zones: string[],
+  peerIP: string,
+): Promise<void> {
+  for (const zone of zones) {
+    const bareStanza = `zone "${zone}" {type master; file "/home/admin/conf/dns/${zone}.db";};`;
+    const withPolicy = `zone "${zone}" {type master; file "/home/admin/conf/dns/${zone}.db"; allow-transfer { ${peerIP}; }; also-notify { ${peerIP}; };};`;
+    const sedCmd = `sed -i 's|${bareStanza.replace(/"/g, '\\"')}|${withPolicy.replace(/"/g, '\\"')}|' /etc/bind/named.conf`;
+    await ssh.exec(sedCmd, { timeout: 10000 });
+  }
+  await ssh.exec('rndc reload', { timeout: 10000 }).catch(() => {});
+}
+
+/**
+ * Install slave zones on the peer server via a separate
+ * /etc/bind/named.conf.cluster include file, then trigger initial AXFR.
+ *
+ * Why a separate include file (Approach B): HestiaCP writes zone stanzas
+ * directly to /etc/bind/named.conf via shell scripts (not via a user-editable
+ * template). Editing the generated file is fragile — v-add-dns-domain rewrites
+ * parts of it. A sibling include file with only-slave stanzas is orthogonal:
+ * HestiaCP never touches it, and the `include` directive is appended once
+ * (idempotent).
+ *
+ * The caller must have already removed the zone from HestiaCP on this server
+ * (via v-delete-dns-domain) so that the only stanza for each zone is the
+ * slave form in the cluster file — BIND errors on duplicate zone definitions.
+ */
+export async function installSlaveZones(
+  ssh: SSHManager,
+  zones: string[],
+  primaryIP: string,
+): Promise<void> {
+  if (zones.length === 0) return;
+
+  await ssh.exec(
+    'mkdir -p /var/cache/bind/slaves && chown bind:bind /var/cache/bind/slaves',
+    { timeout: 10000 }
+  );
+
+  const stanzas = zones
+    .map(
+      (z) =>
+        `zone "${z}" { type slave; masters { ${primaryIP}; }; file "slaves/${z}.db"; allow-transfer { none; }; };`
+    )
+    .join('\n');
+
+  const fileContent = `// Slave zones — primary on peer server (Session 04d, HL #101 AXFR/NOTIFY)\n${stanzas}\n`;
+
+  // Write cluster file via base64 to avoid heredoc/quote escaping pitfalls.
+  const b64 = Buffer.from(fileContent, 'utf8').toString('base64');
+  await ssh.exec(
+    `echo '${b64}' | base64 -d > /etc/bind/named.conf.cluster`,
+    { timeout: 10000 }
+  );
+
+  // Ensure named.conf includes the cluster file — idempotent.
+  await ssh.exec(
+    `grep -q 'named.conf.cluster' /etc/bind/named.conf || echo 'include "/etc/bind/named.conf.cluster";' >> /etc/bind/named.conf`,
+    { timeout: 10000 }
+  );
+
+  await ssh.exec('rndc reload', { timeout: 10000 });
+
+  // Trigger initial AXFR for each slave zone (also-notify from primary covers
+  // future changes, but the slave needs at least one transfer to populate).
+  for (const zone of zones) {
+    await ssh.exec(`rndc retransfer ${zone}`, { timeout: 5000 }).catch(() => {});
+  }
+}
+
+/**
+ * Ensure port 53 TCP + UDP is open to the peer server only (not world).
+ *
+ * Current deployment: /etc/iptables/rules.v4 on Hestia servers already has
+ * `-A INPUT -p tcp --dport 53 -j ACCEPT` and `-A INPUT -p udp --dport 53`
+ * unconditionally (world-open, to serve authoritative DNS). This helper is
+ * therefore a no-op on the existing infrastructure — AXFR inherits from the
+ * global rule. Retained as an explicit peer-scoped rule for future pairs
+ * where a stricter firewall policy may be applied.
+ */
+export async function openBindFirewall(
+  ssh: SSHManager,
+  peerIP: string,
+): Promise<void> {
+  const rules = [
+    `iptables -C INPUT -p tcp -s ${peerIP} --dport 53 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp -s ${peerIP} --dport 53 -j ACCEPT`,
+    `iptables -C INPUT -p udp -s ${peerIP} --dport 53 -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp -s ${peerIP} --dport 53 -j ACCEPT`,
+  ];
+  for (const rule of rules) {
+    await ssh.exec(rule, { timeout: 5000 }).catch(() => {});
+  }
+  // Persist (netfilter-persistent service is standard on Ubuntu + HestiaCP)
+  await ssh.exec('netfilter-persistent save 2>/dev/null || iptables-save > /etc/iptables/rules.v4 2>/dev/null || true', { timeout: 5000 });
+}
+
+// ============================================
 // i) Unmask and start Exim4 + Dovecot
 // Called by Step 6 AFTER all auth records (SPF, DKIM, DMARC) are in place
 // and PTR has been set (Step 5). This ensures Exim4 never listens on port 25

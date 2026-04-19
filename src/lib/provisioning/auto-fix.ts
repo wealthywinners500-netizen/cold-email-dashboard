@@ -229,16 +229,21 @@ async function addWebmailA(
 }
 
 /**
- * Fix MX record: delete all @ MX, add correct one
+ * Fix MX record: delete all @ MX, add correct one.
+ *
+ * HL #100 (Session 04d): Option A centralized gateway — ALL sending domains
+ * route to their owning server's canonical mail hostname `mail{1|2}.{nsDomain}`,
+ * NOT the per-domain `mail{1|2}.{domain}`. This matches `verification-checks.ts`
+ * check 3 `expectedMailHost` so check ↔ fix agree.
  */
 async function fixMX(
   ssh1: SSHManager,
   ssh2: SSHManager,
   domain: string,
-  params: { server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
+  params: { nsDomain: string; server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
 ): Promise<void> {
   const isS2 = params.server2Domains.includes(domain);
-  const mxHost = isS2 ? `mail2.${domain}` : `mail1.${domain}`;
+  const mxHost = isS2 ? `mail2.${params.nsDomain}` : `mail1.${params.nsDomain}`;
   const addCmd = `v-add-dns-record admin ${domain} @ MX ${mxHost} 10`;
 
   const matchFn = (line: string) => {
@@ -848,7 +853,7 @@ async function addMTASTS(
   ssh1: SSHManager,
   ssh2: SSHManager,
   domain: string,
-  params: { server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
+  params: { nsDomain: string; server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
 ): Promise<void> {
   // Generate timestamp
   const now = new Date();
@@ -889,7 +894,10 @@ async function addMTASTS(
   const targetSSH = isS2 ? ssh2 : ssh1;
   const serverName = isS2 ? 'S2' : 'S1';
 
-  const mxHost = `mail${serverNum}.${domain}`;
+  // HL #100: MTA-STS mx value uses the centralized gateway `mail{1|2}.{nsDomain}`
+  // — same as the @ MX record. Must match so senders honoring MTA-STS resolve to
+  // the same host they'd reach via plain MX.
+  const mxHost = `mail${serverNum}.${params.nsDomain}`;
   const mtaStsContent = `version: STSv1
 mode: enforce
 mx: ${mxHost}
