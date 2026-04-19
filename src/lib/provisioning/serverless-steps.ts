@@ -40,6 +40,7 @@ import { DNSVerifier } from "@/lib/provisioning/verification";
 import { checkPort25 } from "@/lib/provisioning/checks/port25";
 import { checkSSLCert } from "@/lib/provisioning/checks/ssl-cn";
 import { checkMXToolboxHealth } from "@/lib/provisioning/checks/mxtoolbox-health";
+import { checkPairIntoDNSHealth } from "@/lib/provisioning/checks/intodns-health";
 import { SSHManager } from "@/lib/provisioning/ssh-manager";
 import { promises as dnsPromises } from "dns";
 import { exec as execCb } from "child_process";
@@ -935,11 +936,64 @@ async function runVerificationGateOnce(jobId: string): Promise<{
     }
   }
 
-  // === FINAL CHECK: MXToolbox Domain Health (the gold standard) ===
-  // This runs AFTER all our internal checks pass. If MXToolbox disagrees
-  // with our assessment, the VG fails — MXToolbox is always right.
-  // Uses MXToolbox API if MXTOOLBOX_API_KEY is set, otherwise runs our
-  // own comprehensive internal checks that mirror MXToolbox's categories.
+  // === FINAL CHECK: intoDNS-class programmatic health (canonical Gate 0 oracle) ===
+  //
+  // Runs AFTER all our internal checks pass. Gate-authoritative: any FAIL here
+  // blocks the step; WARNs are recorded but don't fail the gate. This mirrors
+  // `tools/verify-zone.sh` and is the TypeScript port of the 3-signal stack's
+  // signal (a) — see `src/lib/provisioning/checks/intodns-health.ts` for the
+  // rationale and `.auto-memory/feedback_mxtoolbox_ui_api_gap.md` for the
+  // evidence trail justifying the oracle swap (2026-04-19, Session 04d).
+  //
+  // MXToolbox (API + UI) is called further below as ADVISORY ONLY — its results
+  // populate `warnings[]` but can no longer fail the step. Per F1–F4 of the
+  // research: MXToolbox UI is not programmatically verifiable, uses undocumented
+  // thresholds stricter than its own docs, and disagrees with actual inbox
+  // placement on tier-1 senders like google.com.
+  try {
+    const allDomains = [job.ns_domain, ...(job.sending_domains || [])];
+    const intoDNSReport = await checkPairIntoDNSHealth({
+      zones: allDomains,
+      nsDomain: job.ns_domain,
+      s1Ip: server1IP,
+      s2Ip: server2IP,
+      delayBetweenZonesMs: 200,
+    });
+
+    if (intoDNSReport.ok) {
+      results.push(
+        `✓ intoDNS canonical oracle: all ${intoDNSReport.zones.length} zones pass (signal a of 3)`
+      );
+    } else {
+      for (const z of intoDNSReport.zones) {
+        for (const r of z.results) {
+          if (r.severity === "fail") {
+            failures.push(`✗ intoDNS ${z.zone}: ${r.check} — ${r.message}`);
+          } else if (r.severity === "warn") {
+            warnings.push(`⚠ intoDNS ${z.zone}: ${r.check} — ${r.message}`);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    // intoDNS check infrastructure failure — treat as FAILURE (not advisory).
+    // Unlike MXToolbox, this oracle is the system of record. If it can't run,
+    // we don't know if we're green.
+    failures.push(
+      `✗ intoDNS canonical oracle failed to execute: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+
+  // === ADVISORY: MXToolbox Domain Health (MUST NOT gate Gate 0) ===
+  //
+  // Retained so operators can correlate dashboard state with what shows up in
+  // the MXToolbox UI during audits. Any issues get pushed to `warnings[]` —
+  // not `failures[]`. See `feedback_mxtoolbox_ui_api_gap.md` for the decision
+  // that retired the MXToolbox UI as the Gate 0 oracle (2026-04-19).
+  //
+  // Kept intact so we don't regress the observability signal for pairs that
+  // *do* care about MXToolbox matches (e.g., dashboards that paying customers
+  // can read). But by design, no MXToolbox finding can fail this step.
   try {
     const allDomains = [job.ns_domain, ...(job.sending_domains || [])];
     const mxReport = await checkMXToolboxHealth(
@@ -947,31 +1001,23 @@ async function runVerificationGateOnce(jobId: string): Promise<{
       { server1IP, server2IP },
       job.ns_domain
     );
-
     if (mxReport.ok) {
       results.push(
-        `✓ MXToolbox Domain Health: ALL ${allDomains.length} domains clean (0 errors, 0 warnings) [source: ${mxReport.source}]`
+        `✓ MXToolbox [advisory]: 0 errors across ${allDomains.length} domains [source: ${mxReport.source}]`
       );
     } else {
       for (const d of mxReport.domains) {
-        if (d.errors > 0) {
-          for (const detail of d.errorDetails) {
-            failures.push(`✗ MXToolbox ${d.domain}: ${detail}`);
-          }
+        for (const detail of d.errorDetails) {
+          warnings.push(`⚠ MXToolbox [advisory] ${d.domain}: ${detail}`);
         }
-        if (d.warnings > 0) {
-          for (const detail of d.warningDetails) {
-            warnings.push(`⚠ MXToolbox ${d.domain}: ${detail}`);
-          }
+        for (const detail of d.warningDetails) {
+          warnings.push(`⚠ MXToolbox [advisory] ${d.domain}: ${detail}`);
         }
       }
     }
   } catch (err) {
-    // MXToolbox check failure is a WARNING, not a hard fail —
-    // we don't want MXToolbox being down to block provisioning.
-    // Our internal checks already passed above.
     warnings.push(
-      `⚠ MXToolbox check failed (non-blocking): ${err instanceof Error ? err.message : String(err)}`
+      `⚠ MXToolbox [advisory] check failed: ${err instanceof Error ? err.message : String(err)}`
     );
   }
 
