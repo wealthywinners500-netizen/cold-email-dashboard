@@ -6,8 +6,10 @@
 //   b) Multi-resolver PTR        (8.8.8.8 / 1.1.1.1 / 9.9.9.9 must all match)
 //   c) DNS propagation           (A/MX/SPF/_dmarc consistent across 3 resolvers)
 //   d) Operational blacklist sweep
-//       OPERATIONAL = hard-fail (Spamhaus SBL/DBL, Barracuda, Invaluement)
+//       OPERATIONAL = hard-fail (Spamhaus SBL/DBL, Barracuda)
 //       SEM         = complaint-based, tolerated (SORBS SPAM, UCEPROTECT L3)
+//       (HL #103: Invaluement SIP removed — their legacy DNSBL poisons
+//        all queries as listed. Use their v2 HTTPS API to reinstate.)
 //
 // Deliberately does NOT edit verification.ts's WARN_ONLY_BLACKLISTS —
 // that set tunes the provisioning gate (Barracuda warn-only on Linode).
@@ -45,11 +47,23 @@ interface DnsblZone {
 // fire on a healthy pair, and the spec explicitly says SEM lists are
 // "tolerated". We keep SEM_BLACKLISTS exported for classification if
 // an MXToolbox response mentions them.
+//
+// HL #103 (Session 04d): `sip.invaluement.com` removed. Invaluement retired
+// their open DNS query system in 2018 and replaced it with a paid API. The
+// old zone now returns `127.0.0.2` for EVERY query as a poison response:
+//
+//   $ dig TXT 8.8.8.8.sip.invaluement.com
+//   "unauthorized or malfunctioned attempted access to invaluement data —
+//    so EVERYTHING is listed now ... Our old DNS query system has NOT been
+//    used since 2018 — GET OFF OF IT"
+//
+// Left in the list, it flagged every pair as `red` regardless of reputation.
+// To reinstate Invaluement coverage, onboard to their v2 API and query via
+// HTTPS — not as another entry here.
 const PAIR_VERIFY_ZONES: DnsblZone[] = [
-  { zone: 'sbl.spamhaus.org',     name: 'Spamhaus SBL',    classification: 'operational', target: 'ip' },
-  { zone: 'dbl.spamhaus.org',     name: 'Spamhaus DBL',    classification: 'operational', target: 'domain' },
-  { zone: 'b.barracudacentral.org', name: 'Barracuda',     classification: 'operational', target: 'ip' },
-  { zone: 'sip.invaluement.com',  name: 'Invaluement SIP', classification: 'operational', target: 'ip' },
+  { zone: 'sbl.spamhaus.org',     name: 'Spamhaus SBL', classification: 'operational', target: 'ip' },
+  { zone: 'dbl.spamhaus.org',     name: 'Spamhaus DBL', classification: 'operational', target: 'domain' },
+  { zone: 'b.barracudacentral.org', name: 'Barracuda',  classification: 'operational', target: 'ip' },
 ];
 
 // The three resolvers the spec mandates.
