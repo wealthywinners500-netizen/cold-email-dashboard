@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "next lint",
     "seed": "npx tsx src/seed/seed-dean-org.ts",
-    "test:gate0": "tsx src/lib/provisioning/__tests__/dnsbl-liveness.test.ts && tsx src/lib/provisioning/__tests__/ip-blacklist-check.test.ts && tsx src/lib/provisioning/__tests__/saga-cascade-guard.test.ts && tsx src/lib/provisioning/__tests__/pair-verify.test.ts && tsx src/lib/provisioning/__tests__/await-auth-dns.test.ts && tsx src/lib/provisioning/__tests__/vg2-ssl-probe-mail-hostname.test.ts && tsx src/lib/provisioning/__tests__/mx-spec-alignment.test.ts && tsx src/lib/provisioning/__tests__/zone-sync-axfr.test.ts && tsx src/lib/provisioning/__tests__/vg2-fcrdns-resolver.test.ts && tsx src/lib/provisioning/__tests__/pair-verify-invaluement-dead-zone.test.ts && tsx 'src/app/dashboard/servers/[id]/__tests__/pair-detail-client.test.ts'",
+    "test:gate0": "tsx src/lib/provisioning/__tests__/dnsbl-liveness.test.ts && tsx src/lib/provisioning/__tests__/ip-blacklist-check.test.ts && tsx src/lib/provisioning/__tests__/saga-cascade-guard.test.ts && tsx src/lib/provisioning/__tests__/pair-verify.test.ts && tsx src/lib/provisioning/__tests__/await-auth-dns.test.ts && tsx src/lib/provisioning/__tests__/vg2-ssl-probe-mail-hostname.test.ts && tsx src/lib/provisioning/__tests__/mx-spec-alignment.test.ts && tsx src/lib/provisioning/__tests__/zone-sync-axfr.test.ts && tsx src/lib/provisioning/__tests__/vg2-fcrdns-resolver.test.ts && tsx src/lib/provisioning/__tests__/pair-verify-invaluement-dead-zone.test.ts && tsx src/lib/provisioning/__tests__/vg2-sending-domain-web-cert.test.ts && tsx 'src/app/dashboard/servers/[id]/__tests__/pair-detail-client.test.ts'",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
