@@ -275,8 +275,14 @@ async function cleanupDNSZoneDefaults(
   }
 
   // Hard Lesson #13: Fix SOA MNAME to ns1.NSDOMAIN
+  // HL #107 (Session 04d): Also set Refresh/Retry/Expire/Minimum timers to
+  // values MXToolbox accepts. HestiaCP's factory default `7200 3600 1209600
+  // 180` triggers "SOA Refresh Value out of recommended range" and "SOA
+  // Minimum TTL Value out of recommended range" warnings. Use RFC 1912 §2.2
+  // safe values: Refresh 3600 (1hr), Retry 600 (10min), Expire 2419200 (4wk),
+  // Minimum 3600 (1hr).
   await ssh.exec(
-    `${HESTIA_PATH_PREFIX}v-change-dns-domain-soa admin ${domain} ns1.${nsDomain}`,
+    `${HESTIA_PATH_PREFIX}v-change-dns-domain-soa admin ${domain} ns1.${nsDomain} '' 3600 600 2419200 3600`,
     { timeout: 10000 }
   ).catch(() => {
     // Some HestiaCP versions don't have this command; we'll handle it via record editing

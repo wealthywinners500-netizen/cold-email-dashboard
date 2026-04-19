@@ -265,10 +265,14 @@ export async function runVerificationChecks(
   }
 
   // Check 3: MX record correctness
+  // HL #106 (Session 04d revert): per-domain MX = `mail.{domain}`. HestiaCP's
+  // default. Each sending domain keeps its own reputation profile; shared
+  // `mail{1|2}.{nsDomain}` MX (Option A, superseded) collapsed 5 domains'
+  // reputation onto a single hostname — wrong tradeoff for cold email.
   log('[VG] Running check 3: MX record correctness');
   for (const domain of allDomains) {
     const server = getServerForDomain(domain);
-    const expectedMailHost = server === 'S1' ? `mail1.${nsDomain}` : `mail2.${nsDomain}`;
+    const expectedMailHost = `mail.${domain}`;
 
     try {
       const result = await ssh1.exec(
