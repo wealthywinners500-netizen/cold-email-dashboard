@@ -44,6 +44,7 @@ const STEP_NAMES: Record<StepType, string> = {
   set_ptr: "Set PTR Records",
   setup_mail_domains: "Setup Mail Domains",
   await_s2_dns: "Await S2 DNS Propagation",
+  await_auth_dns: "Await Auth DNS (10-resolver consensus)",
   security_hardening: "Security Hardening",
   verification_gate: "Verification Gate 1",
   auto_fix: "Auto-Fix Issues",

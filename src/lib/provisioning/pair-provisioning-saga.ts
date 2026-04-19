@@ -48,6 +48,7 @@ import { checkSubnetDiversity } from './verification';
 import { checkDomainsBlacklistBatch } from './domain-blacklist';
 import { runVerificationChecks } from './verification-checks';
 import { runAutoFixes } from './auto-fix';
+import { runAwaitAuthDns } from './steps/await-auth-dns';
 
 // Helper to access dynamic metadata on context safely
 function ctxMeta(context: ProvisioningContext): Record<string, unknown> {
@@ -876,9 +877,11 @@ export function createPairProvisioningSaga(
                 `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ TXT '"v=spf1 ip4:${server1IP} -all"'`,
                 { timeout: 10000 }
               );
-              // Add correct DMARC with rua
+              // Add correct DMARC with rua/ruf — reports to dmarc@<ns_domain>
+              // (INTERNAL reporting mailbox on the same NS zone cluster — RFC 7489
+              // same-org reporting, no external DKIM-authorization record needed).
               await ssh1.exec(
-                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100"'`,
+                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@${context.nsDomain}; ruf=mailto:dmarc@${context.nsDomain}; fo=1"'`,
                 { timeout: 10000 }
               );
               // Add BIMI record
@@ -922,7 +925,7 @@ export function createPairProvisioningSaga(
                 { timeout: 10000 }
               );
               await ssh2.exec(
-                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100"'`,
+                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@${context.nsDomain}; ruf=mailto:dmarc@${context.nsDomain}; fo=1"'`,
                 { timeout: 10000 }
               );
               // Add BIMI record
@@ -1149,6 +1152,42 @@ export function createPairProvisioningSaga(
             }
           }
 
+          // DMARC rua/ruf reporting mailbox — collects aggregate reports from Gmail,
+          // Microsoft, Yahoo, etc. The rua/ruf tags in the DMARC TXT records point
+          // here. Nothing consumes the mailbox automatically yet; reports can be
+          // reviewed manually or wired to an aggregator later.
+          // The NS domain has a DNS zone but is NOT set up as a mail domain during
+          // normal provisioning (sending happens on sendingDomains, not the NS domain),
+          // so v-add-mail-domain runs first on both servers. Exit codes 3/4 = "already
+          // exists" — non-fatal (HL #97).
+          context.log(`[Step 6] Creating DMARC reporting mailbox dmarc@${context.nsDomain} on both servers...`);
+          try {
+            const escapedDmarcPassword = password.replace(/'/g, "'\\''");
+            for (const [mailboxSSH, mailboxLabel] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
+              // Ensure NS domain is registered as a mail domain on this server
+              const addMailDomainResult = await mailboxSSH.exec(
+                `${HESTIA_PATH_PREFIX}v-add-mail-domain admin ${context.nsDomain}`,
+                { timeout: 15000 }
+              );
+              if (addMailDomainResult.code !== 0 && addMailDomainResult.code !== 3 && addMailDomainResult.code !== 4) {
+                context.log(`[Step 6] Warning: v-add-mail-domain ${context.nsDomain} on ${mailboxLabel}: exit ${addMailDomainResult.code} — ${addMailDomainResult.stderr}`);
+              }
+              // Create the dmarc@<ns_domain> mailbox
+              const addMailAccountResult = await mailboxSSH.exec(
+                `${HESTIA_PATH_PREFIX}v-add-mail-account admin ${context.nsDomain} dmarc '${escapedDmarcPassword}'`,
+                { timeout: 15000 }
+              );
+              if (addMailAccountResult.code !== 0 && addMailAccountResult.code !== 3 && addMailAccountResult.code !== 4) {
+                context.log(`[Step 6] Warning: v-add-mail-account dmarc@${context.nsDomain} on ${mailboxLabel}: exit ${addMailAccountResult.code} — ${addMailAccountResult.stderr}`);
+              } else {
+                context.log(`[Step 6] DMARC reporting mailbox ready on ${mailboxLabel}: dmarc@${context.nsDomain}`);
+              }
+            }
+          } catch (mailboxErr) {
+            // Non-fatal: reports won't land, but sending still works
+            context.log(`[Step 6] Warning: DMARC reporting mailbox setup failed: ${mailboxErr instanceof Error ? mailboxErr.message : String(mailboxErr)}`);
+          }
+
           // Hard Lesson #95: Sync zone files from S1 → S2 so SOA serials match.
           // HestiaCP DNS cluster is non-functional (#16a), and all v-add-dns-record
           // commands above only modified S1's zone files. Without this sync, S2's
@@ -1354,6 +1393,61 @@ export function createPairProvisioningSaga(
           success: true,
           output,
           metadata: { s2DnsPropagation: results },
+        };
+      },
+
+      async compensate(_context: ProvisioningContext): Promise<void> {
+        // Informational step — nothing to rollback
+      },
+    },
+
+    // ========================================
+    // Step 7b: AWAIT_AUTH_DNS — 10-resolver consensus gate (HL #R3)
+    // Session 04b: LE burned 9 failed validations in ~2 min against
+    // un-propagated DNS, tripping the 5/hour/hostname rate limit.
+    // This step verifies A/MX/SPF/DKIM/DMARC for the NS domain + all
+    // sending domains have converged on ≥7 of 10 geographically
+    // diverse resolvers before security_hardening issues LE certs.
+    // Hard-fails the saga on 30-min timeout — no LE attempts against
+    // DNS that hasn't propagated to Quad9/DNS.WATCH/etc.
+    // ========================================
+    {
+      name: 'Await Authoritative DNS Propagation',
+      type: 'await_auth_dns' as const,
+      estimatedDurationMs: 600_000, // 10 min typical; 30 min hard cap inside the runner
+
+      async execute(context: ProvisioningContext): Promise<StepResult> {
+        context.log('[Step 7b] Awaiting authoritative DNS propagation (10-resolver consensus)...');
+        const ctx = ctxMeta(context);
+        const server1IP = (ctx.server1IP as string) || context.server1?.ip || '';
+        const server2IP = (ctx.server2IP as string) || context.server2?.ip || '';
+        const server1Domains = (ctx.server1Domains as string[]) || [];
+        const server2Domains = (ctx.server2Domains as string[]) || [];
+
+        if (!server1IP || !server2IP) {
+          return {
+            success: false,
+            error: 'await_auth_dns: server IPs not found in provisioning context',
+          };
+        }
+
+        const result = await runAwaitAuthDns({
+          ssh1,
+          nsDomain: context.nsDomain,
+          server1IP,
+          server2IP,
+          server1Domains,
+          server2Domains,
+          log: context.log,
+        });
+
+        return {
+          success: result.success,
+          output: result.output,
+          error: result.error,
+          metadata: {
+            authDnsConsensus: result.metadata,
+          },
         };
       },
 

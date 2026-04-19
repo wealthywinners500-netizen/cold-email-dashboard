@@ -117,6 +117,25 @@ export async function POST(
       );
     }
 
+    // STALE-CALLBACK REJECT (HL #94) — a zombie retry's failure must not overwrite
+    // a successful completion. Drop the callback silently, 200 OK so pg-boss acks.
+    if (step.status === "completed" && status === "failed") {
+      console.warn(`[WorkerCallback] Dropping stale failed callback for completed step`, {
+        jobId, stepType, stepId: step.id,
+        completed_at: step.completed_at,
+      });
+      return NextResponse.json({ accepted: false, reason: "stale_callback" }, { status: 200 });
+    }
+
+    // Symmetric: if step is already 'failed' and callback is 'completed', also drop.
+    // A second attempt might succeed but we've already closed the saga on failure.
+    if (step.status === "failed" && status === "completed") {
+      console.warn(`[WorkerCallback] Dropping stale completed callback for failed step`, {
+        jobId, stepType, stepId: step.id,
+      });
+      return NextResponse.json({ accepted: false, reason: "stale_callback" }, { status: 200 });
+    }
+
     // Update step with worker result
     const now = new Date().toISOString();
 
@@ -331,12 +350,17 @@ export async function POST(
             }
           }
 
-          // Populate sending_domains table for domain-in-use filtering
+          // Populate sending_domains table for domain-in-use filtering.
+          // Attach primary_server_id ('s1' | 's2') from setup_mail_domains metadata
+          // so downstream verification (VG2 ssl_cert_existence, https_connectivity)
+          // probes only the owning server. HL #R1 (Session 04b).
           const sendingDomainsList = jobRow.sending_domains as string[] | undefined;
           if (sendingDomainsList && sendingDomainsList.length > 0) {
+            const server1DomainsSet = new Set(server1Domains);
             const sdRows = sendingDomainsList.map((domain: string) => ({
               pair_id: serverPair.id,
               domain,
+              primary_server_id: server1DomainsSet.has(domain) ? 's1' : 's2',
             }));
             const { error: sdError } = await supabase
               .from("sending_domains")

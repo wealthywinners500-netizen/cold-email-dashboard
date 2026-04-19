@@ -492,12 +492,14 @@ async function addDMARC(
   ssh1: SSHManager,
   ssh2: SSHManager,
   domain: string,
+  nsDomain: string,
   params: { log: (msg: string) => void }
 ): Promise<void> {
-  // Hard Lesson #95: No rua= in DMARC — external reporting domain
-  // (thestealthmail.com) lacks authorization records for sending domains,
-  // causing MXToolbox "External Domains not giving permission" warning.
-  const dmarcValue = '"v=DMARC1; p=quarantine; pct=100"';
+  // HL #95 note: previous "no rua" rule was specifically about EXTERNAL reporting
+  // domains (those require a DKIM auth record on the recipient zone). Using
+  // dmarc@${nsDomain} — same NS zone as the sending domains — sidesteps that
+  // requirement because DMARC RFC 7489 treats same-org reporting as trusted.
+  const dmarcValue = `"v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@${nsDomain}; ruf=mailto:dmarc@${nsDomain}; fo=1"`;
   const addCmd = `v-add-dns-record admin ${domain} _dmarc TXT ${dmarcValue}`;
 
   for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
@@ -536,12 +538,14 @@ async function fixDMARC(
   ssh1: SSHManager,
   ssh2: SSHManager,
   domain: string,
+  nsDomain: string,
   params: { log: (msg: string) => void }
 ): Promise<void> {
-  // Hard Lesson #95: No rua= in DMARC — external reporting domain
-  // (thestealthmail.com) lacks authorization records for sending domains,
-  // causing MXToolbox "External Domains not giving permission" warning.
-  const dmarcValue = '"v=DMARC1; p=quarantine; pct=100"';
+  // HL #95 note: previous "no rua" rule was specifically about EXTERNAL reporting
+  // domains (those require a DKIM auth record on the recipient zone). Using
+  // dmarc@${nsDomain} — same NS zone as the sending domains — sidesteps that
+  // requirement because DMARC RFC 7489 treats same-org reporting as trusted.
+  const dmarcValue = `"v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@${nsDomain}; ruf=mailto:dmarc@${nsDomain}; fo=1"`;
   const addCmd = `v-add-dns-record admin ${domain} _dmarc TXT ${dmarcValue}`;
 
   const matchFn = (line: string) => {
@@ -1157,11 +1161,11 @@ export async function runAutoFixes(
           break;
 
         case 'add_dmarc':
-          await addDMARC(ssh1, ssh2, issue.domain, params);
+          await addDMARC(ssh1, ssh2, issue.domain, params.nsDomain, params);
           break;
 
         case 'fix_dmarc':
-          await fixDMARC(ssh1, ssh2, issue.domain, params);
+          await fixDMARC(ssh1, ssh2, issue.domain, params.nsDomain, params);
           break;
 
         case 'fix_ptr':

@@ -63,6 +63,7 @@ const WORKER_STEP_TYPES: StepType[] = [
   'set_ptr',
   'setup_mail_domains',
   'await_s2_dns',
+  'await_auth_dns',
   'security_hardening',
   'verification_gate',
   'auto_fix',
@@ -503,6 +504,37 @@ export async function handleProvisionStep(
   data: ProvisionStepPayload
 ): Promise<void> {
   const { jobId, stepType, stepId } = data;
+
+  // IDEMPOTENCY GUARD — pg-boss zombie-retry protection (HL #94, job
+  // b920c716 2026-04-18). If the worker restarts mid-step, pg-boss will
+  // re-deliver the in-flight provision-step job. Re-running provider/SSH
+  // work (e.g. Linode createServer) gets rejected ("Label must be unique")
+  // and the failed callback overwrites the already-completed step row,
+  // flipping completed → failed and cascading the saga. Short-circuit
+  // here BEFORE any provider/SSH side-effect so pg-boss simply acks the
+  // zombie delivery.
+  {
+    const guardSupabase = await createAdminClient();
+    const { data: existingStep } = await guardSupabase
+      .from('provisioning_steps')
+      .select('id, status, completed_at, duration_ms')
+      .eq('id', stepId)
+      .maybeSingle();
+
+    if (existingStep?.status === 'completed') {
+      console.warn('[provision-step] Zombie retry of completed step — skipping', {
+        jobId, stepType, stepId,
+        original_completed_at: existingStep.completed_at,
+      });
+      return; // Do NOT post a callback, do NOT re-execute. pg-boss ack drops the job.
+    }
+    if (existingStep?.status === 'failed') {
+      console.warn('[provision-step] Retry of already-failed step — skipping', {
+        jobId, stepType, stepId,
+      });
+      return;
+    }
+  }
 
   if (!WORKER_STEP_TYPES.includes(stepType)) {
     console.error(`[ProvisionStep] Unexpected step type: ${stepType}`);

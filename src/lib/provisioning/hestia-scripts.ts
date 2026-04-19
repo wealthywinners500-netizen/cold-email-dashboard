@@ -333,8 +333,11 @@ async function ensureDNSRecords(
     // on any domain without a _dmarc TXT record — including the NS/hostname domain.
     // Hard Lesson #79: Every domain that appears in DNS must have a DMARC record.
     requiredRecords.push(
-      // Hard Lesson #95: No rua= — external domain lacks authorization records
-      { type: 'TXT', host: '_dmarc', value: '"v=DMARC1; p=quarantine; pct=100"' }
+      // HL #95 note: previous "no rua" rule was specifically about EXTERNAL reporting
+      // domains (those require a DKIM auth record on the recipient zone). Using
+      // dmarc@${nsDomain} — same NS zone as the sending domains — sidesteps that
+      // requirement because DMARC RFC 7489 treats same-org reporting as trusted.
+      { type: 'TXT', host: '_dmarc', value: `"v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@${nsDomain}; ruf=mailto:dmarc@${nsDomain}; fo=1"` }
     );
   }
 

@@ -1,6 +1,28 @@
 import type { SSHManager } from './ssh-manager';
 import type { VerificationResult } from './types';
 import { HESTIA_PATH_PREFIX } from './hestia-scripts';
+import { createAdminClient } from '@/lib/supabase/server';
+
+/**
+ * Normalize a `dig +short` TXT record line.
+ *
+ * `dig +short` wraps TXT content in quotes. TXT records >255 bytes get stored
+ * as multiple string chunks in BIND and come out as `"chunk1" "chunk2"` on a
+ * single line. This helper extracts all quoted chunks and joins them in order,
+ * falling back to the raw line if no quotes are present.
+ *
+ * Fixes Session 04b VG2 false positives (HL #R2):
+ *   - 11/11 dmarc_syntax false-fails — `startsWith('v=DMARC1')` failed on the
+ *     leading `"` that dig prepends.
+ *   - 11/11 dkim_key_validation false-fails — the `p=([A-Za-z0-9+/=]+)` regex
+ *     stops at the first chunk boundary `"`, so multi-chunk 2048-bit DKIM
+ *     public keys appeared ~192 bytes (under the 256-byte threshold).
+ */
+function normalizeTxtRecord(line: string): string {
+  const chunks = line.match(/"([^"]*)"/g);
+  if (!chunks || chunks.length === 0) return line;
+  return chunks.map((c) => c.slice(1, -1)).join('');
+}
 
 /**
  * Comprehensive verification checks for HestiaCP mail server provisioning.
@@ -18,6 +40,12 @@ export async function runVerificationChecks(
     server1Domains: string[];
     server2Domains: string[];
     log: (msg: string) => void;
+    // Optional pair_id — when provided, split-aware checks (ssl_cert_existence,
+    // https_connectivity) prefer the DB-stored primary_server_id from
+    // sending_domains. Falls back to in-memory server1Domains/server2Domains
+    // for legacy callers (e.g. the saga itself, where the pair row doesn't
+    // exist yet at VG1/VG2 time). HL #R1 (Session 04b).
+    pairId?: string;
   }
 ): Promise<VerificationResult[]> {
   const results: VerificationResult[] = [];
@@ -30,14 +58,44 @@ export async function runVerificationChecks(
     server1Domains,
     server2Domains,
     log,
+    pairId,
   } = params;
 
   // All domains to check: NS domain + all sending domains
   const allDomains = [nsDomain, ...sendingDomains];
 
+  // Load per-domain primary_server_id from sending_domains when pairId is
+  // provided. When empty (no rows, NULL column, or no pairId), split-aware
+  // checks fall back to the in-memory server1Domains/server2Domains params.
+  // HL #R1 (Session 04b): the ssl_cert_existence check needs an authoritative
+  // split — an empty in-memory list caused 10/10 false positives.
+  const dbPrimaryServerMap = new Map<string, 's1' | 's2'>();
+  if (pairId) {
+    try {
+      const supabase = await createAdminClient();
+      const { data: domainAssignments } = await supabase
+        .from('sending_domains')
+        .select('domain, primary_server_id')
+        .eq('pair_id', pairId);
+      for (const row of domainAssignments || []) {
+        const pid = (row as { primary_server_id: string | null }).primary_server_id;
+        const dom = (row as { domain: string }).domain;
+        if (pid === 's1' || pid === 's2') {
+          dbPrimaryServerMap.set(dom, pid);
+        }
+      }
+      log(`[VG] Loaded ${dbPrimaryServerMap.size} primary_server_id assignments from sending_domains`);
+    } catch (err) {
+      log(`[VG] Warning: failed to load sending_domains primary_server_id (falling back to in-memory split): ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   // Helper to determine which server a domain belongs to
   const getServerForDomain = (domain: string): 'S1' | 'S2' => {
     if (domain === nsDomain) return 'S1';
+    // DB is authoritative when present (split-aware, HL #R1).
+    const dbAssigned = dbPrimaryServerMap.get(domain);
+    if (dbAssigned) return dbAssigned === 's1' ? 'S1' : 'S2';
     if (server1Domains.includes(domain)) return 'S1';
     if (server2Domains.includes(domain)) return 'S2';
     return 'S1'; // Default to S1 if not found
@@ -932,7 +990,11 @@ export async function runVerificationChecks(
         `dig +short mail._domainkey.${domain} TXT @${primaryResolver} 2>/dev/null`,
         { timeout: 15000 }
       );
-      const dkimLines = dkimResult.stdout.trim().split('\n').filter(Boolean);
+      const dkimLines = dkimResult.stdout
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map(normalizeTxtRecord);
       const hasDKIM = dkimLines.some((txt) => txt.includes('v=DKIM1'));
 
       if (!hasDKIM) {
@@ -974,7 +1036,12 @@ export async function runVerificationChecks(
         `dig +short mail._domainkey.${domain} TXT @${primaryResolver} 2>/dev/null`,
         { timeout: 15000 }
       );
-      const dkimLine = dkimResult.stdout.trim();
+      // HL #R2: 2048-bit DKIM keys exceed BIND's 255-char TXT chunk limit.
+      // dig returns them as `"chunk1" "chunk2"` which must be joined before
+      // the p= regex extraction — otherwise the regex stops at the first `"`
+      // and the estimated key length is ~192 bytes (under the 256 threshold),
+      // false-flagging every record as "auto_fixable — key too short".
+      const dkimLine = normalizeTxtRecord(dkimResult.stdout.trim());
 
       if (!dkimLine || !dkimLine.includes('v=DKIM1')) {
         results.push({
@@ -1045,7 +1112,11 @@ export async function runVerificationChecks(
         `dig +short _dmarc.${domain} TXT @${primaryResolver} 2>/dev/null`,
         { timeout: 15000 }
       );
-      const dmarcLines = dmarcResult.stdout.trim().split('\n').filter(Boolean);
+      const dmarcLines = dmarcResult.stdout
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map(normalizeTxtRecord);
       const hasDMARC = dmarcLines.some((txt) => txt.includes('v=DMARC1'));
 
       if (!hasDMARC) {
@@ -1087,7 +1158,16 @@ export async function runVerificationChecks(
         `dig +short _dmarc.${domain} TXT @${primaryResolver} 2>/dev/null`,
         { timeout: 15000 }
       );
-      const dmarcLines = dmarcResult.stdout.trim().split('\n').filter(Boolean);
+      // HL #R2: dig +short wraps TXT content in quotes. Without
+      // normalization, `dmarcLine.startsWith('v=DMARC1')` below fails on the
+      // leading `"`, flagging all 11 DMARC records as syntax failures even
+      // when the content is valid. Root cause of 11/11 VG2 dmarc_syntax
+      // false-fails in Session 04.
+      const dmarcLines = dmarcResult.stdout
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map(normalizeTxtRecord);
       const dmarcLine = dmarcLines.find((txt) => txt.includes('v=DMARC1'));
 
       if (!dmarcLine) {

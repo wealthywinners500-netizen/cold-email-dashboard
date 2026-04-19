@@ -29,6 +29,7 @@ const STEP_CONFIG: Record<StepType, { label: string; icon: React.ElementType }> 
   setup_dns_zones: { label: "Setup DNS Zones", icon: Globe },
   setup_mail_domains: { label: "Setup Mail Domains", icon: Mail },
   await_s2_dns: { label: "Await S2 DNS Propagation", icon: Clock },
+  await_auth_dns: { label: "Await Auth DNS (10-resolver consensus)", icon: Clock },
   security_hardening: { label: "Security Hardening", icon: Shield },
   verification_gate: { label: "Verification Gate 1", icon: CheckCircle2 },
   auto_fix: { label: "Auto-Fix Issues", icon: Settings },
