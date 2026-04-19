@@ -1048,9 +1048,12 @@ export function createPairProvisioningSaga(
                   `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ A ${server2IP}`,
                   { timeout: 10000 }
                 );
-                // Add correct MX → mail2.{nsDomain}  (HL #100: Option A centralized gateway)
+                // Add correct MX → mail.{domain}  (HL #106: per-domain, HestiaCP default.
+                // Supersedes HL #100 Option A. Each sending domain keeps its own mail
+                // hostname, its own LE SAN cert [mail.{d}, webmail.{d}], and its own
+                // reputation profile — required for cold-email deliverability.)
                 await sshConn.exec(
-                  `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ MX mail2.${context.nsDomain} 10`,
+                  `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ MX mail.${domain} 10`,
                   { timeout: 10000 }
                 );
               } catch (err) {
@@ -1059,49 +1062,12 @@ export function createPairProvisioningSaga(
                 throw new Error(`Failed to fix @ A/MX for S2 domain ${domain} on ${label}: ${err}`);
               }
             }
-            context.log(`[Step 6] A/MX fixed for ${domain}: @ A → ${server2IP}, MX → mail2.${context.nsDomain}`);
+            context.log(`[Step 6] A/MX fixed for ${domain}: @ A → ${server2IP}, MX → mail.${domain}`);
           }
 
-          // PATCH 11d (HL #100, Option A): MX rewrite for S1 domains on BOTH servers.
-          // Hestia's v-add-mail-domain writes `@ MX mail.{domain}` as default. The VG2
-          // check expects `mail1.{nsDomain}` for S1-owned domains (centralized gateway).
-          // For parity with the S2 block above, delete all @ MX and add the canonical.
-          context.log(`[Step 6] Rewriting MX records for S1 domains → mail1.${context.nsDomain} on both DNS servers...`);
-          for (const domain of server1Domains) {
-            for (const [sshConn, label] of [[ssh1, 'S1'], [ssh2, 'S2']] as [typeof ssh1, string][]) {
-              try {
-                const { stdout: records } = await sshConn.exec(
-                  `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
-                  { timeout: 15000 }
-                );
-                const mxRecordIds: string[] = [];
-                for (const line of records.split('\n')) {
-                  const cols = line.trim().split(/\s+/);
-                  if (cols.length < 4) continue;
-                  const [recordId, host, type] = cols;
-                  if (!/^\d+$/.test(recordId)) continue;
-                  if (type === 'MX' && host === '@') mxRecordIds.push(recordId);
-                }
-                for (const rid of mxRecordIds) {
-                  const delResult = await sshConn.exec(
-                    `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${rid}`,
-                    { timeout: 10000 }
-                  );
-                  if (delResult.code !== 0) {
-                    context.log(`[Step 6] WARNING: Failed to delete MX record ${rid} for S1 domain ${domain} on ${label}: exit ${delResult.code} ${delResult.stderr}`);
-                  }
-                }
-                await sshConn.exec(
-                  `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ MX mail1.${context.nsDomain} 10`,
-                  { timeout: 10000 }
-                );
-              } catch (err) {
-                context.log(`[Step 6] ERROR: MX rewrite for S1 domain ${domain} on ${label} FAILED: ${err}`);
-                throw new Error(`Failed to rewrite MX for S1 domain ${domain} on ${label}: ${err}`);
-              }
-            }
-            context.log(`[Step 6] MX rewritten for ${domain}: → mail1.${context.nsDomain}`);
-          }
+          // (HL #106 revert) S1 domains: Hestia's default `@ MX mail.{domain}` already
+          // matches the per-domain invariant. No rewrite needed — the former PATCH 11d
+          // that flipped S1 MX to `mail1.{nsDomain}` (Option A, HL #100) has been deleted.
 
           // PATCH 15: Fix mail/webmail A records for S2 domains on BOTH servers
           // Hard Lesson #90: HestiaCP's v-add-letsencrypt-domain includes mail.domain

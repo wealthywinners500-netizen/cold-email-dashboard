@@ -231,10 +231,12 @@ async function addWebmailA(
 /**
  * Fix MX record: delete all @ MX, add correct one.
  *
- * HL #100 (Session 04d): Option A centralized gateway — ALL sending domains
- * route to their owning server's canonical mail hostname `mail{1|2}.{nsDomain}`,
- * NOT the per-domain `mail{1|2}.{domain}`. This matches `verification-checks.ts`
- * check 3 `expectedMailHost` so check ↔ fix agree.
+ * HL #106 (Session 04d revert): per-domain MX = `mail.{domain}`. HestiaCP's
+ * default convention. Each sending domain carries its own reputation and its
+ * own [mail.{d}, webmail.{d}] SAN cert (issued by `v-add-letsencrypt-domain
+ * ... '' yes`). Supersedes HL #100 (Option A centralized gateway), which
+ * collapsed per-domain reputation onto a shared `mail{1|2}.{nsDomain}` —
+ * bad for cold-email deliverability.
  */
 async function fixMX(
   ssh1: SSHManager,
@@ -242,8 +244,7 @@ async function fixMX(
   domain: string,
   params: { nsDomain: string; server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
 ): Promise<void> {
-  const isS2 = params.server2Domains.includes(domain);
-  const mxHost = isS2 ? `mail2.${params.nsDomain}` : `mail1.${params.nsDomain}`;
+  const mxHost = `mail.${domain}`;
   const addCmd = `v-add-dns-record admin ${domain} @ MX ${mxHost} 10`;
 
   const matchFn = (line: string) => {
@@ -263,7 +264,13 @@ async function fixSOA(
   domain: string,
   params: { log: (msg: string) => void }
 ): Promise<void> {
-  const cmd = `${HESTIA_PATH_PREFIX}v-change-dns-domain-soa admin ${domain} '' '' 3600 600 604800 3600`;
+  // HL #107 (Session 04d): MXToolbox flags SOA Expire < 1209600 (2 weeks) as
+  // "out of recommended range" and Refresh > 7200 (2hr) / Minimum < 3600 (1hr).
+  // RFC 1912 §2.2 safe values: Refresh 3600, Retry 600, Expire 2419200 (4wk),
+  // Minimum 3600 (1hr). Previous value `604800` for Expire was 1 week — failed
+  // MXToolbox range. HestiaCP's factory default `7200 3600 1209600 180` also
+  // fails (Refresh high, Retry high, Minimum too low).
+  const cmd = `${HESTIA_PATH_PREFIX}v-change-dns-domain-soa admin ${domain} '' '' 3600 600 2419200 3600`;
 
   for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
     const result = await ssh.exec(cmd, { timeout: 10000 });
@@ -894,10 +901,9 @@ async function addMTASTS(
   const targetSSH = isS2 ? ssh2 : ssh1;
   const serverName = isS2 ? 'S2' : 'S1';
 
-  // HL #100: MTA-STS mx value uses the centralized gateway `mail{1|2}.{nsDomain}`
-  // — same as the @ MX record. Must match so senders honoring MTA-STS resolve to
-  // the same host they'd reach via plain MX.
-  const mxHost = `mail${serverNum}.${params.nsDomain}`;
+  // HL #106 (Session 04d revert): MTA-STS mx value matches the @ MX record —
+  // `mail.{domain}` per-domain. Supersedes HL #100 centralized gateway.
+  const mxHost = `mail.${domain}`;
   const mtaStsContent = `version: STSv1
 mode: enforce
 mx: ${mxHost}
