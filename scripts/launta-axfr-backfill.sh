@@ -47,29 +47,26 @@ phase_backup() {
 }
 
 phase_A_s1() {
-  echo "=== Phase A / S1: Add allow-transfer { ${S2_IP}; } and also-notify to S1-primary zone stanzas ==="
-  for zone in "${S1_PRIMARY_ZONES[@]}"; do
-    echo "--- S1 zone: ${zone} ---"
-    ssh_s1 "grep \"^zone \\\"${zone}\\\" \" /etc/bind/named.conf || echo 'ZONE NOT FOUND'"
-    ssh_s1 "sed -i 's|zone \"${zone}\" {type master; file \"/home/admin/conf/dns/${zone}.db\";};|zone \"${zone}\" {type master; file \"/home/admin/conf/dns/${zone}.db\"; allow-transfer { ${S2_IP}; }; also-notify { ${S2_IP}; };};|' /etc/bind/named.conf"
-    ssh_s1 "grep \"^zone \\\"${zone}\\\" \" /etc/bind/named.conf"
-  done
-  echo "=== S1 rndc reload ==="
-  ssh_s1 'rndc reload 2>&1 | head -5'
+  echo "=== Phase A / S1: Set GLOBAL allow-transfer + also-notify → ${S2_IP} in named.conf.options ==="
+  # HL #105: per-zone stanzas in /etc/bind/named.conf are wiped by Hestia on
+  # any v-add-letsencrypt-domain / v-add-dns-record / v-rebuild-dns-domain.
+  # Use named.conf.options (Hestia never touches it) so the policy survives.
+  ssh_s1 "cp -n /etc/bind/named.conf.options /etc/bind/named.conf.options.pre-axfr-04d
+sed -i 's|allow-transfer {\"none\";};|allow-transfer { ${S2_IP}; };\\n        also-notify { ${S2_IP}; };|' /etc/bind/named.conf.options
+grep -A 1 'allow-transfer\\|also-notify' /etc/bind/named.conf.options | head -5"
+  echo "=== S1 rndc reconfig (options changes need reconfig, not reload) ==="
+  ssh_s1 'rndc reconfig 2>&1 | head -5'
   echo "=== Verify AXFR from S2's perspective for launta.info ==="
   ssh_s2 "dig AXFR launta.info @${S1_IP} +time=10 +tries=1 2>&1 | head -10"
 }
 
 phase_A_s2() {
-  echo "=== Phase A / S2: Add allow-transfer { ${S1_IP}; } and also-notify to S2-primary zone stanzas ==="
-  for zone in "${S2_PRIMARY_ZONES[@]}"; do
-    echo "--- S2 zone: ${zone} ---"
-    ssh_s2 "grep \"^zone \\\"${zone}\\\" \" /etc/bind/named.conf || echo 'ZONE NOT FOUND'"
-    ssh_s2 "sed -i 's|zone \"${zone}\" {type master; file \"/home/admin/conf/dns/${zone}.db\";};|zone \"${zone}\" {type master; file \"/home/admin/conf/dns/${zone}.db\"; allow-transfer { ${S1_IP}; }; also-notify { ${S1_IP}; };};|' /etc/bind/named.conf"
-    ssh_s2 "grep \"^zone \\\"${zone}\\\" \" /etc/bind/named.conf"
-  done
-  echo "=== S2 rndc reload ==="
-  ssh_s2 'rndc reload 2>&1 | head -5'
+  echo "=== Phase A / S2: Set GLOBAL allow-transfer + also-notify → ${S1_IP} in named.conf.options ==="
+  ssh_s2 "cp -n /etc/bind/named.conf.options /etc/bind/named.conf.options.pre-axfr-04d
+sed -i 's|allow-transfer {\"none\";};|allow-transfer { ${S1_IP}; };\\n        also-notify { ${S1_IP}; };|' /etc/bind/named.conf.options
+grep -A 1 'allow-transfer\\|also-notify' /etc/bind/named.conf.options | head -5"
+  echo "=== S2 rndc reconfig ==="
+  ssh_s2 'rndc reconfig 2>&1 | head -5'
   echo "=== Verify AXFR from S1's perspective for larena.info ==="
   ssh_s1 "dig AXFR larena.info @${S2_IP} +time=10 +tries=1 2>&1 | head -10"
 }
@@ -203,9 +200,9 @@ phase_verify() {
 }
 
 phase_rollback() {
-  echo "=== ROLLBACK: restore /etc/bind/named.conf from backup on both servers ==="
-  ssh_s1 'cp /etc/bind/named.conf.pre-axfr-04d /etc/bind/named.conf && rm -f /etc/bind/named.conf.cluster && rndc reload'
-  ssh_s2 'cp /etc/bind/named.conf.pre-axfr-04d /etc/bind/named.conf && rm -f /etc/bind/named.conf.cluster && rndc reload'
+  echo "=== ROLLBACK: restore /etc/bind/named.conf + named.conf.options from backup on both servers ==="
+  ssh_s1 'cp /etc/bind/named.conf.pre-axfr-04d /etc/bind/named.conf && [ -f /etc/bind/named.conf.options.pre-axfr-04d ] && cp /etc/bind/named.conf.options.pre-axfr-04d /etc/bind/named.conf.options; rm -f /etc/bind/named.conf.cluster && rndc reconfig'
+  ssh_s2 'cp /etc/bind/named.conf.pre-axfr-04d /etc/bind/named.conf && [ -f /etc/bind/named.conf.options.pre-axfr-04d ] && cp /etc/bind/named.conf.options.pre-axfr-04d /etc/bind/named.conf.options; rm -f /etc/bind/named.conf.cluster && rndc reconfig'
   echo "Rollback complete. Zones restored to pre-backfill state."
   echo "NOTE: v-delete-dns-domain is NOT automatically reversed — HestiaCP registration is lost."
   echo "      If phaseB/C ran, you'll need to re-add those zones via v-add-dns-domain manually."

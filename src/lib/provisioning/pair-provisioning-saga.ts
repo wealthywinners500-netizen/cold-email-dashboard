@@ -36,7 +36,7 @@ import {
   syncZoneFiles,
   replicateSSLCertToSecondary,
   computeZonePartition,
-  configureZoneTransferPolicy,
+  setGlobalZoneTransferPolicy,
   installSlaveZones,
   openBindFirewall,
   HESTIA_PATH_PREFIX,
@@ -590,9 +590,12 @@ export function createPairProvisioningSaga(
           await openBindFirewall(ssh1, server2IP);
           await openBindFirewall(ssh2, server1IP);
 
-          // Configure allow-transfer + also-notify on each primary to its peer.
-          await configureZoneTransferPolicy(ssh1, s1Primary, server2IP);
-          await configureZoneTransferPolicy(ssh2, s2Primary, server1IP);
+          // Configure allow-transfer + also-notify globally in named.conf.options.
+          // Per-zone edits (HL #105) are not durable — Hestia regenerates zone
+          // stanzas from its template on v-add-letsencrypt-domain / v-add-dns-record
+          // and wipes per-zone options. named.conf.options is untouched.
+          await setGlobalZoneTransferPolicy(ssh1, server2IP);
+          await setGlobalZoneTransferPolicy(ssh2, server1IP);
 
           // Install slave zones on peer via /etc/bind/named.conf.cluster include.
           // S2 slaves S1's primary zones; S1 slaves S2's primary zones.
