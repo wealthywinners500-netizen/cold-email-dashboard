@@ -917,11 +917,44 @@ export async function issueSSLCert(
       throw new Error(`LE_RATE_LIMIT: ${rateLimit.message}`);
     }
 
-    // Now issue the LE domain cert with full PATH + explicit admin arg
-    // Hard Lesson #51: Full PATH required for internal hostname/date/grep/sed calls
-    // Pass '' for aliases (prevent www in SAN) and 'yes' for mail subdomains
-    // Matches the auto-fix version (auto-fix.ts line 620) for consistency
-    await ssh.exec(`bash -lc "${HESTIA_FULL_PATH} && v-add-letsencrypt-domain admin ${domain} '' yes"`, { timeout: 120000 });
+    // Issue TWO LE certs (HL #104, Session 04d):
+    //   1. Web vhost cert — SAN [{domain}, www.{domain}]. HestiaCP installs it
+    //      on the web vhost nginx config so `https://{domain}/` serves a valid
+    //      cert. Click-tracking links, unsubscribe URLs, and the MTA-STS policy
+    //      file at `https://mta-sts.{domain}/` all need this.
+    //   2. Mail cert — SAN [mail.{domain}, webmail.{domain}]. HestiaCP installs
+    //      it on Exim4/Dovecot/Roundcube. The VG2 SSL checks probe
+    //      `mail.{domain}:443` (HL #99).
+    //
+    // The old single call `v-add-letsencrypt-domain admin {d} '' yes` issued
+    // ONLY the mail cert (the `yes` flag is the MAIL subdomain toggle). The
+    // bare web vhost ended up with SSL disabled — `https://{d}/` fell back to
+    // the default_server cert (`mail{1|2}.{nsDomain}`), producing CN mismatch
+    // warnings on every click-tracking/unsubscribe URL. Session 04d pair 13
+    // needed operational backfill; from this PR forward, the saga ships both.
+    //
+    // Pass '' for aliases on BOTH calls to prevent accidental www/mail double-
+    // binding in the SAN set — HestiaCP decides SAN composition from the MAIL
+    // flag, not the aliases string.
+    const webResult = await ssh.exec(
+      `bash -lc "${HESTIA_FULL_PATH} && v-add-letsencrypt-domain admin ${domain}"`,
+      { timeout: 120000 }
+    );
+    const webExit = (webResult as { code?: number }).code;
+    if (webExit !== undefined && webExit !== 0 && webExit !== 3 && webExit !== 4) {
+      throw new Error(`v-add-letsencrypt-domain (web cert) exited ${webExit} for ${domain}: ${(webResult as { stderr?: string }).stderr ?? ''}`);
+    }
+
+    // Mail cert — kept as separate call so a mail-cert issuance failure does
+    // not roll back a successful web cert. Exit 3/4 tolerated ("already exists").
+    const mailResult = await ssh.exec(
+      `bash -lc "${HESTIA_FULL_PATH} && v-add-letsencrypt-domain admin ${domain} '' yes"`,
+      { timeout: 120000 }
+    );
+    const mailExit = (mailResult as { code?: number }).code;
+    if (mailExit !== undefined && mailExit !== 0 && mailExit !== 3 && mailExit !== 4) {
+      throw new Error(`v-add-letsencrypt-domain (mail cert) exited ${mailExit} for ${domain}: ${(mailResult as { stderr?: string }).stderr ?? ''}`);
+    }
   }
 
   // Verify CN matches expected
