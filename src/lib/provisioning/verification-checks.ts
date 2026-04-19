@@ -127,6 +127,13 @@ export async function runVerificationChecks(
   const authoritativeResolver = server1IP; // S1 is ns1 — the primary authoritative NS
   const resolvers = [server1IP, server2IP, '8.8.8.8'];
   const primaryResolver = authoritativeResolver;
+  // HL #102 (Session 04d): Reverse (PTR) lookups cannot use authoritativeResolver.
+  // HestiaCP's default BIND config is `allow-recursion { 127.0.0.1; ::1; };` —
+  // authoritative-only for external source IPs. S1 is not authoritative for the
+  // in-addr.arpa zones (Linode is), so PTR resolution must recurse — which is
+  // refused when the dig query reaches BIND over the network (source != 127.0.0.1).
+  // Use a public recursive resolver for fcrdns only.
+  const reverseResolver = '8.8.8.8';
 
   // ============================================================================
   // CATEGORY 1: DNS Record Checks (1-10)
@@ -1400,8 +1407,9 @@ export async function runVerificationChecks(
     [ssh2, 'S2', server2IP] as const,
   ]) {
     try {
-      // Reverse DNS lookup
-      const ptrResult = await ssh1.exec(`dig -x ${ip} +short @${primaryResolver} 2>/dev/null`, {
+      // Reverse DNS lookup — HL #102: must use recursive resolver (reverseResolver),
+      // not authoritativeResolver. S1's BIND refuses to recurse for external queries.
+      const ptrResult = await ssh1.exec(`dig -x ${ip} +short @${reverseResolver} 2>/dev/null`, {
         timeout: 15000,
       });
       const ptrName = ptrResult.stdout.trim().replace(/\.$/, '');
@@ -1420,7 +1428,8 @@ export async function runVerificationChecks(
 
       const expectedPTR = name === 'S1' ? `mail1.${nsDomain}` : `mail2.${nsDomain}`;
 
-      // Forward DNS lookup of PTR
+      // Forward DNS lookup of PTR — authoritativeResolver is correct here
+      // because mail{1|2}.{nsDomain} is in our own zone.
       const aResult = await ssh1.exec(
         `dig +short ${ptrName} A @${primaryResolver} 2>/dev/null`,
         { timeout: 15000 }
