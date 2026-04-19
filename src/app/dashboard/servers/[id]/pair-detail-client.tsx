@@ -480,7 +480,7 @@ export default function PairDetailClient({
               <li>MXToolbox domain health</li>
               <li>PTR alignment (multi-resolver)</li>
               <li>DNS propagation consistency</li>
-              <li>Operational blacklist sweep (SBL/DBL/Barracuda/Invaluement)</li>
+              <li>Operational blacklist sweep (SBL/DBL/Barracuda)</li>
             </ul>
             <p className="text-xs text-gray-400 mb-4">
               Typical runtime: 30–90 seconds. SEM-listed results are reported
