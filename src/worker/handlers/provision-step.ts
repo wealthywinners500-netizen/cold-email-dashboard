@@ -63,6 +63,7 @@ const WORKER_STEP_TYPES: StepType[] = [
   'set_ptr',
   'setup_mail_domains',
   'await_s2_dns',
+  'await_auth_dns',
   'security_hardening',
   'verification_gate',
   'auto_fix',

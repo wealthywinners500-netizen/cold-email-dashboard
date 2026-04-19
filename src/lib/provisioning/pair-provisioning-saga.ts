@@ -48,6 +48,7 @@ import { checkSubnetDiversity } from './verification';
 import { checkDomainsBlacklistBatch } from './domain-blacklist';
 import { runVerificationChecks } from './verification-checks';
 import { runAutoFixes } from './auto-fix';
+import { runAwaitAuthDns } from './steps/await-auth-dns';
 
 // Helper to access dynamic metadata on context safely
 function ctxMeta(context: ProvisioningContext): Record<string, unknown> {
@@ -1392,6 +1393,61 @@ export function createPairProvisioningSaga(
           success: true,
           output,
           metadata: { s2DnsPropagation: results },
+        };
+      },
+
+      async compensate(_context: ProvisioningContext): Promise<void> {
+        // Informational step — nothing to rollback
+      },
+    },
+
+    // ========================================
+    // Step 7b: AWAIT_AUTH_DNS — 10-resolver consensus gate (HL #R3)
+    // Session 04b: LE burned 9 failed validations in ~2 min against
+    // un-propagated DNS, tripping the 5/hour/hostname rate limit.
+    // This step verifies A/MX/SPF/DKIM/DMARC for the NS domain + all
+    // sending domains have converged on ≥7 of 10 geographically
+    // diverse resolvers before security_hardening issues LE certs.
+    // Hard-fails the saga on 30-min timeout — no LE attempts against
+    // DNS that hasn't propagated to Quad9/DNS.WATCH/etc.
+    // ========================================
+    {
+      name: 'Await Authoritative DNS Propagation',
+      type: 'await_auth_dns' as const,
+      estimatedDurationMs: 600_000, // 10 min typical; 30 min hard cap inside the runner
+
+      async execute(context: ProvisioningContext): Promise<StepResult> {
+        context.log('[Step 7b] Awaiting authoritative DNS propagation (10-resolver consensus)...');
+        const ctx = ctxMeta(context);
+        const server1IP = (ctx.server1IP as string) || context.server1?.ip || '';
+        const server2IP = (ctx.server2IP as string) || context.server2?.ip || '';
+        const server1Domains = (ctx.server1Domains as string[]) || [];
+        const server2Domains = (ctx.server2Domains as string[]) || [];
+
+        if (!server1IP || !server2IP) {
+          return {
+            success: false,
+            error: 'await_auth_dns: server IPs not found in provisioning context',
+          };
+        }
+
+        const result = await runAwaitAuthDns({
+          ssh1,
+          nsDomain: context.nsDomain,
+          server1IP,
+          server2IP,
+          server1Domains,
+          server2Domains,
+          log: context.log,
+        });
+
+        return {
+          success: result.success,
+          output: result.output,
+          error: result.error,
+          metadata: {
+            authDnsConsensus: result.metadata,
+          },
         };
       },
 

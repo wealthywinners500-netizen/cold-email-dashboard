@@ -47,10 +47,11 @@ export type StepType =
   | "set_ptr"                // Step 6: Requires forward A to resolve
   | "setup_mail_domains"     // Step 7: DKIM/SPF/DMARC/accounts
   | "await_s2_dns"           // Step 8: Poll resolvers for S2 domain A records before SSL
-  | "security_hardening"     // Step 9: Kill services + SSL certs
-  | "verification_gate"      // Step 10: VG1 — categorized checks (auto_fixable vs manual_required)
-  | "auto_fix"               // Step 11: Auto-fix all auto_fixable issues from VG1
-  | "verification_gate_2";   // Step 12: VG2 — re-run checks, pass = done
+  | "await_auth_dns"         // Step 9: 10-resolver consensus on A/MX/SPF/DKIM/DMARC before LE (HL #R3)
+  | "security_hardening"     // Step 10: Kill services + SSL certs
+  | "verification_gate"      // Step 11: VG1 — categorized checks (auto_fixable vs manual_required)
+  | "auto_fix"               // Step 12: Auto-fix all auto_fixable issues from VG1
+  | "verification_gate_2";   // Step 13: VG2 — re-run checks, pass = done
 
 export type StepStatus =
   | "pending"
