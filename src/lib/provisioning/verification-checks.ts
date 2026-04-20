@@ -61,7 +61,14 @@ export async function runVerificationChecks(
     pairId,
   } = params;
 
-  // All domains to check: NS domain + all sending domains
+  // All domains to check: NS domain + all sending domains.
+  // HL #111 (2026-04-20): keep the NS apex first in this array for every check
+  // that emits auto_fixable results — most relevantly `dkim_presence` /
+  // `dkim_key_validation` below. When the NS apex fails either check, `issue.domain`
+  // is set from this iterator, so the `add_dkim` dispatch at auto-fix.ts line 1174
+  // receives `domain = nsDomain` and routes the fix through `addDKIM` unchanged
+  // (which now succeeds because setup_mail_domains registers the NS apex as a
+  // HestiaCP mail domain on S1, so `v-add-mail-domain-dkim admin <ns>` works).
   const allDomains = [nsDomain, ...sendingDomains];
 
   // Load per-domain primary_server_id from sending_domains when pairId is
