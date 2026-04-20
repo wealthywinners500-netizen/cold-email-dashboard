@@ -563,6 +563,7 @@ const VG_RETRY_INTERVAL_MS = 60 * 1000; // 60 seconds
 async function verifyDKIMCrossServerMatch(
   jobId: string,
   orgId: string,
+  nsDomain: string,
   sendingDomains: string[],
   server1IP: string,
   server2IP: string
@@ -570,10 +571,19 @@ async function verifyDKIMCrossServerMatch(
   const issues: string[] = [];
   const supabase = await createAdminClient();
 
+  // HL #111 (2026-04-20): the NS apex is prepended to the checked-domain list so
+  // that a missing or mismatched DKIM on `<ns_domain>` fails the VG just like a
+  // sending-domain key would. Pre-HL-#111, this function only iterated
+  // `sendingDomains`, letting P11-class drift ship silently — the NS apex had no
+  // `/home/admin/conf/mail/<ns>/dkim.pem` on either server and the VG reported
+  // green.
+  const allDomains = [nsDomain, ...sendingDomains];
+
   // PATCH 10c: Load per-server domain assignment from Step 6 metadata.
   // With per-server split, each domain's DKIM key only exists on the
   // assigned server. We verify the key exists on the correct server
-  // rather than requiring it on both.
+  // rather than requiring it on both. The NS apex lands in server1Domains
+  // post-HL-#111, so per-server-split mode checks only S1 for its key.
   const { data: step6Row } = await supabase
     .from("provisioning_steps")
     .select("metadata")
@@ -621,13 +631,14 @@ async function verifyDKIMCrossServerMatch(
     await ssh1.connect(server1IP, 22, "root", { password: byIp.get(server1IP)! });
     await ssh2.connect(server2IP, 22, "root", { password: byIp.get(server2IP)! });
 
-    for (const domain of sendingDomains) {
+    for (const domain of allDomains) {
       const dkimPath = `/home/admin/conf/mail/${domain}/dkim.pem`;
 
       if (hasPerServerSplit) {
         // PATCH 10c: Per-server mode — verify DKIM key exists on the
         // assigned server only. The other server doesn't have the mail
-        // domain so it won't sign mail for this domain.
+        // domain so it won't sign mail for this domain. HL #111: NS apex
+        // is in server1Domains since its master zone is on S1.
         const assignedSSH = s1Domains.has(domain) ? ssh1 : ssh2;
         const assignedLabel = s1Domains.has(domain) ? 'S1' : 'S2';
         try {
@@ -894,17 +905,23 @@ async function runVerificationGateOnce(jobId: string): Promise<{
   // Every sending domain's /home/admin/conf/mail/<d>/dkim.pem must
   // have identical sha256 on S1 and S2, otherwise S2-signed mail will
   // fail DKIM validation at receiving MTAs.
+  //
+  // HL #111 (2026-04-20): pass `job.ns_domain` so the NS apex is included
+  // in the per-server DKIM check. Pre-HL-#111, this call only passed
+  // sending_domains, letting NS-apex DKIM drift (as seen on P11) ship green.
   try {
     const dkimCross = await verifyDKIMCrossServerMatch(
       jobId,
       job.org_id,
+      job.ns_domain,
       job.sending_domains || [],
       server1IP,
       server2IP
     );
+    const checkedCount = 1 + (job.sending_domains?.length || 0);
     if (dkimCross.ok) {
       results.push(
-        `✓ DKIM keys match S1↔S2 across all ${job.sending_domains?.length || 0} sending domain(s)`
+        `✓ DKIM keys present on assigned server across NS apex + ${job.sending_domains?.length || 0} sending domain(s) (${checkedCount} zones total)`
       );
     } else {
       for (const issue of dkimCross.issues) {

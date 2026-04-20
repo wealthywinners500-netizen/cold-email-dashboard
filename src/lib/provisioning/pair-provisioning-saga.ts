@@ -816,23 +816,45 @@ export function createPairProvisioningSaga(
           // domain — required for DKIM: Hestia writes the DKIM TXT into the
           // domain's zone file on whichever server created the mail domain,
           // and slave AXFR propagates it to the peer.
+          //
+          // HL #111 (2026-04-20): NS apex is INCLUDED in the S1 loop — it is the
+          // first element of partition.s1Primary. Pre-HL-#111 saga filtered the NS
+          // apex out of the mail-domain loop, leaving the NS apex without DKIM.
+          // P11 shipped with no `mail._domainkey.<ns-domain>` TXT and had to be
+          // backfilled manually. The loop now iterates [ns_domain, ...s1 sending
+          // domains] on S1 so `createMailDomain` generates a DKIM key for the NS
+          // apex at saga time, published from the S1-mastered zone and slaved to
+          // S2 via AXFR. NS apex has no sending accounts (the `dmarc@<ns>` mailbox
+          // is created separately below for DMARC rua/ruf reporting).
           const partition = computeZonePartition(context.nsDomain, context.sendingDomains);
-          const server1Domains = partition.s1Primary.filter((d) => d !== context.nsDomain);
+          const server1Domains = partition.s1Primary;
           const server2Domains = partition.s2Primary;
-          const midpoint = server1Domains.length;
+          // `namesByDomain` is indexed by sending_domains position; NS apex gets no
+          // sending accounts, so compute the per-server-sending midpoint excluding it.
+          const server1SendingDomains = server1Domains.filter((d) => d !== context.nsDomain);
+          const midpoint = server1SendingDomains.length;
 
-          context.log(`[Step 6] Domain split: S1 gets ${server1Domains.length} domains (${server1Domains.join(', ')})`);
+          context.log(`[Step 6] Domain split: S1 gets ${server1Domains.length} zones including NS apex (${server1Domains.join(', ')})`);
           context.log(`[Step 6] Domain split: S2 gets ${server2Domains.length} domains (${server2Domains.join(', ')})`);
 
           const allAccountsCreated: Record<string, string[]> = {};
           const dkimRecords: Record<string, string> = {};
 
-          // Set up S1 domains (mail accounts + DKIM on server 1 only)
+          // Set up S1 domains (mail accounts + DKIM on server 1 only).
+          // NS apex runs createMailDomain with an empty accounts list — we only
+          // need the DKIM key and SPF/DMARC baseline; the `dmarc@<ns>` mailbox is
+          // created further down in the DMARC reporting mailbox block.
           for (let i = 0; i < server1Domains.length; i++) {
             const domain = server1Domains[i];
-            const accounts = namesByDomain[i] || [];
+            const isNsApex = domain === context.nsDomain;
+            const sendingIdx = isNsApex ? -1 : server1SendingDomains.indexOf(domain);
+            const accounts = isNsApex ? [] : (namesByDomain[sendingIdx] || []);
 
-            context.log(`[Step 6] Setting up mail domain ${domain} on S1 with ${accounts.length} accounts...`);
+            context.log(
+              `[Step 6] Setting up mail domain ${domain} on S1 with ${accounts.length} accounts` +
+                (isNsApex ? ' (NS apex — DKIM only, DMARC mailbox created later)' : '') +
+                '...'
+            );
 
             const result = await createMailDomain(ssh1, {
               domain,
@@ -848,7 +870,8 @@ export function createPairProvisioningSaga(
           // Set up S2 domains (mail accounts + DKIM on server 2 only)
           for (let i = 0; i < server2Domains.length; i++) {
             const domain = server2Domains[i];
-            // namesByDomain index for S2 domains starts at midpoint
+            // namesByDomain index for S2 domains starts at midpoint (S1 sending count,
+            // excluding NS apex).
             const accounts = namesByDomain[midpoint + i] || [];
 
             context.log(`[Step 6] Setting up mail domain ${domain} on S2 with ${accounts.length} accounts...`);
@@ -1191,10 +1214,13 @@ export function createPairProvisioningSaga(
           // Microsoft, Yahoo, etc. The rua/ruf tags in the DMARC TXT records point
           // here. Nothing consumes the mailbox automatically yet; reports can be
           // reviewed manually or wired to an aggregator later.
-          // The NS domain has a DNS zone but is NOT set up as a mail domain during
-          // normal provisioning (sending happens on sendingDomains, not the NS domain),
-          // so v-add-mail-domain runs first on both servers. Exit codes 3/4 = "already
-          // exists" — non-fatal (HL #97).
+          //
+          // HL #111: S1 already has the NS apex mail domain (createMailDomain ran it
+          // above as part of server1Domains), so v-add-mail-domain on S1 exits 3/4
+          // ("already exists", non-fatal per HL #97). On S2 the NS apex is NOT in
+          // server2Domains (per the alphabetical partition), so v-add-mail-domain on
+          // S2 is a genuine create — needed for the dmarc@<ns_domain> mailbox to
+          // receive rua/ruf reports regardless of which server resolves first.
           context.log(`[Step 6] Creating DMARC reporting mailbox dmarc@${context.nsDomain} on both servers...`);
           try {
             const escapedDmarcPassword = password.replace(/'/g, "'\\''");
