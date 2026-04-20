@@ -386,8 +386,16 @@ async function checkDmarc(zone: string, deps: ResolverDeps): Promise<IntoDNSChec
   const p = pMatch?.[1] ?? "none";
   if (p === "quarantine" || p === "reject") out.push(ok("dmarc_policy", `p=${p}`));
   else out.push(warn("dmarc_policy", `p=${p} (should be quarantine or reject)`));
-  if (/\brua=mailto:/.test(dmarc)) out.push(ok("dmarc_rua", "rua present"));
-  else out.push(warn("dmarc_rua", "no rua= reporting address"));
+  // HL #109 (2026-04-20): rua/ruf are OPTIONAL per RFC 7489 §6.3. For
+  // cold-email sending infrastructure we OMIT them. Surface rua presence
+  // as informational only — never a WARN — so this check doesn't drive
+  // the gate severity. Matches the bash `verify-zone.sh` dmarc_rua_informational
+  // demotion done in the oracle-swap PR.
+  if (/\brua=mailto:/.test(dmarc)) {
+    out.push(ok("dmarc_rua", "rua present — fine but not required under cold-email canonical"));
+  } else {
+    out.push(ok("dmarc_rua", "rua absent — matches cold-email canonical (HL #109)"));
+  }
   return out;
 }
 
