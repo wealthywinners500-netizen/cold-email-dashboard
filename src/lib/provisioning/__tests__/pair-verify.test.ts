@@ -124,6 +124,20 @@ function allGreenDeps(): PairVerifyDeps {
       return ['v=spf1 ip4:203.0.113.10 -all'];
     },
     dnsbl: async (_query: string, _zone: string) => [], // clean
+    // Oracle swap (2026-04-19): intoDNS is the new canonical gate. All-green
+    // fixture returns `severity: 'pass'` with a trivially-green per-zone list.
+    intoDNSHealth: async (input) => ({
+      zones: input.zones.map((z) => ({
+        zone: z,
+        nsDomain: input.nsDomain,
+        s1Ip: input.s1Ip,
+        s2Ip: input.s2Ip,
+        results: [{ check: 'fixture_all_green', severity: 'pass', message: 'stubbed green' }],
+        severity: 'pass' as const,
+      })),
+      severity: 'pass',
+      ok: true,
+    }),
   };
 }
 
@@ -139,8 +153,8 @@ async function testAllGreen(): Promise<void> {
 
   assert(report.status === 'green', `expected status=green, got ${report.status}`);
   assert(
-    report.checks.length === 4,
-    `expected 4 checks, got ${report.checks.length}`
+    report.checks.length === 5,
+    `expected 5 checks (intoDNS + MXToolbox + PTR + DNS + blacklist), got ${report.checks.length}`
   );
   assert(
     report.checks.every((c) => c.result === 'pass'),
@@ -277,6 +291,68 @@ async function testMxtoolbox5xxYellow(): Promise<void> {
   console.log('PASS (e) MXToolbox 5xx → yellow with retry guidance');
 }
 
+async function testIntoDNSFailRed(): Promise<void> {
+  console.log('\n=== (f) intoDNS oracle fail → red (oracle swap 2026-04-19) ===\n');
+
+  const deps = allGreenDeps();
+  // Simulate an intoDNS fail: e.g. AXFR serial drift or a real Spamhaus listing.
+  deps.intoDNSHealth = async (input) => ({
+    zones: input.zones.map((z) => ({
+      zone: z,
+      nsDomain: input.nsDomain,
+      s1Ip: input.s1Ip,
+      s2Ip: input.s2Ip,
+      results: [
+        {
+          check: 'soa_serial_consistent',
+          severity: 'fail' as const,
+          message: 'serial drift: S1=... S2=...',
+        },
+      ],
+      severity: 'fail' as const,
+    })),
+    severity: 'fail',
+    ok: false,
+  });
+
+  const supabase = makeSupabase();
+  const report = await runPairVerification(FAKE_PAIR.id, supabase, deps);
+
+  assert(report.status === 'red', `expected status=red on intoDNS fail, got ${report.status}`);
+  const ido = report.checks.find((c) => c.name === 'intodns_domain_health');
+  assert(!!ido, 'intodns_domain_health check must be present');
+  assert(ido!.result === 'fail', `intoDNS result expected fail, got ${ido!.result}`);
+  console.log('PASS (f) intoDNS fail → red');
+}
+
+async function testMxtoolboxFailDoesNotGoRed(): Promise<void> {
+  console.log('\n=== (g) MXToolbox-only failure stays yellow (demoted to advisory) ===\n');
+
+  const deps = allGreenDeps();
+  // MXToolbox reports failures — previously would drive pair_verify to red.
+  // After the oracle swap, this should be at most yellow (intoDNS is clean).
+  deps.mxtoolbox = async (host: string): Promise<MxtoolboxResult> => ({
+    host,
+    failed: ['DNS SOA Expire Value out of recommended range'],
+    warnings: [],
+    passed: [],
+    http_error: null,
+  });
+
+  const supabase = makeSupabase();
+  const report = await runPairVerification(FAKE_PAIR.id, supabase, deps);
+
+  assert(
+    report.status !== 'red',
+    `expected non-red status when only MXToolbox fails, got ${report.status} — oracle swap regression`
+  );
+  const mx = report.checks.find((c) => c.name === 'mxtoolbox_domain_health');
+  assert(mx!.result === 'warn', `MXToolbox advisory result expected warn, got ${mx!.result}`);
+  const details = mx!.details as Record<string, unknown>;
+  assert(details.advisory_only === true, 'advisory_only flag must be true on MXToolbox check');
+  console.log('PASS (g) MXToolbox-only fail → not red (oracle swap honored)');
+}
+
 // ============================================
 // Main
 // ============================================
@@ -290,6 +366,8 @@ export async function testPairVerify(): Promise<void> {
   await testOperationalSblRed();
   await testPtrMismatchRed();
   await testMxtoolbox5xxYellow();
+  await testIntoDNSFailRed();
+  await testMxtoolboxFailDoesNotGoRed();
 
   console.log('\n====================================');
   console.log('ALL TESTS PASSED');

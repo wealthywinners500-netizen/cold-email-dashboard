@@ -1,15 +1,24 @@
 // ============================================
 // In-app Pair Verify — on-demand deliverability audit
 //
-// Runs four checks IN PARALLEL against a server_pair + up to 2 sending_domains:
-//   a) MXToolbox Domain Health   (remote HTTP API; 5xx → warn, not red)
-//   b) Multi-resolver PTR        (8.8.8.8 / 1.1.1.1 / 9.9.9.9 must all match)
-//   c) DNS propagation           (A/MX/SPF/_dmarc consistent across 3 resolvers)
-//   d) Operational blacklist sweep
+// Runs five checks IN PARALLEL against a server_pair + up to 2 sending_domains:
+//   a) intoDNS canonical oracle    (new primary gate: SOA/MTA-STS/TLS-RPT/CAA/DMARC/Spamhaus)
+//   b) MXToolbox Domain Health     (ADVISORY-ONLY as of 2026-04-19; never fails red)
+//   c) Multi-resolver PTR          (8.8.8.8 / 1.1.1.1 / 9.9.9.9 must all match)
+//   d) DNS propagation             (A/MX/SPF/_dmarc consistent across 3 resolvers)
+//   e) Operational blacklist sweep
 //       OPERATIONAL = hard-fail (Spamhaus SBL/DBL, Barracuda)
 //       SEM         = complaint-based, tolerated (SORBS SPAM, UCEPROTECT L3)
 //       (HL #103: Invaluement SIP removed — their legacy DNSBL poisons
 //        all queries as listed. Use their v2 HTTPS API to reinstate.)
+//
+// Oracle-swap history: until 2026-04-19 MXToolbox was the canonical gate.
+// Research deliverable (Session 04d) proved MXToolbox UI is not programma-
+// tically verifiable (no paid API exposes Domain Health), uses undocumented
+// thresholds stricter than its own /problem/ pages, and disagrees with
+// google.com's actual (inbox-delivering) DNS. New canonical = intoDNS +
+// mail-tester ≥ 8.5 + Google Postmaster High. See
+// `.auto-memory/feedback_mxtoolbox_ui_api_gap.md` for F1–F4 evidence.
 //
 // Deliberately does NOT edit verification.ts's WARN_ONLY_BLACKLISTS —
 // that set tunes the provisioning gate (Barracuda warn-only on Linode).
@@ -18,6 +27,10 @@
 
 import dnsPromises from 'node:dns/promises';
 import type { SupabaseClient } from '@supabase/supabase-js';
+import {
+  checkPairIntoDNSHealth,
+  type IntoDNSPairReport,
+} from '@/lib/provisioning/checks/intodns-health';
 
 // ============================================
 // Blacklist classification — OUR local rules, NOT verification.ts's
@@ -139,11 +152,23 @@ export type ResolveFn = (
  */
 export type DnsblQueryFn = (queryName: string, zone: string) => Promise<string[]>;
 
+/**
+ * The intoDNS oracle call. Takes the same inputs as `checkPairIntoDNSHealth`
+ * and returns its report. Injectable so tests can stub the network layer.
+ */
+export type IntoDNSHealthFn = (input: {
+  zones: string[];
+  nsDomain: string;
+  s1Ip: string;
+  s2Ip: string;
+}) => Promise<IntoDNSPairReport>;
+
 export interface PairVerifyDeps {
   mxtoolbox: MxtoolboxFn;
   reverse: ReverseFn;
   resolve: ResolveFn;
   dnsbl: DnsblQueryFn;
+  intoDNSHealth: IntoDNSHealthFn;
 }
 
 // ============================================
@@ -234,11 +259,17 @@ const defaultMxtoolbox: MxtoolboxFn = async (host) => {
   }
 };
 
+const defaultIntoDNSHealth: IntoDNSHealthFn = (input) => checkPairIntoDNSHealth({
+  ...input,
+  delayBetweenZonesMs: 200,
+});
+
 export const defaultPairVerifyDeps: PairVerifyDeps = {
   mxtoolbox: defaultMxtoolbox,
   reverse: defaultReverse,
   resolve: defaultResolve,
   dnsbl: defaultDnsbl,
+  intoDNSHealth: defaultIntoDNSHealth,
 };
 
 // ============================================
@@ -246,9 +277,17 @@ export const defaultPairVerifyDeps: PairVerifyDeps = {
 // ============================================
 
 /**
- * MXToolbox Domain Health check.
+ * MXToolbox Domain Health check — **ADVISORY ONLY** as of 2026-04-19.
+ *
  * Queries the pair's ns_domain (acts as hostname) plus the 2 sending domains.
- * On 5xx / network error: returns warn. Never operational-red.
+ * Any failures or warnings from MXToolbox are reported as `warn` (never
+ * `fail`) so they surface in the admin UI without blocking the pair_verify
+ * gate. The authoritative gate is now `runIntoDNSCheck` — see
+ * `checks/intodns-health.ts` and `feedback_mxtoolbox_ui_api_gap.md`.
+ *
+ * Kept in the check list so operators auditing against the MXToolbox UI
+ * can still correlate, but a pair that's green on intoDNS and fails only
+ * MXToolbox is considered shippable.
  */
 async function runMxtoolboxCheck(
   hosts: string[],
@@ -262,10 +301,11 @@ async function runMxtoolboxCheck(
       name: 'mxtoolbox_domain_health',
       result: 'warn',
       details: {
+        advisory_only: true,
         http_error: anyHttpError.http_error,
         hosts,
         retry_guidance:
-          'MXToolbox unreachable — re-run the verification in a few minutes. No operational signal was produced.',
+          'MXToolbox unreachable. This is advisory only — intoDNS remains the gate.',
       },
       is_sem_warning: false,
     };
@@ -274,20 +314,11 @@ async function runMxtoolboxCheck(
   const hasFailures = results.some((r) => r.failed.length > 0);
   const hasWarnings = results.some((r) => r.warnings.length > 0);
 
-  if (hasFailures) {
-    return {
-      name: 'mxtoolbox_domain_health',
-      result: 'fail',
-      details: { per_host: results },
-      is_sem_warning: false,
-    };
-  }
-
-  if (hasWarnings) {
+  if (hasFailures || hasWarnings) {
     return {
       name: 'mxtoolbox_domain_health',
       result: 'warn',
-      details: { per_host: results },
+      details: { advisory_only: true, per_host: results },
       is_sem_warning: false,
     };
   }
@@ -295,9 +326,49 @@ async function runMxtoolboxCheck(
   return {
     name: 'mxtoolbox_domain_health',
     result: 'pass',
-    details: { per_host: results },
+    details: { advisory_only: true, per_host: results },
     is_sem_warning: false,
   };
+}
+
+/**
+ * intoDNS canonical check — primary Gate 0 oracle.
+ *
+ * Runs the pair-wide DNS health sweep across the ns_domain and the 2 sample
+ * sending domains. Gating: any `fail` from the intoDNS oracle becomes a
+ * `fail` on this check (which the status classifier rolls up to `red`);
+ * any `warn` becomes a `warn` (rolled up to `yellow` if nothing else fails).
+ */
+async function runIntoDNSCheck(
+  zones: string[],
+  nsDomain: string,
+  s1Ip: string,
+  s2Ip: string,
+  intoDNSHealth: IntoDNSHealthFn
+): Promise<PairVerifyCheck> {
+  let report: IntoDNSPairReport;
+  try {
+    report = await intoDNSHealth({ zones, nsDomain, s1Ip, s2Ip });
+  } catch (err) {
+    // Oracle infrastructure failed — can't tell green from red. Treat as fail.
+    return {
+      name: 'intodns_domain_health',
+      result: 'fail',
+      details: {
+        error: err instanceof Error ? err.message : String(err),
+        guidance: 'Oracle could not execute — check worker network egress + dig availability',
+      },
+      is_sem_warning: false,
+    };
+  }
+  const detail: Record<string, unknown> = { per_zone: report.zones, severity: report.severity };
+  if (report.severity === 'fail') {
+    return { name: 'intodns_domain_health', result: 'fail', details: detail, is_sem_warning: false };
+  }
+  if (report.severity === 'warn') {
+    return { name: 'intodns_domain_health', result: 'warn', details: detail, is_sem_warning: false };
+  }
+  return { name: 'intodns_domain_health', result: 'pass', details: detail, is_sem_warning: false };
 }
 
 /**
@@ -554,6 +625,7 @@ export async function runPairVerification(
   const reverse = deps.reverse ?? defaultPairVerifyDeps.reverse;
   const resolve = deps.resolve ?? defaultPairVerifyDeps.resolve;
   const dnsbl = deps.dnsbl ?? defaultPairVerifyDeps.dnsbl;
+  const intoDNSHealth = deps.intoDNSHealth ?? defaultPairVerifyDeps.intoDNSHealth;
 
   // Load the pair
   const { data: pair, error: pairErr } = await supabase
@@ -595,8 +667,10 @@ export async function runPairVerification(
     (h, i, arr) => !!h && arr.indexOf(h) === i
   );
 
-  // Run all 4 checks in parallel
-  const [mxCheck, ptrCheck, dnsCheck, blCheck] = await Promise.all([
+  // Run all 5 checks in parallel. intoDNS is the new canonical gate;
+  // MXToolbox demoted to advisory — see header comment for the swap rationale.
+  const [intoDnsCheck, mxCheck, ptrCheck, dnsCheck, blCheck] = await Promise.all([
+    runIntoDNSCheck(mxtoolboxHosts, pairRow.ns_domain, pairRow.s1_ip, pairRow.s2_ip, intoDNSHealth),
     runMxtoolboxCheck(mxtoolboxHosts, mxtoolbox),
     runPtrCheck(
       pairRow.s1_ip,
@@ -609,7 +683,7 @@ export async function runPairVerification(
     runBlacklistSweep(pairRow.s1_ip, pairRow.s2_ip, sampleDomains, dnsbl),
   ]);
 
-  const checks: PairVerifyCheck[] = [mxCheck, ptrCheck, dnsCheck, blCheck];
+  const checks: PairVerifyCheck[] = [intoDnsCheck, mxCheck, ptrCheck, dnsCheck, blCheck];
 
   // Status classification
   //   any operational fail            → 'red'
