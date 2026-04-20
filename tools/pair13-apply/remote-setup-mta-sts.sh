@@ -46,10 +46,11 @@ for zone in $ZONES; do
     continue
   fi
 
-  # 1. Add web alias (swallow "already exists" error)
+  # 1. Add web alias (swallow "already exists" error — two variants observed:
+  #    "Error: Web alias ... exists" and "already exists".)
   ALIAS_OUT=$(/usr/local/hestia/bin/v-add-web-domain-alias "${USER}" "${zone}" "mta-sts.${zone}" 2>&1 || true)
-  if echo "$ALIAS_OUT" | grep -qi "already"; then
-    pass "${zone}: alias mta-sts.${zone} already present (HestiaCP v-add-web-domain-alias idempotent skip)"
+  if echo "$ALIAS_OUT" | grep -qiE "already|exists"; then
+    pass "${zone}: alias mta-sts.${zone} already present (idempotent skip)"
   elif echo "$ALIAS_OUT" | grep -qiE "(error|fail)"; then
     fail "${zone}: v-add-web-domain-alias failed: ${ALIAS_OUT}"
     continue
@@ -74,24 +75,25 @@ POLICY
     continue
   fi
 
-  # 3. Issue / extend LE cert. This re-issues the zone's web cert with
-  #    the new mta-sts.<zone> alias added to the SAN set.
-  #    Swallow stderr; parse exit code + fresh LE log.
+  # 3. Issue / extend LE cert. HestiaCP signature:
+  #       v-add-letsencrypt-domain USER DOMAIN [ALIASES] [MAIL]
+  #    ALIASES is a *comma-separated list* that REPLACES the SAN aliases.
+  #    Passing empty = cert covers ONLY the bare domain (strips www and
+  #    mta-sts). We explicitly re-specify www AND the new mta-sts entry.
+  #    MAIL param left blank → this is the WEB cert (not the mail cert).
+  NEW_LOG_CHUNK=""
   PRE_LOG=$(ls -1t "${LE_LOG_DIR}"/LE-*.log 2>/dev/null | head -1)
   PRE_SIZE=0
   if [[ -n "$PRE_LOG" && -f "$PRE_LOG" ]]; then
     PRE_SIZE=$(wc -c < "$PRE_LOG")
   fi
-  LE_OUT=$(/usr/local/hestia/bin/v-add-letsencrypt-domain "${USER}" "${zone}" "yes" 2>&1 || true)
+  LE_OUT=$(/usr/local/hestia/bin/v-add-letsencrypt-domain "${USER}" "${zone}" "www.${zone},mta-sts.${zone}" 2>&1 || true)
   LE_RC=$?
   POST_LOG=$(ls -1t "${LE_LOG_DIR}"/LE-*.log 2>/dev/null | head -1)
-  # Read any log chunk that was appended during this call
   if [[ -n "$POST_LOG" && -f "$POST_LOG" ]]; then
     POST_SIZE=$(wc -c < "$POST_LOG")
     if (( POST_SIZE > PRE_SIZE )); then
       NEW_LOG_CHUNK=$(tail -c $((POST_SIZE - PRE_SIZE)) "$POST_LOG")
-    else
-      NEW_LOG_CHUNK=""
     fi
   fi
 

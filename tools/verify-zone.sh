@@ -16,7 +16,23 @@ ZONE="${1:?zone required}"
 NS_DOMAIN="${2:?ns_domain required}"
 S1_IP="${3:?s1_ip required}"
 S2_IP="${4:?s2_ip required}"
-RESOLVERS=("8.8.8.8" "1.1.1.1" "9.9.9.9")
+# Ten-resolver rule (HL-new 2026-04-20): DNS propagation + Spamhaus checks
+# must poll at least 10 geographically diverse public resolvers. Fewer than
+# that hides regional caches + transient propagation lag + one-off resolver
+# quirks. Requires 7-of-10 agreement for a PASS. Any resolver that's
+# rate-limited or unreachable (per HL #92) is skipped rather than counted.
+RESOLVERS=(
+  "8.8.8.8"           # Google Public DNS
+  "8.8.4.4"           # Google Public DNS secondary
+  "1.1.1.1"           # Cloudflare
+  "1.0.0.1"           # Cloudflare secondary
+  "9.9.9.9"           # Quad9
+  "149.112.112.112"   # Quad9 secondary
+  "208.67.222.222"    # OpenDNS
+  "208.67.220.220"    # OpenDNS secondary
+  "4.2.2.2"           # Level3 (Lumen)
+  "64.6.64.6"         # Verisign
+)
 WARN=0; FAIL=0
 
 # Portable timeout shim (macOS has no coreutils timeout). Uses perl if
@@ -158,10 +174,26 @@ if [[ -n "$DMARC" ]]; then
   else
     warn "dmarc_policy" "p=none or missing"
   fi
+  # HL-new 2026-04-20: DMARC rua=/ruf= are OPTIONAL per RFC 7489 and for cold-
+  # email sending infrastructure we INTENTIONALLY omit them — aggregate reports
+  # add near-zero operational value over Google Postmaster + mail-tester, and
+  # cross-domain reporters trigger the "External Domains not giving permission"
+  # error unless we maintain 10+ authorization records per report destination.
+  # Surface rua presence as informational only, NOT a WARN.
   if echo "$DMARC" | grep -q "rua=mailto:"; then
-    pass "dmarc_rua"
+    pass "dmarc_rua_informational (present — fine but not required under cold-email canonical)"
   else
-    warn "dmarc_rua" "no rua= reporting address"
+    pass "dmarc_rua_informational (absent — matches cold-email canonical HL-new)"
+  fi
+  if echo "$DMARC" | grep -qE "\badkim=r\b"; then
+    pass "dmarc_adkim_relaxed"
+  else
+    warn "dmarc_adkim" "adkim=r not set (relaxed alignment preferred for subdomain bounces)"
+  fi
+  if echo "$DMARC" | grep -qE "\baspf=r\b"; then
+    pass "dmarc_aspf_relaxed"
+  else
+    warn "dmarc_aspf" "aspf=r not set"
   fi
 else
   fail "dmarc_present" "no DMARC record at _dmarc.$ZONE"

@@ -32,7 +32,7 @@ import sys
 from pathlib import Path
 
 
-ZONE_DIR = Path("/etc/bind/zones")
+ZONE_DIR = Path("/home/admin/conf/dns")  # HestiaCP layout — zone files live here, not /etc/bind/zones
 NEW_REFRESH = 10800
 NEW_RETRY = 3600
 NEW_EXPIRE = 1814400
