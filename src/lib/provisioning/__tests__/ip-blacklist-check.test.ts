@@ -57,7 +57,7 @@ function testDenied_127_255_255_254(): void {
 
 function testUnexpectedAddress(): void {
   // Anything outside 127.0.0.0/24 or 127.255.255.0/24 is unknown territory.
-  // Treat as error (not-listed) per Hard Lesson #74 (fail-open on transient/
+  // Treat as error (not-listed) per HL #129 (fail-open on transient/
   // unknown states — downstream VG will catch anything real).
   const r = classifyDnsblReply(null, ['192.168.1.1']);
   expect(

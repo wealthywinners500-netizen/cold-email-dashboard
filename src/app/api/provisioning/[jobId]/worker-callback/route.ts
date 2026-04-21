@@ -236,7 +236,7 @@ export async function POST(
         // it against clerk_org_id which failed when the two diverged.
         const dbOrgId = jobRow.org_id;
 
-        // Hard Lesson #50: pair_number is NOT NULL with UNIQUE(org_id, pair_number).
+        // HL #116: pair_number is NOT NULL with UNIQUE(org_id, pair_number).
         // Must compute next pair_number before insert.
         const { data: maxPairRow } = await supabase
           .from("server_pairs")
@@ -265,7 +265,7 @@ export async function POST(
           .select()
           .single();
 
-        // Hard Lesson #50: server_pair creation failure must be FATAL —
+        // HL #116: server_pair creation failure must be FATAL —
         // do NOT mark job as "completed" with server_pair_id=NULL.
         if (pairError) {
           console.error(`[WorkerCallback] server_pairs insert FAILED: ${pairError.message}`);
@@ -299,7 +299,7 @@ export async function POST(
           const allAccountsCreated = mailMeta.allAccountsCreated as Record<string, string[]> | undefined;
           const server1Domains = (mailMeta.server1Domains as string[]) || [];
 
-          // Get server password for smtp_pass (Hard Lesson #78: smtp_user + smtp_pass are NOT NULL)
+          // Get server password for smtp_pass (HL #132: smtp_user + smtp_pass are NOT NULL)
           const { data: vpsStep } = await supabase
             .from("provisioning_steps")
             .select("metadata")

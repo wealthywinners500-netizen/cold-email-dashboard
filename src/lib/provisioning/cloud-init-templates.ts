@@ -64,7 +64,7 @@ write_files:
     append: false
 
 packages:
-  # Hard Lesson #67 (Test #16, 2026-04-11): dnsutils ships \`dig\`, which
+  # HL #125 (Test #16, 2026-04-11): dnsutils ships \`dig\`, which
   # the worker bridge uses from the verification gate and the
   # await_dns_propagation step. On a fresh Linode minimal image \`dig\`
   # is not installed, causing execAsync to throw ENOENT. The catch

@@ -11,12 +11,15 @@
  *        and every src/ emitter publishes `v=DMARC1` WITHOUT
  *        `rua=`/`ruf=`/`fo=` — HL #109, per RFC 7489 §7.1 (External
  *        Destinations) and §3.2 (Organizational Domain via Public Suffix).
- *   5.3. No ghost HL citations in src/ for HL numbers ≥ 81 — every such
+ *   5.3. No ghost HL citations in src/ for HL numbers ≥ 1 — every HL
  *        number cited in src/ must have a `## N.` heading in the master
- *        `feedback_hard_lessons.md`. Scoped to ≥ 81 because that is the
- *        responsibility boundary of this file (it contains `## 81.`
- *        through `## 112.` post-remediation); citations to #1–#80
- *        reference legacy content outside this file.
+ *        `feedback_hard_lessons.md`. Rescoped from ≥ 81 → ≥ 1 by the
+ *        2026-04-22 HL #1–#80 audit: cited bullets #1–#77 were promoted
+ *        to `## N.` headings in place, 25 collide-class citations were
+ *        redirected to current-target headings (#113–#135 recovered from
+ *        code comments, plus 2 renumber-to-existing), and 2 ghost
+ *        citations (#78, #79) were recovered as #132 and #135 respectively.
+ *        See `reports/2026-04-22-hl-1-80-audit-decisions.md`.
  *   5.4. MEMORY.md does not still claim `Main = Vercel = worker = be1006b`
  *        as the live HEAD (guards against the 2026-04-19 stale-HEAD drift
  *        the audit caught; HEAD has since advanced past 5890331 and onward).
@@ -157,9 +160,10 @@ console.log('--- Test 5.2: canonical DMARC has no rua / ruf / fo ---');
 }
 
 // ---------------------------------------------------------------------------
-// Test 5.3 — every HL ≥ 81 cited in src/ exists as a heading in the HL file.
+// Test 5.3 — every HL ≥ 1 cited in src/ exists as a heading in the HL file.
+// (Rescoped from ≥ 81 by the 2026-04-22 HL #1–#80 audit.)
 // ---------------------------------------------------------------------------
-console.log('--- Test 5.3: no ghost HL ≥ 81 citations in src/ ---');
+console.log('--- Test 5.3: no ghost HL ≥ 1 citations in src/ ---');
 {
   const hlFilePath =
     process.env.HL_FILE ||
@@ -182,7 +186,7 @@ console.log('--- Test 5.3: no ghost HL ≥ 81 citations in src/ ---');
         let m: RegExpExecArray | null;
         while ((m = re.exec(line)) !== null) {
           const n = Number(m[2]);
-          if (n < 81) continue;
+          if (n < 1) continue;
           if (!present.has(n)) {
             ghosts.push(`${f}:${i + 1}: HL #${n} (not a heading in feedback_hard_lessons.md)`);
           }
@@ -191,12 +195,12 @@ console.log('--- Test 5.3: no ghost HL ≥ 81 citations in src/ ---');
     }
     if (ghosts.length > 0) {
       fail(
-        'src/ cites HL numbers ≥ 81 that have no matching `## N.` heading in feedback_hard_lessons.md',
+        'src/ cites HL numbers that have no matching `## N.` heading in feedback_hard_lessons.md',
         ghosts.join('\n  '),
       );
     }
     console.log(
-      `PASS: every HL ≥ 81 cited in src/ has a heading in feedback_hard_lessons.md (file has ${present.size} numbered entries)`,
+      `PASS: every HL ≥ 1 cited in src/ has a heading in feedback_hard_lessons.md (file has ${present.size} numbered entries)`,
     );
   }
 }

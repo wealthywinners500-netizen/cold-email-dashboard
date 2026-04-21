@@ -1,10 +1,10 @@
 // ============================================
 // Shared SSH credential persistence for Step 1 (create_vps).
 //
-// Hard Lesson #58 (2026-04-10): credential persistence MUST live in the
+// HL #133 (2026-04-10): credential persistence MUST live in the
 // canonical per-step driver, not the legacy provision-pair.ts handler.
 //
-// Hard Lesson #59 (2026-04-10, Test #14): the `create_vps` step was also
+// HL #120 (2026-04-10, Test #14): the `create_vps` step was also
 // being killed by Vercel's 60s serverless maxDuration while Linode was
 // still booting, so persistPairCredentials() never ran even though the
 // driver tried to call it. Fix: move `create_vps` entirely to the worker

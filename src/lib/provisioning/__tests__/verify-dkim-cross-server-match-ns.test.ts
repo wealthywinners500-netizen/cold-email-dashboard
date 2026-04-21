@@ -9,7 +9,7 @@
  *      `/home/admin/conf/mail/<ns>/dkim.pem` false-greened the VG.
  *   2. The single caller (runVerificationGateOnce → Item 11) passes
  *      `job.ns_domain` in the new slot.
- *   3. Per-server-split mode (HL #68/#69) routes the NS apex to the
+ *   3. Per-server-split mode (HL #126) routes the NS apex to the
  *      server whose `server1Domains` / `server2Domains` set contains it —
  *      post-HL-#111 that's S1, because setup_mail_domains puts the NS apex
  *      in server1Domains.

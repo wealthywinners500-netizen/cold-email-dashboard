@@ -4,7 +4,7 @@
 // directly via provider API for create_vps), then POSTs results back
 // to the Vercel API worker-callback endpoint.
 //
-// Hard Lesson #59 (Test #14, 2026-04-10): `create_vps` moved here from
+// HL #120 (Test #14, 2026-04-10): `create_vps` moved here from
 // the Vercel execute-step route because Linode boot polling routinely
 // exceeds Vercel Hobby's 60s maxDuration, stranding Step 1 `in_progress`
 // with orphan VPS + lost credentials. The worker VPS has no time cap,
@@ -177,11 +177,11 @@ async function postCallback(
  * credentials via the shared persist-credentials module before
  * calling back to Vercel.
  *
- * Hard Lesson #58: credential persistence MUST succeed before the step
+ * HL #133: credential persistence MUST succeed before the step
  * is reported completed. If encrypt() or the Supabase insert throws,
  * we throw — the pair is not "created" if we cannot SSH back into it.
  *
- * Hard Lesson #59: this used to live on the Vercel side but boot
+ * HL #120: this used to live on the Vercel side but boot
  * polling blew past the 60s serverless cap. The worker VPS has no
  * such cap, so the whole chain runs in one handler call.
  */
@@ -306,7 +306,7 @@ async function handleCreateVpsStep(
 
     // 5b. IP blacklist + pair-diversity pre-check with re-roll.
     //
-    // PATCH 9 (2026-04-12), Hard Lesson #74: Fresh Linode IPs can carry
+    // PATCH 9 (2026-04-12), HL #129: Fresh Linode IPs can carry
     // pre-existing blacklist entries from prior tenants. Check both IPs
     // against ~40 DNSBL zones (zero tolerance — any listing is fatal).
     //
@@ -448,7 +448,7 @@ async function handleCreateVpsStep(
       })
       .eq('id', provJob.id);
 
-    // 7. Persist credentials (Hard Lesson #58). Throws on failure, and
+    // 7. Persist credentials (HL #133). Throws on failure, and
     // the outer catch marks the step failed — the pair is NOT complete
     // if we can't SSH back into it.
     await persistPairCredentials({
@@ -549,7 +549,7 @@ export async function handleProvisionStep(
   const startTime = Date.now();
 
   // Route create_vps to the dedicated provider-API handler — it does
-  // not use the saga or SSH managers (Hard Lesson #59).
+  // not use the saga or SSH managers (HL #120).
   if (stepType === 'create_vps') {
     await handleCreateVpsStep(jobId, stepType, startTime);
     return;
@@ -705,9 +705,9 @@ export async function handleProvisionStep(
     (context as unknown as Record<string, unknown>).server2IP = provJob.server2_ip;
   }
 
-  // Hard Lesson #60 (Test #14, 2026-04-11): saga steps 2 + 6 (install_hestiacp,
+  // HL #134 (Test #14, 2026-04-11): saga steps 2 + 6 (install_hestiacp,
   // setup_mail_domains) read the root password from `ctx.serverPassword` for
-  // SSH auth, but the Hard Lesson #59 refactor intentionally omits
+  // SSH auth, but the HL #120 refactor intentionally omits
   // `rootPassword` from create_vps step metadata ("never logged, never
   // returned via metadata"). Result: SSH falls back to 'changeme123' and
   // every step that needs SSH fails with "authentication methods failed".
@@ -760,7 +760,7 @@ export async function handleProvisionStep(
     return;
   }
 
-  // Hard Lesson #61 (Test #14 attempt 2, 2026-04-11): saga steps 4, 6, 7
+  // HL #134 (Test #14 attempt 2, 2026-04-11): saga steps 4, 6, 7
   // (setup_dns_zones, setup_mail_domains, security_hardening) call
   // `ssh1.exec()` / `ssh2.exec()` directly but never call `ssh1.connect()`.
   // In the pre-#59 world the whole saga ran in one process and SSH was
