@@ -53,6 +53,7 @@ import { checkDomainsBlacklistBatch } from './domain-blacklist';
 import { runVerificationChecks } from './verification-checks';
 import { runAutoFixes } from './auto-fix';
 import { runAwaitAuthDns } from './steps/await-auth-dns';
+import { buildDmarcAddCommand } from './dns-templates';
 
 // Helper to access dynamic metadata on context safely
 function ctxMeta(context: ProvisioningContext): Record<string, unknown> {
@@ -928,11 +929,9 @@ export function createPairProvisioningSaga(
                 `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ TXT '"v=spf1 ip4:${server1IP} -all"'`,
                 { timeout: 10000 }
               );
-              // Add correct DMARC with rua/ruf — reports to dmarc@<ns_domain>
-              // (INTERNAL reporting mailbox on the same NS zone cluster — RFC 7489
-              // same-org reporting, no external DKIM-authorization record needed).
+              // HL #109 canonical DMARC (see dns-templates.ts).
               await ssh1.exec(
-                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@${context.nsDomain}; ruf=mailto:dmarc@${context.nsDomain}; fo=1"'`,
+                `${HESTIA_PATH_PREFIX}${buildDmarcAddCommand(domain)}`,
                 { timeout: 10000 }
               );
               // Add BIMI record
@@ -975,8 +974,9 @@ export function createPairProvisioningSaga(
                 `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ TXT '"v=spf1 ip4:${server2IP} -all"'`,
                 { timeout: 10000 }
               );
+              // HL #109 canonical DMARC (see dns-templates.ts).
               await ssh2.exec(
-                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} _dmarc TXT '"v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@${context.nsDomain}; ruf=mailto:dmarc@${context.nsDomain}; fo=1"'`,
+                `${HESTIA_PATH_PREFIX}${buildDmarcAddCommand(domain)}`,
                 { timeout: 10000 }
               );
               // Add BIMI record
@@ -1222,7 +1222,7 @@ export function createPairProvisioningSaga(
             context.log(`[Step 6] Warning: DMARC reporting mailbox setup failed: ${mailboxErr instanceof Error ? mailboxErr.message : String(mailboxErr)}`);
           }
 
-          // Hard Lesson #95: Sync zone files from S1 → S2 so SOA serials match.
+          // HL #112: Sync zone files from S1 → S2 so SOA serials match.
           // HestiaCP DNS cluster is non-functional (#16a), and all v-add-dns-record
           // commands above only modified S1's zone files. Without this sync, S2's
           // zones are stale, causing MXToolbox "Serial numbers do not match" warning.
@@ -1634,7 +1634,7 @@ export function createPairProvisioningSaga(
             }
           }
 
-          // Hard Lesson #95: Sync zone files after LE cert issuance
+          // HL #112: Sync zone files after LE cert issuance
           // LE ACME challenges modify zone serials on both servers
           {
             const ctx8 = ctxMeta(context);
@@ -1848,7 +1848,7 @@ export function createPairProvisioningSaga(
             }
           );
 
-          // Hard Lesson #95: Sync zone files after auto-fix modifies DNS records
+          // HL #112: Sync zone files after auto-fix modifies DNS records
           if (fixed.length > 0) {
             context.log('[Step 10] Syncing zone files from S1 → S2 after auto-fix...');
             const password = ctx.serverPassword as string;

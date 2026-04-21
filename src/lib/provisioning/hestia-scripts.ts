@@ -20,6 +20,7 @@
 import type { SSHManager, SSHCommandError } from './ssh-manager';
 import { parseDNSRecords, parseDKIMOutput } from './hestia-parsers';
 import type { DNSRecord } from './hestia-parsers';
+import { CANONICAL_DMARC_VALUE } from './dns-templates';
 
 /**
  * HestiaCP installs its CLI tools to /usr/local/hestia/bin/ which
@@ -339,11 +340,8 @@ async function ensureDNSRecords(
     // on any domain without a _dmarc TXT record — including the NS/hostname domain.
     // Hard Lesson #79: Every domain that appears in DNS must have a DMARC record.
     requiredRecords.push(
-      // HL #95 note: previous "no rua" rule was specifically about EXTERNAL reporting
-      // domains (those require a DKIM auth record on the recipient zone). Using
-      // dmarc@${nsDomain} — same NS zone as the sending domains — sidesteps that
-      // requirement because DMARC RFC 7489 treats same-org reporting as trusted.
-      { type: 'TXT', host: '_dmarc', value: `"v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@${nsDomain}; ruf=mailto:dmarc@${nsDomain}; fo=1"` }
+      // HL #109 canonical DMARC (see dns-templates.ts).
+      { type: 'TXT', host: '_dmarc', value: CANONICAL_DMARC_VALUE }
     );
   }
 
@@ -664,7 +662,7 @@ export async function replicateZone(
 }
 
 /**
- * Hard Lesson #95: Sync zone DB files from S1 → S2 via SSH.
+ * HL #112: Sync zone DB files from S1 → S2 via SSH.
  * HestiaCP DNS cluster is non-functional (#16a), so after any DNS record
  * modification on S1 we must copy the zone files to S2 and reload BIND.
  * This ensures SOA serials match and all records are identical on both
