@@ -2,7 +2,7 @@
 // Pure-function step runners for the serverless-class steps
 // (configure_registrar, set_ptr, verification_gate, await_dns_propagation).
 //
-// Hard Lesson #59 / Test #14 (2026-04-10) made the case for moving
+// HL #120 / Test #14 (2026-04-10) made the case for moving
 // every long-running provider poll OFF Vercel's 60s function cap. The
 // per-step decomposition that came out of that lesson left the
 // short-lived API steps (registrar NS / PTR) on the serverless side
@@ -191,7 +191,7 @@ export async function runConfigureRegistrar(
     { hostname: `ns2.${job.ns_domain}`, ip: server2IP },
   ]);
 
-  // Hard Lesson #62 (2026-04-11): delegate every sending domain to the new
+  // HL #121 (2026-04-11): delegate every sending domain to the new
   // pair's nameservers via updateNameserversOnly (NOT setNameservers, which
   // is a stash on Ionos). The pair-provisioning-saga had this loop; the
   // canonical execute-step driver was missing it before commit 506a2a8.
@@ -221,7 +221,7 @@ export async function runConfigureRegistrar(
     );
   }
 
-  // Hard Lesson #72: Ionos 202 Accepted is async — the update can silently
+  // HL #127: Ionos 202 Accepted is async — the update can silently
   // fail. Verify each delegation actually took effect by reading back the
   // nameservers from the Ionos API after a short wait.
   if (dnsRow.registrar_type === "ionos") {
@@ -333,7 +333,7 @@ const PROPAGATION_MAX_MS = 75 * 60 * 1000; // 75 minutes
 const PROPAGATION_POLL_INTERVAL_MS = 60 * 1000; // 60 seconds
 
 /**
- * Hard Lesson #64 (Test #15, 2026-04-11): the previous implementation
+ * HL #122 (Test #15, 2026-04-11): the previous implementation
  * polled recursive resolvers (8.8.8.8/1.1.1.1/9.9.9.9) for the
  * `ns_domain`'s NS records. This created a chicken-and-egg deadlock
  * because:
@@ -531,7 +531,7 @@ export async function runAwaitDnsPropagation(
 //   8.  Let's Encrypt SSL cert on mail1.<ns_domain>:443 (NOT self-signed)
 //   9.  Let's Encrypt SSL cert on mail2.<ns_domain>:443 (NOT self-signed)
 //   10. Port 25 reachable on both servers (banner check)
-//   11. Spamhaus DBL/ZEN clean via DQS (Hard Lesson #47)
+//   11. Spamhaus DBL/ZEN clean via DQS (HL #115)
 //   12. /24 subnet diversity between server1 and server2
 //
 // Implements an outer 30-minute retry loop (60 s between attempts) so the
@@ -544,7 +544,7 @@ const VG_RETRY_MAX_MS = 30 * 60 * 1000; // 30 minutes
 const VG_RETRY_INTERVAL_MS = 60 * 1000; // 60 seconds
 
 /**
- * Hard Lesson #68 / #69 (Test #16 canary 11 forensics, 2026-04-11):
+ * HL #126 (Test #16 canary 11 forensics, 2026-04-11):
  *
  * The VG previously only checked DNS-visible DKIM state (the public TXT
  * record at mail._domainkey.<domain>) which is published from S1 only.
@@ -558,7 +558,7 @@ const VG_RETRY_INTERVAL_MS = 60 * 1000; // 60 seconds
  * them. This is the only source of truth for row 11 of the success bar.
  *
  * Uses the worker VPS's ssh_credentials row for the job. If the creds
- * row is missing (Hard Lesson #58 failure), returns a hard failure.
+ * row is missing (HL #133 failure), returns a hard failure.
  */
 async function verifyDKIMCrossServerMatch(
   jobId: string,
@@ -603,7 +603,7 @@ async function verifyDKIMCrossServerMatch(
     .eq("provisioning_job_id", jobId);
   if (credsErr || !creds || creds.length < 2) {
     issues.push(
-      `DKIM cross-check: ssh_credentials rows missing for job ${jobId} (found ${creds?.length ?? 0}) — Hard Lesson #58 regression?`
+      `DKIM cross-check: ssh_credentials rows missing for job ${jobId} (found ${creds?.length ?? 0}) — HL #133 regression?`
     );
     return { ok: false, issues };
   }
@@ -900,7 +900,7 @@ async function runVerificationGateOnce(jobId: string): Promise<{
     }
   }
 
-  // Item 11: DKIM sha256 cross-server match (Hard Lesson #68/#69).
+  // Item 11: DKIM sha256 cross-server match (HL #126).
   // THIS IS THE CHECK TEST #16 LACKED AND THAT FALSE-GREENED PATCH 4.
   // Every sending domain's /home/admin/conf/mail/<d>/dkim.pem must
   // have identical sha256 on S1 and S2, otherwise S2-signed mail will
@@ -944,7 +944,7 @@ async function runVerificationGateOnce(jobId: string): Promise<{
       s1Octets[2] === s2Octets[2];
     if (sameSubnet24) {
       failures.push(
-        `✗ /24 subnet collision: ${server1IP} and ${server2IP} share the same /24 (Hard Lesson #45 — Snov.io clusters them as the same sender)`
+        `✗ /24 subnet collision: ${server1IP} and ${server2IP} share the same /24 (HL #50 — Snov.io clusters them as the same sender)`
       );
     } else {
       results.push(
@@ -1062,7 +1062,7 @@ export async function runVerificationGate(
     attempt += 1;
     lastResult = await runVerificationGateOnce(jobId);
 
-    // Hard Lesson #72: per-attempt logging so journalctl shows progress
+    // Per-attempt logging so journalctl shows progress
     // (27 attempts with zero output looks like a hang)
     const failCount = lastResult.failures?.length || 0;
     const passCount = lastResult.results?.length || 0;

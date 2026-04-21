@@ -2,7 +2,7 @@
  * Round-trip test for createSSHCredentials encryption pipeline.
  *
  * Exercises the exact code path the per-step wizard driver uses for
- * Hard Lesson #58 (password-persistence bug):
+ * HL #133 (password-persistence bug):
  *
  *   crypto.randomBytes → encrypt() → createSSHCredentials() → query → decrypt()
  *

@@ -166,7 +166,7 @@ async function mxToolboxLookup(
  *   2. DMARC — 1 lookup per domain
  *   3. MX — 1 lookup per domain
  *
- * Hard Lesson #57: circuit breaker on first permanent error (401/403-persistent).
+ * HL #119: circuit breaker on first permanent error (401/403-persistent).
  * If the API key is invalid, bail immediately — don't hammer 44 times.
  */
 async function checkViaAPI(
@@ -390,7 +390,7 @@ async function checkViaInternalDNS(
 
     // ---- DKIM: validate public key content ----
     try {
-      // Hard Lesson #75: DKIM selector is `mail`, NOT `default`
+      // HL #51: DKIM selector is `mail`, NOT `default`
       const dkimRecords = await resolver.resolveTxt(`mail._domainkey.${domain}`);
       const dkim = dkimRecords
         .map((r) => r.join(""))

@@ -599,14 +599,14 @@ async function main() {
   // pollAdvanceableJobs fills that gap: find jobs in (pending, in_progress),
   // verify no step is currently in_progress, find the lowest-step_order pending
   // step, and atomically claim it. The conditional UPDATE on status='pending'
-  // (Hard Lesson #42 atomic claim) prevents two poller ticks or two worker
+  // (HL #114 atomic claim) prevents two poller ticks or two worker
   // instances from claiming the same step.
   //
   // This driver does NOT call boss.send directly — it just performs the
   // atomic claim. pollDispatchedSteps then enqueues the provision-step job
   // on its next tick (10s later, worst case). One source of truth, no races.
   //
-  // Hard Lesson #11 redux: this is NOT a re-enable of pollProvisioningJobs.
+  // This is NOT a re-enable of pollProvisioningJobs.
   // The old monolith ran the entire saga in one process. This driver only
   // claims the next step and hands off to the existing dispatched-steps
   // bridge — same canonical path as the wizard.
@@ -655,7 +655,7 @@ async function main() {
         const next = pendingSteps[0];
 
         // Atomic claim: only succeed if the row is still 'pending'
-        // (Hard Lesson #42). If two pollers race, exactly one wins.
+        // (HL #114). If two pollers race, exactly one wins.
         const claimTime = new Date().toISOString();
         const { data: claimed, error: claimErr } = await supabase
           .from("provisioning_steps")
@@ -678,7 +678,7 @@ async function main() {
           continue;
         }
 
-        // Hard Lesson #77: Queue the pg-boss job directly instead of
+        // HL #131: Queue the pg-boss job directly instead of
         // relying on pollDispatchedSteps to read metadata.dispatched_to_worker.
         // A Supabase Realtime trigger or race condition was reproducibly
         // clobbering metadata to {}, leaving the step stuck in in_progress

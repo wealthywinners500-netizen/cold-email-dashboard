@@ -33,7 +33,7 @@ export const HESTIA_PATH_PREFIX = 'export PATH=/usr/local/hestia/bin:$PATH && ';
  * Full PATH for v-commands that internally invoke coreutils (hostname, date, grep, sed).
  * Used for Let's Encrypt certificate functions which need access to hostname and date.
  *
- * Hard Lesson #51: v-add-letsencrypt-host requires full PATH because it internally calls
+ * HL #117: v-add-letsencrypt-host requires full PATH because it internally calls
  * hostname, date, grep, sed — not just v-commands. Non-login SSH has empty $PATH.
  */
 export const HESTIA_FULL_PATH = 'export PATH=/usr/local/hestia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
@@ -258,7 +258,7 @@ async function cleanupDNSZoneDefaults(
       await ssh.exec(`${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${record.id}`, { timeout: 10000 });
     }
 
-    // Hard Lesson #73: Remove HestiaCP auto-generated root SPF
+    // HL #128: Remove HestiaCP auto-generated root SPF
     // v-add-dns-domain creates a default SPF with only s1's IP.
     // ensureDNSRecords will add the correct both-IP SPF for NS domains,
     // and createMailDomain will add it for sending domains in Step 6.
@@ -329,7 +329,7 @@ async function ensureDNSRecords(
       { type: 'A', host: 'ns1', value: server1IP },
       { type: 'A', host: 'ns2', value: server2IP }
     );
-    // Hard Lesson #73: NS domain root SPF must include both server IPs.
+    // HL #128: NS domain root SPF must include both server IPs.
     // HestiaCP auto-generates a root SPF with only s1's IP during
     // v-add-dns-domain. cleanupDNSZoneDefaults deletes it, and we add
     // the correct one here with both IPs for HELO SPF alignment.
@@ -338,7 +338,7 @@ async function ensureDNSRecords(
     );
     // PATCH 11: NS domain needs DMARC too. MXToolbox flags "No DMARC Record found"
     // on any domain without a _dmarc TXT record — including the NS/hostname domain.
-    // Hard Lesson #79: Every domain that appears in DNS must have a DMARC record.
+    // HL #135: Every domain that appears in DNS must have a DMARC record.
     requiredRecords.push(
       // HL #109 canonical DMARC (see dns-templates.ts).
       { type: 'TXT', host: '_dmarc', value: CANONICAL_DMARC_VALUE }
@@ -475,7 +475,7 @@ export async function createMailDomain(
   // and adds the correct versions with explicit server IPs. Creating throwaway
   // records here just creates a brief window of wrong auth. (Hard Lesson #84)
   //
-  // Previously this block contained Hard Lesson #67/#72 dedup + canonical SPF/DMARC
+  // Previously this block contained dedup + canonical SPF/DMARC
   // creation. That logic is now consolidated into the saga's Step 6 dedup block,
   // which has full context (both server IPs, admin email) and runs AFTER all
   // domains are created on both servers.
@@ -877,8 +877,8 @@ export async function checkLERateLimit(
 /**
  * Issue Let's Encrypt SSL certificate for a domain or hostname.
  *
- * Hard Lesson #51: v-add-letsencrypt-host requires full PATH + explicit admin arg.
- * Hard Lesson #52: v-add-letsencrypt-domain requires v-add-web-domain to exist first.
+ * HL #117: v-add-letsencrypt-host requires full PATH + explicit admin arg.
+ * HL #118: v-add-letsencrypt-domain requires v-add-web-domain to exist first.
  */
 export async function issueSSLCert(
   ssh: SSHManager,
@@ -899,11 +899,11 @@ export async function issueSSLCert(
 
   if (isHostname) {
     // Issue hostname cert: v-add-letsencrypt-host
-    // Hard Lesson #51: Use full PATH + explicit 'admin' arg + bash -lc for login shell
+    // HL #117: Use full PATH + explicit 'admin' arg + bash -lc for login shell
     await ssh.exec(`bash -lc "${HESTIA_FULL_PATH} && v-add-letsencrypt-host admin"`, { timeout: 120000 });
   } else {
     // Issue domain cert: v-add-letsencrypt-domain
-    // Hard Lesson #52: Ensure v-add-web-domain exists first (required by HestiaCP)
+    // HL #118: Ensure v-add-web-domain exists first (required by HestiaCP)
     // Treat exit 4 (already exists) as non-fatal
     try {
       await ssh.exec(`bash -lc "${HESTIA_FULL_PATH} && v-add-web-domain admin ${domain}"`, { timeout: 120000 });
@@ -989,7 +989,7 @@ export async function issueSSLCert(
 }
 
 /**
- * Hard Lesson #65 (Test #15, 2026-04-11): cluster cert race.
+ * HL #123 (Test #15, 2026-04-11): cluster cert race.
  *
  * When both servers in a HestiaCP DNS cluster try to issue a Let's
  * Encrypt cert for the same sending domain via HTTP-01, they each
@@ -1140,7 +1140,7 @@ export async function replicateSSLCertToSecondary(
 // g.2) Replicate DKIM private/public keys S1 -> S2
 // ============================================
 /**
- * Hard Lesson #66 (Test #15, 2026-04-11): HestiaCP's v-add-mail-domain-dkim
+ * HL #124 (Test #15, 2026-04-11): HestiaCP's v-add-mail-domain-dkim
  * generates a FRESH RSA keypair on each server it's run on. When createMailDomain
  * runs on both s1 and s2, each server ends up with a DIFFERENT private key,
  * but the DNS TXT record mail._domainkey.<domain> only contains s1's public key.
@@ -1148,7 +1148,7 @@ export async function replicateSSLCertToSecondary(
  * receiving MTA because the receiver compares s2's signature against s1's
  * published public key.
  *
- * Hard Lesson #68 (Test #16 canary, 2026-04-11): The ORIGINAL PATCH 4 shipped
+ * HL #126 (Test #16 canary, 2026-04-11): The ORIGINAL PATCH 4 shipped
  * with the WRONG PATHS. It looked for /etc/exim4/domains/<d>/dkim.private.pem
  * and /etc/exim4/domains/<d>/dkim.public.pem — but HestiaCP doesn't use those
  * filenames. The actual paths HestiaCP writes are:
@@ -1215,7 +1215,7 @@ export async function replicateDKIMKeysToSecondary(
     if (b64Content === 'MISSING' || !b64Content) {
       if (srcPath === eximDkimPath) {
         throw new Error(
-          `[replicateDKIMKeysToSecondary] CRITICAL: ${srcPath} not present on S1 for ${domain} — DKIM will mismatch. Fail fast (Hard Lesson #68).`
+          `[replicateDKIMKeysToSecondary] CRITICAL: ${srcPath} not present on S1 for ${domain} — DKIM will mismatch. Fail fast (HL #126).`
         );
       }
       // eslint-disable-next-line no-console
@@ -1233,7 +1233,7 @@ export async function replicateDKIMKeysToSecondary(
       );
       replicated += 1;
     } catch (err) {
-      // PATCH 6 (Hard Lesson #68 follow-up): write failures on S2 are
+      // PATCH 6 (HL #126 follow-up): write failures on S2 are
       // fatal for the critical file — do NOT silently continue.
       if (srcPath === eximDkimPath) {
         throw new Error(

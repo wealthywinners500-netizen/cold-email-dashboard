@@ -10,7 +10,7 @@
 // that MXToolbox checks. ALL listings are fatal. No IP with ANY blacklist
 // listing is acceptable. Hard Lesson #98.
 //
-// Hard Lesson #74: Treat transient DNSBL errors (timeout, SERVFAIL) as
+// HL #129: Treat transient DNSBL errors (timeout, SERVFAIL) as
 // "not listed" — a false-negative here just means the VG catches it later.
 // A false-positive would block provisioning unnecessarily.
 // ============================================
@@ -149,7 +149,7 @@ export type ZoneQueryResult =
  *                                       public recursors and rate-limits)
  *   - Any other A-record              → `error` with code `UNEXPECTED_<addr>`
  *                                       (unknown — conservatively treated as
- *                                       not-listed per Hard Lesson #74)
+ *                                       not-listed per HL #129)
  *
  * Keeping this as a pure helper makes it trivially unit-testable without
  * touching the network. Mirrors the semantics of
@@ -242,7 +242,7 @@ async function pickResolverWithLiveZone(
  *
  * Runs on the worker VPS (200.234.226.226) which is NOT a cloud provider
  * IP, so Spamhaus ZEN queries work without the 127.255.255.254 cloud-IP
- * denial (Hard Lesson #47).
+ * denial (HL #115).
  */
 export async function checkIPBlacklist(ip: string): Promise<IPBlacklistResult> {
   const reversed = ip.split('.').reverse().join('.');

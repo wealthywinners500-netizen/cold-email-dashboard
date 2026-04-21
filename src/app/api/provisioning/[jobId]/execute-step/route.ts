@@ -663,7 +663,7 @@ export async function POST(
           throw new Error(`Server IPs missing from create_vps metadata: s1=${server1IP}, s2=${server2IP}`);
         }
 
-        // Hard Lesson #50: pair_number is NOT NULL with UNIQUE(org_id, pair_number).
+        // HL #116: pair_number is NOT NULL with UNIQUE(org_id, pair_number).
         // Must compute next pair_number before insert.
         const { data: maxPairRow } = await supabase
           .from("server_pairs")
@@ -692,14 +692,14 @@ export async function POST(
           .select()
           .single();
 
-        // Hard Lesson #50: server_pair creation failure must be FATAL —
+        // HL #116: server_pair creation failure must be FATAL —
         // do NOT mark job as "completed" with server_pair_id=NULL.
         if (pairError) {
           throw new Error(`server_pairs insert failed (pair_number=${nextPairNumber}): ${pairError.message}`);
         }
 
         // Create email accounts from setup_mail_domains step metadata
-        // (Hard Lesson #78: smtp_user + smtp_pass are NOT NULL)
+        // (HL #132: smtp_user + smtp_pass are NOT NULL)
         let accountsCreated = 0;
         const { data: mailStep } = await supabase
           .from("provisioning_steps")

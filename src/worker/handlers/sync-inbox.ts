@@ -81,7 +81,7 @@ export async function handleClassifyReply(data: { messageId: number }): Promise<
     return;
   }
 
-  // B10: Bounce detection BEFORE classification — Hard Lesson #11
+  // B10: Bounce detection BEFORE classification — HL #113
   if (isBounceMessage(message.from_email, message.body_text)) {
     console.log(`[ClassifyReply] Bounce detected for message ${data.messageId}, routing to bounce handler`);
     const { handleProcessBounce } = await import('./process-bounce');

@@ -157,7 +157,7 @@ const IP_BLACKLISTS = [
   { zone: 'spam.dnsbl.anonmails.de', name: 'Anonmails' },
 ];
 
-// Barracuda + UCEPROTECT are WARN-only — high false-positive rates on Linode (Hard Lesson #76)
+// Barracuda + UCEPROTECT are WARN-only — high false-positive rates on Linode (HL #130)
 const WARN_ONLY_BLACKLISTS = new Set(['Barracuda', 'UCEPROTECT L1']);
 
 const DOMAIN_BLACKLISTS = [
