@@ -72,112 +72,136 @@ async function waitForPublicDNSPropagation(
 }
 
 /**
+ * PATCH 10d (HL #101 / post-PR #4): pick the Hestia-master half for a zone.
+ *
+ * Each zone has exactly one Hestia DNS master + BIND primary; the peer holds
+ * the zone as a BIND slave (installSlaveZones writes it to named.conf.cluster)
+ * but Hestia CLI on the peer doesn't know about it — `v-*-dns-*` returns
+ * exit 3 "dns domain doesn't exist." AXFR/NOTIFY propagates writes owner→peer
+ * automatically (see PR #4, PR #8 named.conf.options, HL #105).
+ */
+function pickOwningServer(
+  domain: string,
+  ssh1: SSHManager,
+  ssh2: SSHManager,
+  server1Domains: string[],
+  server2Domains: string[],
+): { ssh: SSHManager; serverName: 'S1' | 'S2' } {
+  if (server2Domains.includes(domain)) return { ssh: ssh2, serverName: 'S2' };
+  // Default to S1 — server1Domains is NS + alphabetical first half; any domain
+  // not explicitly listed in server2Domains belongs on S1 per computeZonePartition.
+  // `server1Domains` param is available for invariant-logging by callers.
+  void server1Domains;
+  return { ssh: ssh1, serverName: 'S1' };
+}
+
+/**
  * Robust DNS record replacement pattern:
  * 1. List all DNS records
  * 2. Delete ALL records matching predicate
  * 3. Verify deletion with re-list
  * 4. Add correct records
  * 5. Verify addition with re-list
+ *
+ * PATCH 10d (HL #101): runs only on the zone's Hestia-master half. AXFR
+ * propagates to the peer slave. Caller computes owning via pickOwningServer.
  */
 async function robustDNSRecordReplace(
-  sshConnections: SSHManager[],
+  ssh: SSHManager,
+  serverName: string,
   domain: string,
   matchFn: (line: string) => boolean,
   addCommands: string[],
   log: (msg: string) => void,
   label: string
 ): Promise<void> {
-  // Delete on both servers
-  for (let i = 0; i < sshConnections.length; i++) {
-    const ssh = sshConnections[i];
-    const serverName = i === 0 ? 'S1' : 'S2';
-
-    // List records
-    const listCmd = `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`;
-    const listResult = await ssh.exec(listCmd, { timeout: 10000 });
-    if (listResult.code !== 0) {
-      throw new Error(`${serverName} Failed to list DNS records for ${domain}: ${listResult.stderr}`);
-    }
-
-    const lines = listResult.stdout.trim().split('\n').filter(l => l.length > 0);
-    const recordsToDelete = lines.filter(matchFn);
-
-    if (recordsToDelete.length === 0) {
-      log(`[Auto-Fix] ${label}/${serverName}: No records to delete for ${domain}`);
-    } else {
-      log(`[Auto-Fix] ${label}/${serverName}: Found ${recordsToDelete.length} records to delete for ${domain}`);
-
-      // Extract IDs and delete each
-      for (const line of recordsToDelete) {
-        const parts = line.split(/\s+/);
-        const recordId = parts[0];
-
-        if (!recordId) {
-          throw new Error(`${serverName} Could not parse record ID from: ${line}`);
-        }
-
-        const deleteCmd = `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${recordId}`;
-        const deleteResult = await ssh.exec(deleteCmd, { timeout: 10000 });
-
-        // Hard Lesson #89: NEVER use .catch on DNS deletes — ALWAYS log errors explicitly
-        if (deleteResult.code !== 0) {
-          const errMsg = `${serverName} Failed to delete DNS record ${recordId} from ${domain}: ${deleteResult.stderr}`;
-          log(`[Auto-Fix] ✗ ${label}/${serverName}: ${errMsg}`);
-          throw new Error(errMsg);
-        }
-      }
-    }
-
-    // Verify deletion
-    const verifyListResult = await ssh.exec(listCmd, { timeout: 10000 });
-    if (verifyListResult.code !== 0) {
-      throw new Error(`${serverName} Failed to verify DNS records for ${domain}: ${verifyListResult.stderr}`);
-    }
-
-    const verifyLines = verifyListResult.stdout.trim().split('\n').filter(l => l.length > 0);
-    const stillThere = verifyLines.filter(matchFn);
-    if (stillThere.length > 0) {
-      throw new Error(
-        `${serverName} Verification failed for ${domain}: ${stillThere.length} records still present after delete`
-      );
-    }
-
-    // Add new records
-    for (const addCmd of addCommands) {
-      const fullCmd = `${HESTIA_PATH_PREFIX}${addCmd}`;
-      const addResult = await ssh.exec(fullCmd, { timeout: 10000 });
-      // Hard Lesson #97: HestiaCP exit code 4 = "object already exists" — non-fatal for DNS adds
-      // Exit code 3 = "object already exists" for some record types (also non-fatal)
-      if (addResult.code !== 0 && addResult.code !== 3 && addResult.code !== 4) {
-        throw new Error(
-          `${serverName} Failed to add DNS record for ${domain}: ${addResult.stderr || addResult.stdout}`
-        );
-      }
-      if (addResult.code === 3 || addResult.code === 4) {
-        log(`[Auto-Fix] ${label}/${serverName}: Record already exists for ${domain} (exit code ${addResult.code}) — continuing`);
-      }
-    }
-
-    // Verify addition
-    const finalListResult = await ssh.exec(listCmd, { timeout: 10000 });
-    if (finalListResult.code !== 0) {
-      throw new Error(`${serverName} Failed to verify DNS records after add for ${domain}: ${finalListResult.stderr}`);
-    }
-
-    const finalLines = finalListResult.stdout.trim().split('\n').filter(l => l.length > 0);
-    const nowPresent = finalLines.filter(l => addCommands.some(cmd => l.includes(domain)));
-    if (nowPresent.length === 0) {
-      log(
-        `[Auto-Fix] ${label}/${serverName}: Warning — records added but verification returned no results. Continuing.`
-      );
-    }
-
-    log(`[Auto-Fix] ${label}/${serverName}: Successfully replaced DNS records for ${domain}`);
+  // List records
+  const listCmd = `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`;
+  const listResult = await ssh.exec(listCmd, { timeout: 10000 });
+  if (listResult.code !== 0) {
+    throw new Error(`${serverName} Failed to list DNS records for ${domain}: ${listResult.stderr}`);
   }
+
+  const lines = listResult.stdout.trim().split('\n').filter(l => l.length > 0);
+  const recordsToDelete = lines.filter(matchFn);
+
+  if (recordsToDelete.length === 0) {
+    log(`[Auto-Fix] ${label}/${serverName}: No records to delete for ${domain}`);
+  } else {
+    log(`[Auto-Fix] ${label}/${serverName}: Found ${recordsToDelete.length} records to delete for ${domain}`);
+
+    // Extract IDs and delete each
+    for (const line of recordsToDelete) {
+      const parts = line.split(/\s+/);
+      const recordId = parts[0];
+
+      if (!recordId) {
+        throw new Error(`${serverName} Could not parse record ID from: ${line}`);
+      }
+
+      const deleteCmd = `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${recordId}`;
+      const deleteResult = await ssh.exec(deleteCmd, { timeout: 10000 });
+
+      // Hard Lesson #89: NEVER use .catch on DNS deletes — ALWAYS log errors explicitly
+      if (deleteResult.code !== 0) {
+        const errMsg = `${serverName} Failed to delete DNS record ${recordId} from ${domain}: ${deleteResult.stderr}`;
+        log(`[Auto-Fix] ✗ ${label}/${serverName}: ${errMsg}`);
+        throw new Error(errMsg);
+      }
+    }
+  }
+
+  // Verify deletion
+  const verifyListResult = await ssh.exec(listCmd, { timeout: 10000 });
+  if (verifyListResult.code !== 0) {
+    throw new Error(`${serverName} Failed to verify DNS records for ${domain}: ${verifyListResult.stderr}`);
+  }
+
+  const verifyLines = verifyListResult.stdout.trim().split('\n').filter(l => l.length > 0);
+  const stillThere = verifyLines.filter(matchFn);
+  if (stillThere.length > 0) {
+    throw new Error(
+      `${serverName} Verification failed for ${domain}: ${stillThere.length} records still present after delete`
+    );
+  }
+
+  // Add new records
+  for (const addCmd of addCommands) {
+    const fullCmd = `${HESTIA_PATH_PREFIX}${addCmd}`;
+    const addResult = await ssh.exec(fullCmd, { timeout: 10000 });
+    // Hard Lesson #97: HestiaCP exit code 4 = "object already exists" — non-fatal for DNS adds
+    // Exit code 3 = "object already exists" for some record types (also non-fatal)
+    if (addResult.code !== 0 && addResult.code !== 3 && addResult.code !== 4) {
+      throw new Error(
+        `${serverName} Failed to add DNS record for ${domain}: ${addResult.stderr || addResult.stdout}`
+      );
+    }
+    if (addResult.code === 3 || addResult.code === 4) {
+      log(`[Auto-Fix] ${label}/${serverName}: Record already exists for ${domain} (exit code ${addResult.code}) — continuing`);
+    }
+  }
+
+  // Verify addition
+  const finalListResult = await ssh.exec(listCmd, { timeout: 10000 });
+  if (finalListResult.code !== 0) {
+    throw new Error(`${serverName} Failed to verify DNS records after add for ${domain}: ${finalListResult.stderr}`);
+  }
+
+  const finalLines = finalListResult.stdout.trim().split('\n').filter(l => l.length > 0);
+  const nowPresent = finalLines.filter(l => addCommands.some(cmd => l.includes(domain)));
+  if (nowPresent.length === 0) {
+    log(
+      `[Auto-Fix] ${label}/${serverName}: Warning — records added but verification returned no results. Continuing.`
+    );
+  }
+
+  log(`[Auto-Fix] ${label}/${serverName}: Successfully replaced DNS records for ${domain} (AXFR propagates to peer slave)`);
 }
 
 /**
- * Fix A record: delete all @ A records, add correct one
+ * Fix A record: delete all @ A records, add correct one.
+ *
+ * PATCH 10d: runs on owning half only (AXFR propagates to peer).
  */
 async function fixARecord(
   ssh1: SSHManager,
@@ -197,11 +221,14 @@ async function fixARecord(
     return parts[2] === 'A' && parts[1] === '@';
   };
 
-  await robustDNSRecordReplace([ssh1, ssh2], domain, matchFn, [addCmd], params.log, 'fix_a_record');
+  const { ssh, serverName } = pickOwningServer(domain, ssh1, ssh2, params.server1Domains, params.server2Domains);
+  await robustDNSRecordReplace(ssh, serverName, domain, matchFn, [addCmd], params.log, 'fix_a_record');
 }
 
 /**
- * Add webmail A and mail A records
+ * Add webmail A and mail A records.
+ *
+ * PATCH 10d: runs on owning half only.
  */
 async function addWebmailA(
   ssh1: SSHManager,
@@ -225,7 +252,8 @@ async function addWebmailA(
     return type === 'A' && (host === 'mail' || host === 'webmail');
   };
 
-  await robustDNSRecordReplace([ssh1, ssh2], domain, matchFn, addCommands, params.log, 'add_webmail_a');
+  const { ssh, serverName } = pickOwningServer(domain, ssh1, ssh2, params.server1Domains, params.server2Domains);
+  await robustDNSRecordReplace(ssh, serverName, domain, matchFn, addCommands, params.log, 'add_webmail_a');
 }
 
 /**
@@ -237,6 +265,8 @@ async function addWebmailA(
  * ... '' yes`). Supersedes HL #100 (Option A centralized gateway), which
  * collapsed per-domain reputation onto a shared `mail{1|2}.{nsDomain}` —
  * bad for cold-email deliverability.
+ *
+ * PATCH 10d: runs on owning half only.
  */
 async function fixMX(
   ssh1: SSHManager,
@@ -252,17 +282,20 @@ async function fixMX(
     return parts[2] === 'MX' && parts[1] === '@';
   };
 
-  await robustDNSRecordReplace([ssh1, ssh2], domain, matchFn, [addCmd], params.log, 'fix_mx');
+  const { ssh, serverName } = pickOwningServer(domain, ssh1, ssh2, params.server1Domains, params.server2Domains);
+  await robustDNSRecordReplace(ssh, serverName, domain, matchFn, [addCmd], params.log, 'fix_mx');
 }
 
 /**
- * Fix SOA record
+ * Fix SOA record.
+ *
+ * PATCH 10d: runs on owning half only.
  */
 async function fixSOA(
   ssh1: SSHManager,
   ssh2: SSHManager,
   domain: string,
-  params: { log: (msg: string) => void }
+  params: { server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
 ): Promise<void> {
   // HL #107 (Session 04d): MXToolbox flags SOA Expire < 1209600 (2 weeks) as
   // "out of recommended range" and Refresh > 7200 (2hr) / Minimum < 3600 (1hr).
@@ -272,84 +305,88 @@ async function fixSOA(
   // fails (Refresh high, Retry high, Minimum too low).
   const cmd = `${HESTIA_PATH_PREFIX}v-change-dns-domain-soa admin ${domain} '' '' 3600 600 2419200 3600`;
 
-  for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
-    const result = await ssh.exec(cmd, { timeout: 10000 });
-    if (result.code !== 0) {
-      throw new Error(`${serverName} Failed to set SOA for ${domain}: ${result.stderr}`);
-    }
-    params.log(`[Auto-Fix] fix_soa/${serverName}: Set SOA for ${domain}`);
+  const { ssh, serverName } = pickOwningServer(domain, ssh1, ssh2, params.server1Domains, params.server2Domains);
+  const result = await ssh.exec(cmd, { timeout: 10000 });
+  if (result.code !== 0) {
+    throw new Error(`${serverName} Failed to set SOA for ${domain}: ${result.stderr}`);
   }
+  params.log(`[Auto-Fix] fix_soa/${serverName}: Set SOA for ${domain} (AXFR propagates to peer slave)`);
 }
 
 /**
- * Fix zone transfer: disable public zone transfers
+ * Fix zone transfer: disable public zone transfers.
+ *
+ * PATCH 10d: runs on owning half only.
  */
 async function fixZoneTransfer(
   ssh1: SSHManager,
   ssh2: SSHManager,
   domain: string,
-  params: { log: (msg: string) => void }
+  params: { server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
 ): Promise<void> {
   const cmd = `${HESTIA_PATH_PREFIX}v-change-dns-domain-tp admin ${domain} ''`;
 
-  for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
-    const result = await ssh.exec(cmd, { timeout: 10000 });
-    if (result.code !== 0) {
-      throw new Error(`${serverName} Failed to disable zone transfer for ${domain}: ${result.stderr}`);
-    }
-    params.log(`[Auto-Fix] fix_zone_transfer/${serverName}: Disabled zone transfer for ${domain}`);
+  const { ssh, serverName } = pickOwningServer(domain, ssh1, ssh2, params.server1Domains, params.server2Domains);
+  const result = await ssh.exec(cmd, { timeout: 10000 });
+  if (result.code !== 0) {
+    throw new Error(`${serverName} Failed to disable zone transfer for ${domain}: ${result.stderr}`);
   }
+  params.log(`[Auto-Fix] fix_zone_transfer/${serverName}: Disabled zone transfer for ${domain}`);
 }
 
 /**
- * Add CAA record
+ * Add CAA record.
+ *
+ * PATCH 10d: runs on owning half only.
  */
 async function addCAA(
   ssh1: SSHManager,
   ssh2: SSHManager,
   domain: string,
-  params: { log: (msg: string) => void }
+  params: { server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
 ): Promise<void> {
-  for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
-    // Check if CAA already exists with letsencrypt.org
-    const listResult = await ssh.exec(
-      `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
-      { timeout: 10000 }
+  const { ssh, serverName } = pickOwningServer(domain, ssh1, ssh2, params.server1Domains, params.server2Domains);
+
+  // Check if CAA already exists with letsencrypt.org
+  const listResult = await ssh.exec(
+    `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+    { timeout: 10000 }
+  );
+  if (listResult.code === 0) {
+    const existingCAA = listResult.stdout.split('\n').find(
+      l => l.includes('CAA') && l.includes('letsencrypt')
     );
-    if (listResult.code === 0) {
-      const existingCAA = listResult.stdout.split('\n').find(
-        l => l.includes('CAA') && l.includes('letsencrypt')
-      );
-      if (existingCAA) {
-        params.log(`[Auto-Fix] add_caa/${serverName}: CAA record already exists for ${domain} — skipping`);
-        continue;
-      }
+    if (existingCAA) {
+      params.log(`[Auto-Fix] add_caa/${serverName}: CAA record already exists for ${domain} — skipping`);
+      return;
     }
+  }
 
-    // Try with quotes first, then without if it fails
-    let cmd = `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ CAA '0 issue "letsencrypt.org"'`;
-    let result = await ssh.exec(cmd, { timeout: 10000 });
+  // Try with quotes first, then without if it fails
+  let cmd = `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ CAA '0 issue "letsencrypt.org"'`;
+  let result = await ssh.exec(cmd, { timeout: 10000 });
 
-    // If failed (not "already exists"), try without quotes
-    if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
-      cmd = `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ CAA 0 issue letsencrypt.org`;
-      result = await ssh.exec(cmd, { timeout: 10000 });
-    }
+  // If failed (not "already exists"), try without quotes
+  if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
+    cmd = `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ CAA 0 issue letsencrypt.org`;
+    result = await ssh.exec(cmd, { timeout: 10000 });
+  }
 
-    // Hard Lesson #97: exit 3/4 = "already exists" — non-fatal
-    if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
-      throw new Error(`${serverName} Failed to add CAA record for ${domain}: ${result.stderr}`);
-    }
-    if (result.code === 3 || result.code === 4) {
-      params.log(`[Auto-Fix] add_caa/${serverName}: CAA already exists for ${domain} (exit ${result.code}) — continuing`);
-    } else {
-      params.log(`[Auto-Fix] add_caa/${serverName}: Added CAA record for ${domain}`);
-    }
+  // Hard Lesson #97: exit 3/4 = "already exists" — non-fatal
+  if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
+    throw new Error(`${serverName} Failed to add CAA record for ${domain}: ${result.stderr}`);
+  }
+  if (result.code === 3 || result.code === 4) {
+    params.log(`[Auto-Fix] add_caa/${serverName}: CAA already exists for ${domain} (exit ${result.code}) — continuing`);
+  } else {
+    params.log(`[Auto-Fix] add_caa/${serverName}: Added CAA record for ${domain} (AXFR propagates to peer slave)`);
   }
 }
 
 /**
- * Add SPF record
+ * Add SPF record.
+ *
+ * PATCH 10d: runs on owning half only.
  */
 async function addSPF(
   ssh1: SSHManager,
@@ -363,37 +400,39 @@ async function addSPF(
   const spfValue = `"v=spf1 ip4:${correctIP} -all"`;
   const addCmd = `v-add-dns-record admin ${domain} @ TXT ${spfValue}`;
 
-  for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
-    // Check if SPF already exists with correct content
-    const listResult = await ssh.exec(
-      `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
-      { timeout: 10000 }
-    );
-    if (listResult.code === 0) {
-      const existingSPF = listResult.stdout.split('\n').find(
-        l => l.includes('TXT') && l.includes('v=spf1') && l.includes(correctIP)
-      );
-      if (existingSPF) {
-        params.log(`[Auto-Fix] add_spf/${serverName}: SPF record already exists for ${domain} — skipping`);
-        continue;
-      }
-    }
+  const { ssh, serverName } = pickOwningServer(domain, ssh1, ssh2, params.server1Domains, params.server2Domains);
 
-    const result = await ssh.exec(`${HESTIA_PATH_PREFIX}${addCmd}`, { timeout: 10000 });
-    // Hard Lesson #97: exit 3/4 = "already exists" — non-fatal
-    if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
-      throw new Error(`${serverName} Failed to add SPF record for ${domain}: ${result.stderr}`);
+  // Check if SPF already exists with correct content
+  const listResult = await ssh.exec(
+    `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+    { timeout: 10000 }
+  );
+  if (listResult.code === 0) {
+    const existingSPF = listResult.stdout.split('\n').find(
+      l => l.includes('TXT') && l.includes('v=spf1') && l.includes(correctIP)
+    );
+    if (existingSPF) {
+      params.log(`[Auto-Fix] add_spf/${serverName}: SPF record already exists for ${domain} — skipping`);
+      return;
     }
-    if (result.code === 3 || result.code === 4) {
-      params.log(`[Auto-Fix] add_spf/${serverName}: SPF already exists for ${domain} (exit ${result.code}) — continuing`);
-    } else {
-      params.log(`[Auto-Fix] add_spf/${serverName}: Added SPF record for ${domain}`);
-    }
+  }
+
+  const result = await ssh.exec(`${HESTIA_PATH_PREFIX}${addCmd}`, { timeout: 10000 });
+  // Hard Lesson #97: exit 3/4 = "already exists" — non-fatal
+  if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
+    throw new Error(`${serverName} Failed to add SPF record for ${domain}: ${result.stderr}`);
+  }
+  if (result.code === 3 || result.code === 4) {
+    params.log(`[Auto-Fix] add_spf/${serverName}: SPF already exists for ${domain} (exit ${result.code}) — continuing`);
+  } else {
+    params.log(`[Auto-Fix] add_spf/${serverName}: Added SPF record for ${domain} (AXFR propagates to peer slave)`);
   }
 }
 
 /**
- * Fix SPF record: delete all SPF TXT records, add correct one
+ * Fix SPF record: delete all SPF TXT records, add correct one.
+ *
+ * PATCH 10d: runs on owning half only.
  */
 async function fixSPF(
   ssh1: SSHManager,
@@ -411,14 +450,22 @@ async function fixSPF(
     return line.includes('TXT') && line.includes('v=spf1');
   };
 
-  await robustDNSRecordReplace([ssh1, ssh2], domain, matchFn, [addCmd], params.log, 'fix_spf');
+  const { ssh, serverName } = pickOwningServer(domain, ssh1, ssh2, params.server1Domains, params.server2Domains);
+  await robustDNSRecordReplace(ssh, serverName, domain, matchFn, [addCmd], params.log, 'fix_spf');
 }
 
 /**
- * Add DKIM record: read from source server, add to both.
- * Hard Lesson #97: exit code 3/4 = "already exists" — non-fatal for DNS adds.
- * Before adding, check if the record already exists with correct content on
- * the target server. If so, skip the add (mark as already fixed).
+ * Ensure DKIM key + TXT exists on the owning server.
+ *
+ * PATCH 10d (HL #101): post-PR #4, DKIM generation runs on the Hestia-master
+ * half only. AXFR/NOTIFY propagates the `mail._domainkey` TXT to the peer
+ * slave automatically (verified on Pair 13 launta.info, PR #8). Previous
+ * peer-write via `v-add-dns-record` on the non-owning Hestia returned
+ * exit 3/4 ("dns domain doesn't exist" / "already exists") and was
+ * silently treated as non-fatal — wasted RTTs for no effect.
+ *
+ * Hard Lesson #97: exit code 3/4 = "already exists" — non-fatal for
+ * v-add-mail-domain-dkim regeneration.
  */
 async function addDKIM(
   ssh1: SSHManager,
@@ -426,86 +473,59 @@ async function addDKIM(
   domain: string,
   params: { server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
 ): Promise<void> {
-  // Determine source server
-  const sourceSSH = params.server2Domains.includes(domain) ? ssh2 : ssh1;
-  const sourceServer = params.server2Domains.includes(domain) ? 'S2' : 'S1';
-  const otherSSH = sourceSSH === ssh1 ? ssh2 : ssh1;
-  const otherServer = sourceServer === 'S1' ? 'S2' : 'S1';
+  const { ssh: owningSSH, serverName: owningServer } =
+    pickOwningServer(domain, ssh1, ssh2, params.server1Domains, params.server2Domains);
 
-  // Read DKIM from source server
+  // Read DKIM from owning server
   const listCmd = `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`;
-  const listResult = await sourceSSH.exec(listCmd, { timeout: 10000 });
+  const listResult = await owningSSH.exec(listCmd, { timeout: 10000 });
 
   if (listResult.code !== 0) {
-    throw new Error(`${sourceServer} Failed to list DNS records for ${domain}: ${listResult.stderr}`);
+    throw new Error(`${owningServer} Failed to list DNS records for ${domain}: ${listResult.stderr}`);
   }
 
   const lines = listResult.stdout.trim().split('\n').filter(l => l.length > 0);
   let dkimLine = lines.find(l => l.includes('mail._domainkey') && l.includes('TXT'));
 
   if (!dkimLine) {
-    // Try to regenerate DKIM
-    params.log(`[Auto-Fix] add_dkim/${sourceServer}: No DKIM found, attempting to regenerate for ${domain}`);
+    // Try to regenerate DKIM on the owning half
+    params.log(`[Auto-Fix] add_dkim/${owningServer}: No DKIM found, attempting to regenerate for ${domain}`);
     const genCmd = `${HESTIA_PATH_PREFIX}v-add-mail-domain-dkim admin ${domain}`;
-    const genResult = await sourceSSH.exec(genCmd, { timeout: 15000 });
+    const genResult = await owningSSH.exec(genCmd, { timeout: 15000 });
 
     // Exit 3/4 = already exists (non-fatal)
     if (genResult.code !== 0 && genResult.code !== 3 && genResult.code !== 4) {
-      throw new Error(`${sourceServer} Failed to regenerate DKIM for ${domain}: ${genResult.stderr}`);
+      throw new Error(`${owningServer} Failed to regenerate DKIM for ${domain}: ${genResult.stderr}`);
     }
 
     // Re-list to get the DKIM
-    const relistResult = await sourceSSH.exec(listCmd, { timeout: 10000 });
+    const relistResult = await owningSSH.exec(listCmd, { timeout: 10000 });
     if (relistResult.code !== 0) {
-      throw new Error(`${sourceServer} Failed to re-list DNS records for ${domain}: ${relistResult.stderr}`);
+      throw new Error(`${owningServer} Failed to re-list DNS records for ${domain}: ${relistResult.stderr}`);
     }
 
     const relistLines = relistResult.stdout.trim().split('\n').filter(l => l.length > 0);
     dkimLine = relistLines.find(l => l.includes('mail._domainkey') && l.includes('TXT'));
 
     if (!dkimLine) {
-      throw new Error(`${sourceServer} Failed to find DKIM record even after regeneration for ${domain}`);
+      throw new Error(`${owningServer} Failed to find DKIM record even after regeneration for ${domain}`);
     }
   }
 
-  // Extract DKIM value
-  const parts = dkimLine.split(/\s+/);
-  const dkimValue = parts.slice(3).join(' ');
-
-  // Check if the DKIM record already exists on the other server with correct content
-  const otherListResult = await otherSSH.exec(listCmd, { timeout: 10000 });
-  if (otherListResult.code === 0) {
-    const otherLines = otherListResult.stdout.trim().split('\n').filter(l => l.length > 0);
-    const existingDkim = otherLines.find(l => l.includes('mail._domainkey') && l.includes('TXT'));
-    if (existingDkim && existingDkim.includes('v=DKIM1')) {
-      params.log(`[Auto-Fix] add_dkim/${otherServer}: DKIM record already exists for ${domain} — skipping add`);
-      return;
-    }
-  }
-
-  // Add to other server — tolerate exit 3/4 ("already exists")
-  const addCmd = `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} mail._domainkey TXT ${dkimValue}`;
-  const addResult = await otherSSH.exec(addCmd, { timeout: 10000 });
-
-  if (addResult.code !== 0 && addResult.code !== 3 && addResult.code !== 4) {
-    throw new Error(`${otherServer} Failed to add DKIM record for ${domain}: ${addResult.stderr}`);
-  }
-  if (addResult.code === 3 || addResult.code === 4) {
-    params.log(`[Auto-Fix] add_dkim/${otherServer}: DKIM record already exists for ${domain} (exit ${addResult.code}) — continuing`);
-  } else {
-    params.log(`[Auto-Fix] add_dkim/${otherServer}: Added DKIM record for ${domain}`);
-  }
+  params.log(`[Auto-Fix] add_dkim/${owningServer}: DKIM present for ${domain} on owning half (AXFR propagates to peer slave)`);
 }
 
 /**
- * Add DMARC record
+ * Add DMARC record.
+ *
+ * PATCH 10d: runs on owning half only.
  */
 async function addDMARC(
   ssh1: SSHManager,
   ssh2: SSHManager,
   domain: string,
   nsDomain: string,
-  params: { log: (msg: string) => void }
+  params: { server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
 ): Promise<void> {
   // HL #95 note: previous "no rua" rule was specifically about EXTERNAL reporting
   // domains (those require a DKIM auth record on the recipient zone). Using
@@ -514,44 +534,46 @@ async function addDMARC(
   const dmarcValue = `"v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@${nsDomain}; ruf=mailto:dmarc@${nsDomain}; fo=1"`;
   const addCmd = `v-add-dns-record admin ${domain} _dmarc TXT ${dmarcValue}`;
 
-  for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
-    // Check if DMARC record already exists with correct content
-    const listResult = await ssh.exec(
-      `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
-      { timeout: 10000 }
-    );
-    if (listResult.code === 0) {
-      const existingDmarc = listResult.stdout.split('\n').find(
-        l => l.includes('_dmarc') && l.includes('TXT') && l.includes('v=DMARC1')
-      );
-      if (existingDmarc) {
-        params.log(`[Auto-Fix] add_dmarc/${serverName}: DMARC record already exists for ${domain} — skipping`);
-        continue;
-      }
-    }
+  const { ssh, serverName } = pickOwningServer(domain, ssh1, ssh2, params.server1Domains, params.server2Domains);
 
-    const result = await ssh.exec(`${HESTIA_PATH_PREFIX}${addCmd}`, { timeout: 10000 });
-    // Hard Lesson #97: exit 3/4 = "already exists" — non-fatal
-    if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
-      throw new Error(`${serverName} Failed to add DMARC record for ${domain}: ${result.stderr}`);
+  // Check if DMARC record already exists with correct content
+  const listResult = await ssh.exec(
+    `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+    { timeout: 10000 }
+  );
+  if (listResult.code === 0) {
+    const existingDmarc = listResult.stdout.split('\n').find(
+      l => l.includes('_dmarc') && l.includes('TXT') && l.includes('v=DMARC1')
+    );
+    if (existingDmarc) {
+      params.log(`[Auto-Fix] add_dmarc/${serverName}: DMARC record already exists for ${domain} — skipping`);
+      return;
     }
-    if (result.code === 3 || result.code === 4) {
-      params.log(`[Auto-Fix] add_dmarc/${serverName}: DMARC already exists for ${domain} (exit ${result.code}) — continuing`);
-    } else {
-      params.log(`[Auto-Fix] add_dmarc/${serverName}: Added DMARC record for ${domain}`);
-    }
+  }
+
+  const result = await ssh.exec(`${HESTIA_PATH_PREFIX}${addCmd}`, { timeout: 10000 });
+  // Hard Lesson #97: exit 3/4 = "already exists" — non-fatal
+  if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
+    throw new Error(`${serverName} Failed to add DMARC record for ${domain}: ${result.stderr}`);
+  }
+  if (result.code === 3 || result.code === 4) {
+    params.log(`[Auto-Fix] add_dmarc/${serverName}: DMARC already exists for ${domain} (exit ${result.code}) — continuing`);
+  } else {
+    params.log(`[Auto-Fix] add_dmarc/${serverName}: Added DMARC record for ${domain} (AXFR propagates to peer slave)`);
   }
 }
 
 /**
- * Fix DMARC record: delete all _dmarc TXT records, add correct one
+ * Fix DMARC record: delete all _dmarc TXT records, add correct one.
+ *
+ * PATCH 10d: runs on owning half only.
  */
 async function fixDMARC(
   ssh1: SSHManager,
   ssh2: SSHManager,
   domain: string,
   nsDomain: string,
-  params: { log: (msg: string) => void }
+  params: { server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
 ): Promise<void> {
   // HL #95 note: previous "no rua" rule was specifically about EXTERNAL reporting
   // domains (those require a DKIM auth record on the recipient zone). Using
@@ -565,7 +587,8 @@ async function fixDMARC(
     return parts[2] === 'TXT' && parts[1] === '_dmarc';
   };
 
-  await robustDNSRecordReplace([ssh1, ssh2], domain, matchFn, [addCmd], params.log, 'fix_dmarc');
+  const { ssh, serverName } = pickOwningServer(domain, ssh1, ssh2, params.server1Domains, params.server2Domains);
+  await robustDNSRecordReplace(ssh, serverName, domain, matchFn, [addCmd], params.log, 'fix_dmarc');
 }
 
 /**
@@ -686,32 +709,33 @@ async function reissueSSL(
   // Step 1: Ensure web domain exists on S2
   await ensureWebDomain(ssh2, domain, 'S2', params.log);
 
-  // Step 2: Remove stale S1 A records from DNS zones on BOTH servers.
+  // Step 2: Remove stale S1 A records from the S2-primary zone on its owning
+  // server (ssh2). PATCH 10d (HL #101 / post-PR #4): ssh1 holds the zone as a
+  // BIND slave only; mutating it via Hestia CLI on ssh1 returns exit 3. Any
+  // removal we make on ssh2 propagates to the ssh1 slave via AXFR.
   const s1IP = params.server1IP;
-  for (const [ssh, sName] of [[ssh1, 'S1'], [ssh2, 'S2']] as const) {
-    try {
-      const { stdout: records } = await ssh.exec(
-        `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
-        { timeout: 15000 }
-      );
-      for (const line of records.split('\n')) {
-        const parts = line.trim().split(/\s+/);
-        if (parts.length >= 4 && parts[1] === '@' && parts[2] === 'A' && parts[3] === s1IP) {
-          const recordId = parts[0];
-          params.log(`[Auto-Fix] reissue_ssl/S2: Removing stale S1 A record (id=${recordId}) from ${sName} zone for ${domain}`);
-          try {
-            await ssh.exec(
-              `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${recordId}`,
-              { timeout: 15000 }
-            );
-          } catch {
-            // Non-fatal
-          }
+  try {
+    const { stdout: records } = await ssh2.exec(
+      `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+      { timeout: 15000 }
+    );
+    for (const line of records.split('\n')) {
+      const parts = line.trim().split(/\s+/);
+      if (parts.length >= 4 && parts[1] === '@' && parts[2] === 'A' && parts[3] === s1IP) {
+        const recordId = parts[0];
+        params.log(`[Auto-Fix] reissue_ssl/S2: Removing stale S1 A record (id=${recordId}) from S2 zone for ${domain}`);
+        try {
+          await ssh2.exec(
+            `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${recordId}`,
+            { timeout: 15000 }
+          );
+        } catch {
+          // Non-fatal
         }
       }
-    } catch {
-      params.log(`[Auto-Fix] reissue_ssl/S2: Warning: could not clean DNS on ${sName} for ${domain}`);
     }
+  } catch {
+    params.log(`[Auto-Fix] reissue_ssl/S2: Warning: could not clean DNS on S2 for ${domain}`);
   }
 
   // Step 3: Try LE on S2 — NO self-signed fallback (self-signed certs cause MXToolbox
@@ -854,7 +878,10 @@ async function ensureWebDomain(
 }
 
 /**
- * Add MTA-STS record and file
+ * Add MTA-STS record and file.
+ *
+ * PATCH 10d: DNS record written on owning half only; AXFR propagates to peer
+ * slave. MTA-STS HTTP file is already routed to owning half below.
  */
 async function addMTASTS(
   ssh1: SSHManager,
@@ -869,29 +896,34 @@ async function addMTASTS(
   const mtaStsValue = `"v=STSv1; id=${timestamp}"`;
   const addCmd = `v-add-dns-record admin ${domain} _mta-sts TXT ${mtaStsValue}`;
 
-  // Add DNS record on both servers — tolerate "already exists" (exit 3/4)
-  for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
+  // Add DNS record on owning half only — tolerate "already exists" (exit 3/4)
+  {
+    const { ssh, serverName } = pickOwningServer(domain, ssh1, ssh2, params.server1Domains, params.server2Domains);
+
     // Check if MTA-STS record already exists
     const listResult = await ssh.exec(
       `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
       { timeout: 10000 }
     );
+    let dnsAlreadyPresent = false;
     if (listResult.code === 0) {
       const existingMtaSts = listResult.stdout.split('\n').find(
         l => l.includes('_mta-sts') && l.includes('TXT') && l.includes('v=STSv1')
       );
       if (existingMtaSts) {
         params.log(`[Auto-Fix] add_mta_sts/${serverName}: MTA-STS DNS record already exists for ${domain} — skipping`);
-        continue;
+        dnsAlreadyPresent = true;
       }
     }
 
-    const dnsResult = await ssh.exec(`${HESTIA_PATH_PREFIX}${addCmd}`, { timeout: 10000 });
-    if (dnsResult.code !== 0 && dnsResult.code !== 3 && dnsResult.code !== 4) {
-      throw new Error(`${serverName} Failed to add MTA-STS DNS record for ${domain}: ${dnsResult.stderr}`);
-    }
-    if (dnsResult.code === 3 || dnsResult.code === 4) {
-      params.log(`[Auto-Fix] add_mta_sts/${serverName}: MTA-STS already exists for ${domain} (exit ${dnsResult.code}) — continuing`);
+    if (!dnsAlreadyPresent) {
+      const dnsResult = await ssh.exec(`${HESTIA_PATH_PREFIX}${addCmd}`, { timeout: 10000 });
+      if (dnsResult.code !== 0 && dnsResult.code !== 3 && dnsResult.code !== 4) {
+        throw new Error(`${serverName} Failed to add MTA-STS DNS record for ${domain}: ${dnsResult.stderr}`);
+      }
+      if (dnsResult.code === 3 || dnsResult.code === 4) {
+        params.log(`[Auto-Fix] add_mta_sts/${serverName}: MTA-STS already exists for ${domain} (exit ${dnsResult.code}) — continuing`);
+      }
     }
   }
 
@@ -925,86 +957,90 @@ max_age: 604800`;
 }
 
 /**
- * Add TLSRPT record
+ * Add TLSRPT record.
+ *
+ * PATCH 10d: runs on owning half only.
  */
 async function addTLSRPT(
   ssh1: SSHManager,
   ssh2: SSHManager,
   domain: string,
-  params: { log: (msg: string) => void }
+  params: { server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
 ): Promise<void> {
   // Hard Lesson #95: No external rua — thestealthmail.com lacks authorization records
   // TLS-RPT is optional and VG check is skipped, but keep the value clean just in case
   const tlsrptValue = '"v=TLSRPTv1;"';
   const addCmd = `v-add-dns-record admin ${domain} _smtp._tls TXT ${tlsrptValue}`;
 
-  for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
-    // Check if TLSRPT already exists
-    const listResult = await ssh.exec(
-      `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
-      { timeout: 10000 }
-    );
-    if (listResult.code === 0) {
-      const existingTlsrpt = listResult.stdout.split('\n').find(
-        l => l.includes('_smtp._tls') && l.includes('TXT') && l.includes('TLSRPTv1')
-      );
-      if (existingTlsrpt) {
-        params.log(`[Auto-Fix] add_tlsrpt/${serverName}: TLSRPT record already exists for ${domain} — skipping`);
-        continue;
-      }
-    }
+  const { ssh, serverName } = pickOwningServer(domain, ssh1, ssh2, params.server1Domains, params.server2Domains);
 
-    const result = await ssh.exec(`${HESTIA_PATH_PREFIX}${addCmd}`, { timeout: 10000 });
-    // Hard Lesson #97: exit 3/4 = "already exists" — non-fatal
-    if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
-      throw new Error(`${serverName} Failed to add TLSRPT record for ${domain}: ${result.stderr}`);
+  // Check if TLSRPT already exists
+  const listResult = await ssh.exec(
+    `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+    { timeout: 10000 }
+  );
+  if (listResult.code === 0) {
+    const existingTlsrpt = listResult.stdout.split('\n').find(
+      l => l.includes('_smtp._tls') && l.includes('TXT') && l.includes('TLSRPTv1')
+    );
+    if (existingTlsrpt) {
+      params.log(`[Auto-Fix] add_tlsrpt/${serverName}: TLSRPT record already exists for ${domain} — skipping`);
+      return;
     }
-    if (result.code === 3 || result.code === 4) {
-      params.log(`[Auto-Fix] add_tlsrpt/${serverName}: TLSRPT already exists for ${domain} (exit ${result.code}) — continuing`);
-    } else {
-      params.log(`[Auto-Fix] add_tlsrpt/${serverName}: Added TLSRPT record for ${domain}`);
-    }
+  }
+
+  const result = await ssh.exec(`${HESTIA_PATH_PREFIX}${addCmd}`, { timeout: 10000 });
+  // Hard Lesson #97: exit 3/4 = "already exists" — non-fatal
+  if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
+    throw new Error(`${serverName} Failed to add TLSRPT record for ${domain}: ${result.stderr}`);
+  }
+  if (result.code === 3 || result.code === 4) {
+    params.log(`[Auto-Fix] add_tlsrpt/${serverName}: TLSRPT already exists for ${domain} (exit ${result.code}) — continuing`);
+  } else {
+    params.log(`[Auto-Fix] add_tlsrpt/${serverName}: Added TLSRPT record for ${domain} (AXFR propagates to peer slave)`);
   }
 }
 
 /**
- * Add BIMI record
+ * Add BIMI record.
+ *
+ * PATCH 10d: runs on owning half only.
  */
 async function addBIMI(
   ssh1: SSHManager,
   ssh2: SSHManager,
   domain: string,
-  params: { log: (msg: string) => void }
+  params: { server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
 ): Promise<void> {
   const bimiValue = '\'"v=BIMI1; l=; a="\'';
   const addCmd = `v-add-dns-record admin ${domain} default._bimi TXT ${bimiValue}`;
 
-  for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
-    // Check if BIMI already exists
-    const listResult = await ssh.exec(
-      `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
-      { timeout: 10000 }
-    );
-    if (listResult.code === 0) {
-      const existingBIMI = listResult.stdout.split('\n').find(
-        l => l.includes('default._bimi') && l.includes('TXT') && l.includes('v=BIMI1')
-      );
-      if (existingBIMI) {
-        params.log(`[Auto-Fix] add_bimi/${serverName}: BIMI record already exists for ${domain} — skipping`);
-        continue;
-      }
-    }
+  const { ssh, serverName } = pickOwningServer(domain, ssh1, ssh2, params.server1Domains, params.server2Domains);
 
-    const result = await ssh.exec(`${HESTIA_PATH_PREFIX}${addCmd}`, { timeout: 10000 });
-    // Hard Lesson #97: exit 3/4 = "already exists" — non-fatal
-    if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
-      throw new Error(`${serverName} Failed to add BIMI record for ${domain}: ${result.stderr}`);
+  // Check if BIMI already exists
+  const listResult = await ssh.exec(
+    `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+    { timeout: 10000 }
+  );
+  if (listResult.code === 0) {
+    const existingBIMI = listResult.stdout.split('\n').find(
+      l => l.includes('default._bimi') && l.includes('TXT') && l.includes('v=BIMI1')
+    );
+    if (existingBIMI) {
+      params.log(`[Auto-Fix] add_bimi/${serverName}: BIMI record already exists for ${domain} — skipping`);
+      return;
     }
-    if (result.code === 3 || result.code === 4) {
-      params.log(`[Auto-Fix] add_bimi/${serverName}: BIMI already exists for ${domain} (exit ${result.code}) — continuing`);
-    } else {
-      params.log(`[Auto-Fix] add_bimi/${serverName}: Added BIMI record for ${domain}`);
-    }
+  }
+
+  const result = await ssh.exec(`${HESTIA_PATH_PREFIX}${addCmd}`, { timeout: 10000 });
+  // Hard Lesson #97: exit 3/4 = "already exists" — non-fatal
+  if (result.code !== 0 && result.code !== 3 && result.code !== 4) {
+    throw new Error(`${serverName} Failed to add BIMI record for ${domain}: ${result.stderr}`);
+  }
+  if (result.code === 3 || result.code === 4) {
+    params.log(`[Auto-Fix] add_bimi/${serverName}: BIMI already exists for ${domain} (exit ${result.code}) — continuing`);
+  } else {
+    params.log(`[Auto-Fix] add_bimi/${serverName}: Added BIMI record for ${domain} (AXFR propagates to peer slave)`);
   }
 }
 
