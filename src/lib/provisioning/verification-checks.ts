@@ -2158,9 +2158,10 @@ export async function runVerificationChecks(
     }
   }
 
-  // Check 35: TLSRPT — Hard Lesson #95: TLS-RPT requires rua= which points to
-  // an external domain that lacks authorization records, causing MXToolbox warnings.
-  // Since TLS-RPT is optional and not deliverability-critical, mark as pass either way.
+  // Check 35: TLSRPT — TLS-RPT marked optional per RFC 8460; no external rua= per HL #109.
+  // (Authorization records at <publishing>._report._dmarc.<reporter> required by
+  // RFC 7489 §7.1 for cross-Organizational-Domain reporting are not maintained
+  // per-pair, so the canonical template omits rua=.) Mark as pass either way.
   log('[VG] Running check 35: TLSRPT (optional — skipped)');
   for (const domain of allDomains) {
     const server = getServerForDomain(domain);

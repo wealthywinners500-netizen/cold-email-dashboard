@@ -1,6 +1,7 @@
 import type { SSHManager } from './ssh-manager';
 import type { VerificationResult, VPSProvider } from './types';
 import { HESTIA_PATH_PREFIX, HESTIA_FULL_PATH, checkLERateLimit } from './hestia-scripts';
+import { buildDmarcAddCommand } from './dns-templates';
 
 /**
  * Auto-fix module for cold email server provisioning.
@@ -527,12 +528,9 @@ async function addDMARC(
   nsDomain: string,
   params: { server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
 ): Promise<void> {
-  // HL #95 note: previous "no rua" rule was specifically about EXTERNAL reporting
-  // domains (those require a DKIM auth record on the recipient zone). Using
-  // dmarc@${nsDomain} — same NS zone as the sending domains — sidesteps that
-  // requirement because DMARC RFC 7489 treats same-org reporting as trusted.
-  const dmarcValue = `"v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@${nsDomain}; ruf=mailto:dmarc@${nsDomain}; fo=1"`;
-  const addCmd = `v-add-dns-record admin ${domain} _dmarc TXT ${dmarcValue}`;
+  // HL #109: canonical cold-email DMARC — see dns-templates.ts.
+  void nsDomain;
+  const addCmd = buildDmarcAddCommand(domain);
 
   const { ssh, serverName } = pickOwningServer(domain, ssh1, ssh2, params.server1Domains, params.server2Domains);
 
@@ -575,12 +573,9 @@ async function fixDMARC(
   nsDomain: string,
   params: { server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
 ): Promise<void> {
-  // HL #95 note: previous "no rua" rule was specifically about EXTERNAL reporting
-  // domains (those require a DKIM auth record on the recipient zone). Using
-  // dmarc@${nsDomain} — same NS zone as the sending domains — sidesteps that
-  // requirement because DMARC RFC 7489 treats same-org reporting as trusted.
-  const dmarcValue = `"v=DMARC1; p=quarantine; pct=100; rua=mailto:dmarc@${nsDomain}; ruf=mailto:dmarc@${nsDomain}; fo=1"`;
-  const addCmd = `v-add-dns-record admin ${domain} _dmarc TXT ${dmarcValue}`;
+  // HL #109: canonical cold-email DMARC — see dns-templates.ts.
+  void nsDomain;
+  const addCmd = buildDmarcAddCommand(domain);
 
   const matchFn = (line: string) => {
     const parts = line.split(/\s+/);
@@ -967,8 +962,9 @@ async function addTLSRPT(
   domain: string,
   params: { server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
 ): Promise<void> {
-  // Hard Lesson #95: No external rua — thestealthmail.com lacks authorization records
-  // TLS-RPT is optional and VG check is skipped, but keep the value clean just in case
+  // HL #109: TLSRPT is optional (VG check skipped). Template carries no external
+  // rua= per HL #109 — RFC 7489 §7.1 authorization records aren't maintained
+  // per-pair. Keep the value clean just in case.
   const tlsrptValue = '"v=TLSRPTv1;"';
   const addCmd = `v-add-dns-record admin ${domain} _smtp._tls TXT ${tlsrptValue}`;
 
