@@ -990,175 +990,183 @@ export function createPairProvisioningSaga(
             }
           }
 
-          // PATCH 10c: Fix @ A record and MX for S2 domains
+          // PATCH 10c: Fix @ A record and MX for S2 domains.
           // ensureDNSRecords (Step 5) sets ALL domains' @ A → server1IP.
           // S2 domains need @ A → server2IP so LE HTTP-01 validation hits S2
           // (where the ACME challenge file lives). MX also needs to point to
-          // mail2.domain (S2's mail handler) instead of mail1.domain (S1).
-          // Fix on BOTH servers since both serve DNS (ns1/ns2 authoritative).
+          // mail.{domain} (HL #106 per-domain convention).
+          //
+          // PATCH 10d (HL #101 / post-PR #4): run only on ssh2. Post-AXFR, S2
+          // is the sole Hestia DNS master for server2Domains zones; ssh1 holds
+          // them as BIND slaves (via installSlaveZones). `v-list-dns-records
+          // admin <s2-primary-zone> plain` on ssh1 returns exit 3 "dns domain
+          // doesn't exist" and crashes the saga (P14 2026-04-21). AXFR+NOTIFY
+          // propagates the ssh2 writes to the ssh1 slave automatically.
+          //
           // Hard Lesson #89: Delete ALL stale @ A records before adding correct
           // one — never use .catch(() => {}) on DNS record deletes (masks failures
           // that leave dual A records, breaking LE SSL and deliverability).
-          context.log('[Step 6] Fixing @ A and MX records for S2 domains on both DNS servers...');
+          context.log('[Step 6] Fixing @ A and MX records for S2 domains on owning server (S2)...');
           for (const domain of server2Domains) {
-            for (const [sshConn, label] of [[ssh1, 'S1'], [ssh2, 'S2']] as [typeof ssh1, string][]) {
-              try {
-                const { stdout: records } = await sshConn.exec(
-                  `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
-                  { timeout: 15000 }
-                );
-                const lines = records.split('\n');
+            try {
+              const { stdout: records } = await ssh2.exec(
+                `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+                { timeout: 15000 }
+              );
+              const lines = records.split('\n');
 
-                // Collect ALL @ A and @ MX record IDs to delete
-                const aRecordIds: string[] = [];
-                const mxRecordIds: string[] = [];
-                for (const line of lines) {
-                  const cols = line.trim().split(/\s+/);
-                  if (cols.length < 4) continue;
-                  // Hard Lesson #105: v-list-dns-records plain column order is ID HOST TYPE [PRIORITY] VALUE
-                  // NEVER use [recordId, type, host] — that has type and host SWAPPED
-                  const [recordId, host, type] = cols;
-                  if (!/^\d+$/.test(recordId)) continue;
+              // Collect ALL @ A and @ MX record IDs to delete
+              const aRecordIds: string[] = [];
+              const mxRecordIds: string[] = [];
+              for (const line of lines) {
+                const cols = line.trim().split(/\s+/);
+                if (cols.length < 4) continue;
+                // Hard Lesson #105: v-list-dns-records plain column order is ID HOST TYPE [PRIORITY] VALUE
+                // NEVER use [recordId, type, host] — that has type and host SWAPPED
+                const [recordId, host, type] = cols;
+                if (!/^\d+$/.test(recordId)) continue;
 
-                  // Delete ALL @ A records (not just server1IP) — we'll add the correct one after
-                  if (type === 'A' && host === '@') {
-                    aRecordIds.push(recordId);
-                  }
-                  // Delete ALL @ MX records — we'll add the correct one after
-                  if (type === 'MX' && host === '@') {
-                    mxRecordIds.push(recordId);
-                  }
+                // Delete ALL @ A records (not just server1IP) — we'll add the correct one after
+                if (type === 'A' && host === '@') {
+                  aRecordIds.push(recordId);
                 }
-
-                // Delete old @ A records with explicit error logging (no silent catch)
-                for (const rid of aRecordIds) {
-                  const delResult = await sshConn.exec(
-                    `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${rid}`,
-                    { timeout: 10000 }
-                  );
-                  if (delResult.code !== 0) {
-                    context.log(`[Step 6] WARNING: Failed to delete A record ${rid} for ${domain} on ${label}: exit ${delResult.code} ${delResult.stderr}`);
-                  }
+                // Delete ALL @ MX records — we'll add the correct one after
+                if (type === 'MX' && host === '@') {
+                  mxRecordIds.push(recordId);
                 }
-
-                // Delete old @ MX records with explicit error logging
-                for (const rid of mxRecordIds) {
-                  const delResult = await sshConn.exec(
-                    `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${rid}`,
-                    { timeout: 10000 }
-                  );
-                  if (delResult.code !== 0) {
-                    context.log(`[Step 6] WARNING: Failed to delete MX record ${rid} for ${domain} on ${label}: exit ${delResult.code} ${delResult.stderr}`);
-                  }
-                }
-
-                // Verify no @ A records remain before adding
-                const { stdout: postDeleteRecords } = await sshConn.exec(
-                  `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
-                  { timeout: 15000 }
-                );
-                const remainingARecords = postDeleteRecords.split('\n').filter(l => {
-                  const c = l.trim().split(/\s+/);
-                  // Hard Lesson #105: column order is ID HOST TYPE — c[1]=HOST, c[2]=TYPE
-                  return c.length >= 4 && c[1] === '@' && c[2] === 'A';
-                });
-                if (remainingARecords.length > 0) {
-                  context.log(`[Step 6] ERROR: ${remainingARecords.length} stale @ A record(s) still present for ${domain} on ${label} after delete — LE SSL will likely fail`);
-                }
-
-                // Add correct @ A → server2IP
-                await sshConn.exec(
-                  `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ A ${server2IP}`,
-                  { timeout: 10000 }
-                );
-                // Add correct MX → mail.{domain}  (HL #106: per-domain, HestiaCP default.
-                // Supersedes HL #100 Option A. Each sending domain keeps its own mail
-                // hostname, its own LE SAN cert [mail.{d}, webmail.{d}], and its own
-                // reputation profile — required for cold-email deliverability.)
-                await sshConn.exec(
-                  `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ MX mail.${domain} 10`,
-                  { timeout: 10000 }
-                );
-              } catch (err) {
-                context.log(`[Step 6] ERROR: A/MX fix for ${domain} on ${label} FAILED: ${err}`);
-                // Re-throw — dual A records break SSL and deliverability, this must not be silent
-                throw new Error(`Failed to fix @ A/MX for S2 domain ${domain} on ${label}: ${err}`);
               }
+
+              // Delete old @ A records with explicit error logging (no silent catch)
+              for (const rid of aRecordIds) {
+                const delResult = await ssh2.exec(
+                  `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${rid}`,
+                  { timeout: 10000 }
+                );
+                if (delResult.code !== 0) {
+                  context.log(`[Step 6] WARNING: Failed to delete A record ${rid} for ${domain} on S2: exit ${delResult.code} ${delResult.stderr}`);
+                }
+              }
+
+              // Delete old @ MX records with explicit error logging
+              for (const rid of mxRecordIds) {
+                const delResult = await ssh2.exec(
+                  `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${rid}`,
+                  { timeout: 10000 }
+                );
+                if (delResult.code !== 0) {
+                  context.log(`[Step 6] WARNING: Failed to delete MX record ${rid} for ${domain} on S2: exit ${delResult.code} ${delResult.stderr}`);
+                }
+              }
+
+              // Verify no @ A records remain before adding
+              const { stdout: postDeleteRecords } = await ssh2.exec(
+                `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+                { timeout: 15000 }
+              );
+              const remainingARecords = postDeleteRecords.split('\n').filter(l => {
+                const c = l.trim().split(/\s+/);
+                // Hard Lesson #105: column order is ID HOST TYPE — c[1]=HOST, c[2]=TYPE
+                return c.length >= 4 && c[1] === '@' && c[2] === 'A';
+              });
+              if (remainingARecords.length > 0) {
+                context.log(`[Step 6] ERROR: ${remainingARecords.length} stale @ A record(s) still present for ${domain} on S2 after delete — LE SSL will likely fail`);
+              }
+
+              // Add correct @ A → server2IP
+              await ssh2.exec(
+                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ A ${server2IP}`,
+                { timeout: 10000 }
+              );
+              // Add correct MX → mail.{domain}  (HL #106: per-domain, HestiaCP default.
+              // Supersedes HL #100 Option A. Each sending domain keeps its own mail
+              // hostname, its own LE SAN cert [mail.{d}, webmail.{d}], and its own
+              // reputation profile — required for cold-email deliverability.)
+              await ssh2.exec(
+                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} @ MX mail.${domain} 10`,
+                { timeout: 10000 }
+              );
+            } catch (err) {
+              context.log(`[Step 6] ERROR: A/MX fix for ${domain} on S2 FAILED: ${err}`);
+              // Re-throw — dual A records break SSL and deliverability, this must not be silent
+              throw new Error(`Failed to fix @ A/MX for S2 domain ${domain} on S2: ${err}`);
             }
-            context.log(`[Step 6] A/MX fixed for ${domain}: @ A → ${server2IP}, MX → mail.${domain}`);
+            context.log(`[Step 6] A/MX fixed for ${domain}: @ A → ${server2IP}, MX → mail.${domain} (AXFR propagates to S1 slave)`);
           }
 
           // (HL #106 revert) S1 domains: Hestia's default `@ MX mail.{domain}` already
           // matches the per-domain invariant. No rewrite needed — the former PATCH 11d
           // that flipped S1 MX to `mail1.{nsDomain}` (Option A, HL #100) has been deleted.
 
-          // PATCH 15: Fix mail/webmail A records for S2 domains on BOTH servers
+          // PATCH 15: Fix mail/webmail A records for S2 domains.
           // Hard Lesson #90: HestiaCP's v-add-letsencrypt-domain includes mail.domain
           // and webmail.domain in the SAN cert. If these subdomains don't resolve to
           // the correct server (NXDOMAIN from either ns1 or ns2), LE validation fails
           // with exit 15. ensureDNSRecords in Step 4 creates mail A → server1IP for ALL
           // domains. For S2 domains, we must delete the stale record and add the correct one.
-          context.log('[Step 6] Fixing mail/webmail A records for S2 domains on both DNS servers...');
+          //
+          // PATCH 10d (HL #101 / post-PR #4): run only on ssh2. Same reasoning as
+          // the PATCH 10c block above — S2-primary zones are BIND slaves on S1 and
+          // Hestia CLI on ssh1 returns exit 3. AXFR propagates mail/webmail A writes
+          // from ssh2 to the ssh1 slave.
+          context.log('[Step 6] Fixing mail/webmail A records for S2 domains on owning server (S2)...');
           for (const domain of server2Domains) {
-            for (const [sshConn, label] of [[ssh1, 'S1'], [ssh2, 'S2']] as [typeof ssh1, string][]) {
-              try {
-                const { stdout: records } = await sshConn.exec(
-                  `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
-                  { timeout: 15000 }
-                );
-                const lines = records.split('\n');
+            try {
+              const { stdout: records } = await ssh2.exec(
+                `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+                { timeout: 15000 }
+              );
+              const lines = records.split('\n');
 
-                // Collect mail A and webmail A record IDs to delete
-                const mailAIds: string[] = [];
-                for (const line of lines) {
-                  const cols = line.trim().split(/\s+/);
-                  if (cols.length < 4) continue;
-                  const [recordId, host, type] = cols;
-                  if (!/^\d+$/.test(recordId)) continue;
-                  if (type === 'A' && (host === 'mail' || host === 'webmail')) {
-                    mailAIds.push(recordId);
-                  }
+              // Collect mail A and webmail A record IDs to delete
+              const mailAIds: string[] = [];
+              for (const line of lines) {
+                const cols = line.trim().split(/\s+/);
+                if (cols.length < 4) continue;
+                const [recordId, host, type] = cols;
+                if (!/^\d+$/.test(recordId)) continue;
+                if (type === 'A' && (host === 'mail' || host === 'webmail')) {
+                  mailAIds.push(recordId);
                 }
-
-                // Delete old mail/webmail A records with explicit error logging
-                for (const rid of mailAIds) {
-                  const delResult = await sshConn.exec(
-                    `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${rid}`,
-                    { timeout: 10000 }
-                  );
-                  if (delResult.code !== 0) {
-                    context.log(`[Step 6] WARNING: Failed to delete mail/webmail A record ${rid} for ${domain} on ${label}: exit ${delResult.code} ${delResult.stderr}`);
-                  }
-                }
-
-                // Verify no stale mail/webmail A records remain
-                const { stdout: postDeleteRecords } = await sshConn.exec(
-                  `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
-                  { timeout: 15000 }
-                );
-                const remainingMailA = postDeleteRecords.split('\n').filter(l => {
-                  const c = l.trim().split(/\s+/);
-                  return c.length >= 4 && c[2] === 'A' && (c[1] === 'mail' || c[1] === 'webmail');
-                });
-                if (remainingMailA.length > 0) {
-                  context.log(`[Step 6] ERROR: ${remainingMailA.length} stale mail/webmail A record(s) still present for ${domain} on ${label}`);
-                }
-
-                // Add correct mail A → server2IP and webmail A → server2IP
-                await sshConn.exec(
-                  `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} mail A ${server2IP}`,
-                  { timeout: 10000 }
-                );
-                await sshConn.exec(
-                  `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} webmail A ${server2IP}`,
-                  { timeout: 10000 }
-                );
-              } catch (err) {
-                context.log(`[Step 6] ERROR: mail/webmail A fix for ${domain} on ${label} FAILED: ${err}`);
-                throw new Error(`Failed to fix mail/webmail A for S2 domain ${domain} on ${label}: ${err}`);
               }
+
+              // Delete old mail/webmail A records with explicit error logging
+              for (const rid of mailAIds) {
+                const delResult = await ssh2.exec(
+                  `${HESTIA_PATH_PREFIX}v-delete-dns-record admin ${domain} ${rid}`,
+                  { timeout: 10000 }
+                );
+                if (delResult.code !== 0) {
+                  context.log(`[Step 6] WARNING: Failed to delete mail/webmail A record ${rid} for ${domain} on S2: exit ${delResult.code} ${delResult.stderr}`);
+                }
+              }
+
+              // Verify no stale mail/webmail A records remain
+              const { stdout: postDeleteRecords } = await ssh2.exec(
+                `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} plain`,
+                { timeout: 15000 }
+              );
+              const remainingMailA = postDeleteRecords.split('\n').filter(l => {
+                const c = l.trim().split(/\s+/);
+                return c.length >= 4 && c[2] === 'A' && (c[1] === 'mail' || c[1] === 'webmail');
+              });
+              if (remainingMailA.length > 0) {
+                context.log(`[Step 6] ERROR: ${remainingMailA.length} stale mail/webmail A record(s) still present for ${domain} on S2`);
+              }
+
+              // Add correct mail A → server2IP and webmail A → server2IP
+              await ssh2.exec(
+                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} mail A ${server2IP}`,
+                { timeout: 10000 }
+              );
+              await ssh2.exec(
+                `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} webmail A ${server2IP}`,
+                { timeout: 10000 }
+              );
+            } catch (err) {
+              context.log(`[Step 6] ERROR: mail/webmail A fix for ${domain} on S2 FAILED: ${err}`);
+              throw new Error(`Failed to fix mail/webmail A for S2 domain ${domain} on S2: ${err}`);
             }
-            context.log(`[Step 6] mail/webmail A fixed for ${domain}: mail A → ${server2IP}, webmail A → ${server2IP}`);
+            context.log(`[Step 6] mail/webmail A fixed for ${domain}: mail A → ${server2IP}, webmail A → ${server2IP} (AXFR propagates to S1 slave)`);
           }
 
           // PATCH 10c: Replicate SPF/DKIM/DMARC DNS records to the OTHER server.
