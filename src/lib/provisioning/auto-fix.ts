@@ -1045,8 +1045,21 @@ async function addBIMI(
 }
 
 /**
- * Fix SOA serial sync between S1 and S2
- * Rebuilds zones on both servers, reloads BIND, verifies S2 responds
+ * Fix SOA serial sync between S1 and S2 — AXFR-aware (PATCH 10d / HL #101).
+ *
+ * Post-PR #4 architecture: each zone has exactly one Hestia master + BIND
+ * primary; the peer holds the zone as a BIND slave. To bump the SOA serial
+ * and propagate changes:
+ *   1. `v-rebuild-dns-domain` on the owning half — rewrites the zone file
+ *      and bumps the serial. Hestia CLI only works on the owning half.
+ *   2. `rndc retransfer {zone}` on the peer — forces BIND to AXFR the
+ *      refreshed zone from the master immediately (don't wait for the
+ *      NOTIFY to fire / the Refresh timer to elapse).
+ *
+ * The pre-PATCH-10d implementation rebuilt on BOTH halves and, on the
+ * peer's "doesn't exist" exit, re-added the zone via `v-add-dns-domain`
+ * — which would re-create the slave zone as a Hestia-managed primary,
+ * breaking the AXFR relationship and reintroducing dual-primary drift.
  */
 async function fixSOASerialSync(
   ssh1: SSHManager,
@@ -1061,58 +1074,50 @@ async function fixSOASerialSync(
     log: (msg: string) => void;
   }
 ): Promise<void> {
-  // Step 1: Rebuild zone on S1 (the primary/source of truth)
-  const rebuildS1 = await ssh1.exec(
+  const { ssh: owningSSH, serverName: owningServer } =
+    pickOwningServer(domain, ssh1, ssh2, params.server1Domains, params.server2Domains);
+  const peerSSH = owningSSH === ssh1 ? ssh2 : ssh1;
+  const peerServer = owningServer === 'S1' ? 'S2' : 'S1';
+  const peerIP = owningServer === 'S1' ? params.server2IP : params.server1IP;
+
+  // Step 1: Rebuild zone on the owning half (bumps SOA serial, regenerates zone file).
+  const rebuildOwning = await owningSSH.exec(
     `${HESTIA_PATH_PREFIX}v-rebuild-dns-domain admin ${domain}`,
     { timeout: 15000 }
   );
-  if (rebuildS1.code !== 0) {
-    throw new Error(`S1 Failed to rebuild zone for ${domain}: ${rebuildS1.stderr}`);
+  if (rebuildOwning.code !== 0) {
+    throw new Error(`${owningServer} Failed to rebuild zone for ${domain}: ${rebuildOwning.stderr}`);
   }
-  params.log(`[Auto-Fix] fix_soa_serial_sync/S1: Rebuilt zone for ${domain}`);
+  params.log(`[Auto-Fix] fix_soa_serial_sync/${owningServer}: Rebuilt zone for ${domain} (new serial)`);
 
-  // Step 2: Rebuild zone on S2
-  const rebuildS2 = await ssh2.exec(
-    `${HESTIA_PATH_PREFIX}v-rebuild-dns-domain admin ${domain}`,
-    { timeout: 15000 }
-  );
-  if (rebuildS2.code !== 0) {
-    // If domain doesn't exist on S2, add it first
-    if (rebuildS2.stderr?.includes('doesn\'t exist') || rebuildS2.stderr?.includes('not exist')) {
-      const serverIP = params.server2Domains.includes(domain) ? params.server2IP : params.server1IP;
-      const addResult = await ssh2.exec(
-        `${HESTIA_PATH_PREFIX}v-add-dns-domain admin ${domain} ${serverIP}`,
-        { timeout: 15000 }
-      );
-      if (addResult.code !== 0 && addResult.code !== 3 && addResult.code !== 4) {
-        throw new Error(`S2 Failed to add zone for ${domain}: ${addResult.stderr}`);
-      }
-      params.log(`[Auto-Fix] fix_soa_serial_sync/S2: Added missing zone for ${domain}`);
-    } else {
-      throw new Error(`S2 Failed to rebuild zone for ${domain}: ${rebuildS2.stderr}`);
-    }
-  }
-  params.log(`[Auto-Fix] fix_soa_serial_sync/S2: Rebuilt zone for ${domain}`);
-
-  // Step 3: Reload BIND on both servers
-  for (const [ssh, serverName] of [[ssh1, 'S1'] as const, [ssh2, 'S2'] as const]) {
-    const result = await ssh.exec('rndc reload', { timeout: 10000 });
-    if (result.code !== 0) {
-      params.log(`[Auto-Fix] fix_soa_serial_sync/${serverName}: rndc reload warning: ${result.stderr}`);
-    }
+  // Step 2: Reload BIND on the owning half so the regenerated zone is served.
+  const reloadOwning = await owningSSH.exec('rndc reload', { timeout: 10000 });
+  if (reloadOwning.code !== 0) {
+    params.log(`[Auto-Fix] fix_soa_serial_sync/${owningServer}: rndc reload warning: ${reloadOwning.stderr}`);
   }
 
-  // Step 4: Verify S2 responds to queries for this zone
-  const verifyResult = await ssh1.exec(
-    `dig SOA ${domain} @${params.server2IP} +short +time=5 +tries=1 2>/dev/null`,
+  // Step 3: Force AXFR refresh on the peer slave. NOTIFY will eventually fire
+  // from the master, but `rndc retransfer` skips the Refresh/Retry timers and
+  // pulls immediately — closes the SOA-divergence window.
+  const retransferPeer = await peerSSH.exec(`rndc retransfer ${domain}`, { timeout: 15000 });
+  if (retransferPeer.code !== 0) {
+    // Non-fatal: AXFR will still happen on the next NOTIFY / Refresh.
+    params.log(`[Auto-Fix] fix_soa_serial_sync/${peerServer}: rndc retransfer warning for ${domain}: ${retransferPeer.stderr}`);
+  } else {
+    params.log(`[Auto-Fix] fix_soa_serial_sync/${peerServer}: AXFR retransfer triggered for ${domain}`);
+  }
+
+  // Step 4: Verify the peer responds with a matching SOA.
+  const verifyResult = await owningSSH.exec(
+    `dig SOA ${domain} @${peerIP} +short +time=5 +tries=2 2>/dev/null`,
     { timeout: 10000 }
   );
-  const s2SOA = verifyResult.stdout.trim();
-  if (!s2SOA) {
-    throw new Error(`S2 still not responding for ${domain} after rebuild + reload`);
+  const peerSOA = verifyResult.stdout.trim();
+  if (!peerSOA) {
+    throw new Error(`${peerServer} (${peerIP}) not responding for ${domain} after rebuild + retransfer`);
   }
 
-  params.log(`[Auto-Fix] fix_soa_serial_sync: Verified — S2 responding for ${domain} (SOA: ${s2SOA})`);
+  params.log(`[Auto-Fix] fix_soa_serial_sync: Verified — ${peerServer} responding for ${domain} (SOA: ${peerSOA})`);
 }
 
 /**
