@@ -46,6 +46,17 @@ export async function runVerificationChecks(
     // for legacy callers (e.g. the saga itself, where the pair row doesn't
     // exist yet at VG1/VG2 time). HL #R1 (Session 04b).
     pairId?: string;
+    // When true, the fcrdns block (Check 21) retries up to 3 attempts with
+    // 10-minute spacing if S1 or S2 does not return a pass. Added 2026-04-22
+    // for the P14 fresh-saga VG2 path after 04-21's `fcrdns:both × 2` failure
+    // was traced to Linode authoritative `*.ip.linodeusercontent.com` → public
+    // resolver cache lag (~18 h to full propagation; 8.8.8.8 commonly ~5-20 min
+    // post-PTR-set). VG1 leaves this false — VG1 failures are expected to
+    // trigger auto-fix, which re-sets PTR via the Linode API; propagation
+    // lag manifests at VG2 time. Total extra wall-clock: up to 20 min of
+    // retry waits (2 inter-attempt sleeps × 10 min). VG2 step's
+    // estimatedDurationMs is sized for that.
+    fcrdnsRetryBackoff?: boolean;
   }
 ): Promise<VerificationResult[]> {
   const results: VerificationResult[] = [];
@@ -59,6 +70,7 @@ export async function runVerificationChecks(
     server2Domains,
     log,
     pairId,
+    fcrdnsRetryBackoff,
   } = params;
 
   // All domains to check: NS domain + all sending domains.
@@ -1412,79 +1424,125 @@ export async function runVerificationChecks(
   }
 
   // Check 21: FCrDNS (Forward-confirmed rDNS)
+  //
+  // When `fcrdnsRetryBackoff` is true (VG2 path, 2026-04-22), the probe retries
+  // up to 3 attempts with 10-minute spacing to absorb Linode authoritative
+  // `*.ip.linodeusercontent.com` → public-resolver cache lag. Two 10-min
+  // inter-attempt sleeps = 20 min of added VG2 wall-clock, which fits inside
+  // the 30-min pg-boss queue expire envelope (HL #94). VG1 keeps the default
+  // single-attempt semantics — a VG1 miss is expected to trigger auto-fix
+  // (`fix_ptr` sets PTR via the Linode API), and only VG2 sees propagation lag.
   log('[VG] Running check 21: FCrDNS (Forward-confirmed rDNS)');
-  for (const [sshn, name, ip] of [
-    [ssh1, 'S1', server1IP] as const,
-    [ssh2, 'S2', server2IP] as const,
-  ]) {
-    try {
-      // Reverse DNS lookup — HL #102: must use recursive resolver (reverseResolver),
-      // not authoritativeResolver. S1's BIND refuses to recurse for external queries.
-      const ptrResult = await ssh1.exec(`dig -x ${ip} +short @${reverseResolver} 2>/dev/null`, {
-        timeout: 15000,
-      });
-      const ptrName = ptrResult.stdout.trim().replace(/\.$/, '');
+  const FCRDNS_MAX_ATTEMPTS = fcrdnsRetryBackoff ? 3 : 1;
+  const FCRDNS_RETRY_DELAY_MS = 10 * 60 * 1000;
 
-      if (!ptrName) {
-        results.push({
+  const probeFcrdnsOnce = async (): Promise<VerificationResult[]> => {
+    const out: VerificationResult[] = [];
+    for (const [, name, ip] of [
+      [ssh1, 'S1', server1IP] as const,
+      [ssh2, 'S2', server2IP] as const,
+    ]) {
+      try {
+        // Reverse DNS lookup — HL #102: must use recursive resolver (reverseResolver),
+        // not authoritativeResolver. S1's BIND refuses to recurse for external queries.
+        const ptrResult = await ssh1.exec(`dig -x ${ip} +short @${reverseResolver} 2>/dev/null`, {
+          timeout: 15000,
+        });
+        const ptrName = ptrResult.stdout.trim().replace(/\.$/, '');
+
+        if (!ptrName) {
+          out.push({
+            check: 'fcrdns',
+            domain: 'both',
+            server: name,
+            status: 'auto_fixable',
+            details: `No PTR record found for ${ip}`,
+            fixAction: 'fix_ptr',
+          });
+          continue;
+        }
+
+        const expectedPTR = name === 'S1' ? `mail1.${nsDomain}` : `mail2.${nsDomain}`;
+
+        // Forward DNS lookup of PTR — authoritativeResolver is correct here
+        // because mail{1|2}.{nsDomain} is in our own zone.
+        const aResult = await ssh1.exec(
+          `dig +short ${ptrName} A @${primaryResolver} 2>/dev/null`,
+          { timeout: 15000 }
+        );
+        const aIPs = aResult.stdout.trim().split('\n').filter(Boolean);
+
+        const fcrdnsIssues: string[] = [];
+
+        if (ptrName !== expectedPTR && ptrName !== `${expectedPTR}.`) {
+          fcrdnsIssues.push(`PTR mismatch: ${ptrName} != ${expectedPTR}`);
+        }
+
+        if (!aIPs.includes(ip)) {
+          fcrdnsIssues.push(`Forward lookup of ${ptrName} does not resolve to ${ip}`);
+        }
+
+        if (fcrdnsIssues.length > 0) {
+          out.push({
+            check: 'fcrdns',
+            domain: 'both',
+            server: name,
+            status: 'auto_fixable',
+            details: `FCrDNS issues: ${fcrdnsIssues.join('; ')}`,
+            fixAction: 'fix_ptr',
+          });
+        } else {
+          out.push({
+            check: 'fcrdns',
+            domain: 'both',
+            server: name,
+            status: 'pass',
+            details: `FCrDNS confirmed: ${ip} <-> ${ptrName}`,
+          });
+        }
+      } catch (err) {
+        out.push({
           check: 'fcrdns',
           domain: 'both',
           server: name,
-          status: 'auto_fixable',
-          details: `No PTR record found for ${ip}`,
-          fixAction: 'fix_ptr',
-        });
-        continue;
-      }
-
-      const expectedPTR = name === 'S1' ? `mail1.${nsDomain}` : `mail2.${nsDomain}`;
-
-      // Forward DNS lookup of PTR — authoritativeResolver is correct here
-      // because mail{1|2}.{nsDomain} is in our own zone.
-      const aResult = await ssh1.exec(
-        `dig +short ${ptrName} A @${primaryResolver} 2>/dev/null`,
-        { timeout: 15000 }
-      );
-      const aIPs = aResult.stdout.trim().split('\n').filter(Boolean);
-
-      const fcrdnsIssues: string[] = [];
-
-      if (ptrName !== expectedPTR && ptrName !== `${expectedPTR}.`) {
-        fcrdnsIssues.push(`PTR mismatch: ${ptrName} != ${expectedPTR}`);
-      }
-
-      if (!aIPs.includes(ip)) {
-        fcrdnsIssues.push(`Forward lookup of ${ptrName} does not resolve to ${ip}`);
-      }
-
-      if (fcrdnsIssues.length > 0) {
-        results.push({
-          check: 'fcrdns',
-          domain: 'both',
-          server: name,
-          status: 'auto_fixable',
-          details: `FCrDNS issues: ${fcrdnsIssues.join('; ')}`,
-          fixAction: 'fix_ptr',
-        });
-      } else {
-        results.push({
-          check: 'fcrdns',
-          domain: 'both',
-          server: name,
-          status: 'pass',
-          details: `FCrDNS confirmed: ${ip} <-> ${ptrName}`,
+          status: 'manual_required',
+          details: `Error checking FCrDNS: ${err instanceof Error ? err.message : String(err)}`,
         });
       }
-    } catch (err) {
-      results.push({
-        check: 'fcrdns',
-        domain: 'both',
-        server: name,
-        status: 'manual_required',
-        details: `Error checking FCrDNS: ${err instanceof Error ? err.message : String(err)}`,
-      });
     }
+    return out;
+  };
+
+  let fcrdnsResults: VerificationResult[] = [];
+  for (let attempt = 1; attempt <= FCRDNS_MAX_ATTEMPTS; attempt++) {
+    fcrdnsResults = await probeFcrdnsOnce();
+    const allPassing = fcrdnsResults.every((r) => r.status === 'pass');
+    if (allPassing) {
+      if (attempt > 1) {
+        log(`[VG] fcrdns passed on attempt ${attempt}/${FCRDNS_MAX_ATTEMPTS} after backoff`);
+      }
+      break;
+    }
+    if (attempt === FCRDNS_MAX_ATTEMPTS) {
+      if (FCRDNS_MAX_ATTEMPTS > 1) {
+        const waitedMin = Math.round(((attempt - 1) * FCRDNS_RETRY_DELAY_MS) / 60000);
+        fcrdnsResults = fcrdnsResults.map((r) =>
+          r.status === 'pass'
+            ? r
+            : {
+                ...r,
+                details: `fcrdns retry exhausted after ${attempt} attempts (${waitedMin} min): ${r.details}`,
+              }
+        );
+      }
+      break;
+    }
+    log(
+      `[VG] fcrdns attempt ${attempt}/${FCRDNS_MAX_ATTEMPTS} had non-pass results — waiting 10 min for PTR propagation before retry...`
+    );
+    await new Promise((r) => setTimeout(r, FCRDNS_RETRY_DELAY_MS));
   }
+  results.push(...fcrdnsResults);
 
   // Check 22: SMTP STARTTLS
   log('[VG] Running check 22: SMTP STARTTLS');

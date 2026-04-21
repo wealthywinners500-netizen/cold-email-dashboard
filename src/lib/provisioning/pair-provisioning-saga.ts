@@ -1889,15 +1889,20 @@ export function createPairProvisioningSaga(
     },
 
     // ========================================
-    // Step 11: VERIFICATION_GATE_2 (~2-5 min)
+    // Step 11: VERIFICATION_GATE_2 (~2-25 min)
     // Re-runs the same checks as VG1 to confirm fixes worked.
     // Pass = done. ANY failure = hard fail (success: false).
     // Max 2 passes total (VG1 + VG2), never loop.
+    //
+    // 2026-04-22: fcrdnsRetryBackoff enabled on the VG2 call — the fcrdns
+    // check retries up to 3 attempts with 10-min spacing (max 20 min wait)
+    // to absorb Linode PTR propagation lag. estimatedDurationMs sized for
+    // that worst case; still fits inside the 30-min pg-boss queue envelope.
     // ========================================
     {
       name: 'Verification Gate 2',
       type: 'verification_gate_2' as const,
-      estimatedDurationMs: 300_000,
+      estimatedDurationMs: 1_500_000, // 25 min: other checks ~5 min + fcrdns retry waits up to 20 min
 
       async execute(context: ProvisioningContext): Promise<StepResult> {
         context.log('[Step 11] Running Verification Gate 2 (post-fix verification)...');
@@ -1916,6 +1921,7 @@ export function createPairProvisioningSaga(
             server1Domains: s1Domains,
             server2Domains: s2Domains,
             log: context.log,
+            fcrdnsRetryBackoff: true,
           });
 
           const passing = verificationResults.filter(r => r.status === 'pass');
