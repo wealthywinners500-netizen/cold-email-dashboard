@@ -1169,54 +1169,19 @@ export function createPairProvisioningSaga(
             context.log(`[Step 6] mail/webmail A fixed for ${domain}: mail A → ${server2IP}, webmail A → ${server2IP} (AXFR propagates to S1 slave)`);
           }
 
-          // PATCH 10c: Replicate SPF/DKIM/DMARC DNS records to the OTHER server.
-          // Both servers serve DNS (ns1=S1, ns2=S2). createMailDomain only adds
-          // auth records to the assigned server's zone. Without replication,
-          // DNS queries hitting the "wrong" server return nothing → VG fails.
-          context.log('[Step 6] Replicating SPF/DKIM/DMARC to cross-server zones...');
-          const replicationPairs: Array<{ domains: string[]; sourceSSH: typeof ssh1; targetSSH: typeof ssh2; sourceLabel: string; targetLabel: string; serverIP: string }> = [
-            { domains: server1Domains, sourceSSH: ssh1, targetSSH: ssh2, sourceLabel: 'S1', targetLabel: 'S2', serverIP: server1IP },
-            { domains: server2Domains, sourceSSH: ssh2, targetSSH: ssh1, sourceLabel: 'S2', targetLabel: 'S1', serverIP: server2IP },
-          ];
-
-          for (const { domains, sourceSSH, targetSSH, sourceLabel, targetLabel, serverIP } of replicationPairs) {
-            for (const domain of domains) {
-              try {
-                // Read DNS records from source server to get DKIM and DMARC values
-                const { stdout: jsonRecords } = await sourceSSH.exec(
-                  `${HESTIA_PATH_PREFIX}v-list-dns-records admin ${domain} json`,
-                  { timeout: 15000 }
-                );
-                const parsed = JSON.parse(jsonRecords || '{}') as Record<string, { RECORD: string; TYPE: string; VALUE: string }>;
-
-                for (const rec of Object.values(parsed)) {
-                  const host = rec.RECORD;
-                  const rtype = rec.TYPE;
-                  const value = rec.VALUE;
-
-                  // Replicate SPF (@ TXT with spf1), DKIM (mail._domainkey TXT), DMARC (_dmarc TXT), and BIMI (default._bimi TXT)
-                  const isSPF = rtype === 'TXT' && host === '@' && value.includes('spf1');
-                  const isDKIM = rtype === 'TXT' && host === 'mail._domainkey';
-                  const isDMARC = rtype === 'TXT' && host === '_dmarc';
-                  const isBIMI = rtype === 'TXT' && host === 'default._bimi';
-
-                  if (isSPF || isDKIM || isDMARC || isBIMI) {
-                    // Use single quotes around value to prevent shell interpretation
-                    const safeValue = value.replace(/'/g, "'\\''");
-                    await targetSSH.exec(
-                      `${HESTIA_PATH_PREFIX}v-add-dns-record admin ${domain} ${host} TXT '${safeValue}'`,
-                      { timeout: 10000 }
-                    ).catch(() => {
-                      // Record may already exist — not fatal
-                    });
-                  }
-                }
-                context.log(`[Step 6] Replicated auth DNS for ${domain}: ${sourceLabel} → ${targetLabel}`);
-              } catch (err) {
-                context.log(`[Step 6] Warning: DNS replication for ${domain} ${sourceLabel}→${targetLabel}: ${err}`);
-              }
-            }
-          }
+          // PATCH 10d-2 (HL #101 / post-PR #4): the previous cross-server SPF/DKIM/
+          // DMARC/BIMI TXT replication block was from the dual-primary era. Each
+          // auth record was written to its owning zone above, then mirrored to the
+          // peer via `v-add-dns-record` on the peer's Hestia. Post-PR #4, the peer
+          // holds these zones as BIND slaves only (installSlaveZones); `v-add-dns-
+          // record` on the peer returns exit 3/4 and the block's .catch(() => {})
+          // silently swallowed it. AXFR/NOTIFY (set up by PR #4 + reinforced by
+          // PR #8's named.conf.options) propagates SPF/DKIM/DMARC/BIMI TXT from
+          // the owning primary to the peer slave automatically.
+          //
+          // Removed: the cross-server replication loop that wrote to the non-owning
+          // Hestia (now obsolete; AXFR handles it).
+          context.log('[Step 6] Auth records (SPF/DKIM/DMARC/BIMI) propagate owner→peer via AXFR/NOTIFY — no cross-server write needed.');
 
           // DMARC rua/ruf reporting mailbox — collects aggregate reports from Gmail,
           // Microsoft, Yahoo, etc. The rua/ruf tags in the DMARC TXT records point
