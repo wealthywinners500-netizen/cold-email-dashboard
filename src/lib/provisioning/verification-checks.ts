@@ -25,51 +25,45 @@ function normalizeTxtRecord(line: string): string {
 }
 
 /**
- * Pure helper: validate an SOA serial's format against the MXToolbox Domain
- * Health UI gate discovered during the 2026-04-22 P14 parity pass.
+ * Pure helper: validate an SOA serial's format.
  *
- * Returns an object describing validation state. Callers decide whether to
- * route the fix to `fix_soa_serial_format` (bad-format or bad-date) or `fix_soa`
- * (valid format but bad timers).
+ * Format-only check (no date-freshness comparison):
+ *   1. Must be 10 digits matching `^\d{4}\d{2}\d{2}\d{2}$` (YYYYMMDDNN).
+ *   2. Month portion must be 01-12.
+ *   3. Day portion must be 01-31.
  *
- * Rules (in order):
- *   1. Must match `^\\d{4}\\d{2}\\d{2}\\d{2}$` (10-digit YYYYmmddNN).
- *   2. The yyyymmdd portion must be STRICTLY LESS than today_UTC (date
- *      component only). Equal-to-today or future-dated serials fail.
+ * The previous rule (PR #18, 2026-04-22) additionally rejected serials whose
+ * yyyymmdd portion was today_UTC or later. That rule was derived from one
+ * observation on P14/savini.info (see
+ * `reports/2026-04-22-p13-vs-p14-investigation.md:118`) and was refuted by
+ * P15-v2 Attempt 3 (2026-04-22): 11 zones with today-UTC serials
+ * (`2026042229+`) returned PERFECT on MXToolbox. SOA correctness is already
+ * enforced at creation time by Step 2's HL #107 `patchDomainSHSOATemplate`
+ * (domain.sh rewrite) plus `setDomainSOA` in Steps 5/7; format-only
+ * validation here is the residual safety net.
  *
- * The rules are derived from empirical MXToolbox UI behavior (see
- * `reports/2026-04-22-p13-vs-p14-investigation.md`), not from MXToolbox's
- * public `/problem/dns/dns-soa-serial-format-valid` doc — which 404s as of
- * 2026-04-22 but historically described a looser "YYYYMMDDNN" shape. UI
- * enforcement is stricter than docs (HL #110 F2 pattern).
- *
- * @param serial    10-digit serial string from `dig +short SOA`
- * @param now       current time (injectable for deterministic testing)
+ * @param serial 10-digit serial string from `dig +short SOA`
  */
 export function validateSOASerialFormat(
-  serial: string,
-  now: Date = new Date()
+  serial: string
 ): { ok: boolean; issue?: string } {
   const match = /^(\d{4})(\d{2})(\d{2})(\d{2})$/.exec(serial);
   if (!match) {
     return { ok: false, issue: `Serial ${serial} not in YYYYMMDDNN format` };
   }
-  const [, yStr, mStr, dStr] = match;
-  const serialDate = Date.UTC(
-    parseInt(yStr, 10),
-    parseInt(mStr, 10) - 1,
-    parseInt(dStr, 10)
-  );
-  const todayUTC = Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate()
-  );
-  if (serialDate >= todayUTC) {
-    const todayStr = new Date(todayUTC).toISOString().slice(0, 10);
+  const [, , mStr, dStr] = match;
+  const month = parseInt(mStr, 10);
+  const day = parseInt(dStr, 10);
+  if (month < 1 || month > 12) {
     return {
       ok: false,
-      issue: `Serial ${serial} yyyymmdd=${yStr}-${mStr}-${dStr} is today-UTC or future (today_UTC=${todayStr}) — MXToolbox flags this as "SOA Serial Number Format is Invalid" until the date rolls over`,
+      issue: `Serial ${serial} has invalid month ${mStr} (expected 01-12)`,
+    };
+  }
+  if (day < 1 || day > 31) {
+    return {
+      ok: false,
+      issue: `Serial ${serial} has invalid day ${dStr} (expected 01-31)`,
     };
   }
   return { ok: true };
@@ -502,14 +496,14 @@ export async function runVerificationChecks(
       const minTTL = parseInt(soaParts[6], 10);
 
       const issues: string[] = [];
-      let serialFormatBad = false;
+      let serialFormatInvalid = false;
 
-      // See validateSOASerialFormat above for the rule set. Injects `new Date()`
-      // at runtime; the helper is pure for testability.
+      // See validateSOASerialFormat above — format-only check (10-digit
+      // YYYYMMDDNN, month 01-12, day 01-31). No date-freshness comparison.
       const serialCheck = validateSOASerialFormat(serial);
       if (!serialCheck.ok) {
         issues.push(serialCheck.issue!);
-        serialFormatBad = true;
+        serialFormatInvalid = true;
       }
 
       // Check refresh >= 3600
@@ -533,17 +527,30 @@ export async function runVerificationChecks(
       }
 
       if (issues.length > 0) {
-        // Serial format is a distinct failure mode from timer issues — it
-        // requires a zone-file serial rewrite + peer AXFR retransfer, which
-        // `fix_soa` (v-change-dns-domain-soa) cannot do on its own.
-        results.push({
-          check: 'soa_record',
-          domain,
-          server,
-          status: 'auto_fixable',
-          details: `SOA issues: ${issues.join('; ')}`,
-          fixAction: serialFormatBad ? 'fix_soa_serial_format' : 'fix_soa',
-        });
+        // Malformed serials indicate deeper state corruption — Hestia's
+        // `update_domain_serial` always emits a well-formed YYYYMMDDNN, so
+        // reaching this branch means something outside the saga touched the
+        // zone. No auto-fix path exists; surface for manual inspection.
+        // Timer issues remain auto-fixable via `fix_soa`
+        // (`v-change-dns-domain-soa`).
+        if (serialFormatInvalid) {
+          results.push({
+            check: 'soa_record',
+            domain,
+            server,
+            status: 'manual_required',
+            details: `SOA issues: ${issues.join('; ')}`,
+          });
+        } else {
+          results.push({
+            check: 'soa_record',
+            domain,
+            server,
+            status: 'auto_fixable',
+            details: `SOA issues: ${issues.join('; ')}`,
+            fixAction: 'fix_soa',
+          });
+        }
       } else {
         results.push({
           check: 'soa_record',
