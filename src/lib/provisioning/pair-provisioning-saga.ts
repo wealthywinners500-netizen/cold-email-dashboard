@@ -39,6 +39,7 @@ import {
   setGlobalZoneTransferPolicy,
   installSlaveZones,
   openBindFirewall,
+  patchDomainSHSOATemplate,
   HESTIA_PATH_PREFIX,
 } from './hestia-scripts';
 import { generateAccountNamesForPair } from './name-generator';
@@ -396,11 +397,36 @@ export function createPairProvisioningSaga(
           await setHostname(ssh1, `mail1.${context.nsDomain}`);
           await setHostname(ssh2, `mail2.${context.nsDomain}`);
 
+          // HL #107 durable fix: patch domain.sh SOA block BEFORE any zone is
+          // created (Step 4 setup_dns_zones). Without this, every zone
+          // HestiaCP generates bakes in the factory SOA timers
+          // (7200 $refresh 1209600 180), which MXToolbox flags as "out of
+          // recommended range" and drags through every subsequent zone-touching
+          // CLI call (v-add-dns-record, v-add-letsencrypt-domain, etc.). P13
+          // passed MXToolbox 0/0 because this patch was applied manually
+          // during Session 04d operational backfill; P14 hit warnings until
+          // the 2026-04-22 live parity pass. See
+          // `reports/2026-04-22-p13-vs-p14-investigation.md` §4.
+          context.log('[Step 2] Applying HL #107 domain.sh SOA template patch on both servers...');
+          try {
+            await patchDomainSHSOATemplate(ssh1);
+            await patchDomainSHSOATemplate(ssh2);
+            context.log('[Step 2] HL #107 domain.sh patch applied (or confirmed idempotent) on both servers.');
+          } catch (patchErr) {
+            const msg = patchErr instanceof Error ? patchErr.message : String(patchErr);
+            return {
+              success: false,
+              error: `Step 2 failed: domain.sh HL #107 patch did not apply — ${msg}`,
+              output: outputLines.join('\n'),
+            };
+          }
+
           return {
             success: true,
-            output: `HestiaCP installed on both servers. ${outputLines.length} log lines captured.`,
+            output: `HestiaCP installed on both servers. ${outputLines.length} log lines captured. HL #107 domain.sh patch applied.`,
             metadata: {
               hestiaCPInstalled: true,
+              hl107PatchApplied: true,
             },
           };
         } catch (err) {
