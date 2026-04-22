@@ -25,6 +25,57 @@ function normalizeTxtRecord(line: string): string {
 }
 
 /**
+ * Pure helper: validate an SOA serial's format against the MXToolbox Domain
+ * Health UI gate discovered during the 2026-04-22 P14 parity pass.
+ *
+ * Returns an object describing validation state. Callers decide whether to
+ * route the fix to `fix_soa_serial_format` (bad-format or bad-date) or `fix_soa`
+ * (valid format but bad timers).
+ *
+ * Rules (in order):
+ *   1. Must match `^\\d{4}\\d{2}\\d{2}\\d{2}$` (10-digit YYYYmmddNN).
+ *   2. The yyyymmdd portion must be STRICTLY LESS than today_UTC (date
+ *      component only). Equal-to-today or future-dated serials fail.
+ *
+ * The rules are derived from empirical MXToolbox UI behavior (see
+ * `reports/2026-04-22-p13-vs-p14-investigation.md`), not from MXToolbox's
+ * public `/problem/dns/dns-soa-serial-format-valid` doc — which 404s as of
+ * 2026-04-22 but historically described a looser "YYYYMMDDNN" shape. UI
+ * enforcement is stricter than docs (HL #110 F2 pattern).
+ *
+ * @param serial    10-digit serial string from `dig +short SOA`
+ * @param now       current time (injectable for deterministic testing)
+ */
+export function validateSOASerialFormat(
+  serial: string,
+  now: Date = new Date()
+): { ok: boolean; issue?: string } {
+  const match = /^(\d{4})(\d{2})(\d{2})(\d{2})$/.exec(serial);
+  if (!match) {
+    return { ok: false, issue: `Serial ${serial} not in YYYYMMDDNN format` };
+  }
+  const [, yStr, mStr, dStr] = match;
+  const serialDate = Date.UTC(
+    parseInt(yStr, 10),
+    parseInt(mStr, 10) - 1,
+    parseInt(dStr, 10)
+  );
+  const todayUTC = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate()
+  );
+  if (serialDate >= todayUTC) {
+    const todayStr = new Date(todayUTC).toISOString().slice(0, 10);
+    return {
+      ok: false,
+      issue: `Serial ${serial} yyyymmdd=${yStr}-${mStr}-${dStr} is today-UTC or future (today_UTC=${todayStr}) — MXToolbox flags this as "SOA Serial Number Format is Invalid" until the date rolls over`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
  * Comprehensive verification checks for HestiaCP mail server provisioning.
  * Implements 36 checks across DNS, authentication, SMTP, SSL, and blacklist categories.
  * Called by both Verification Gate 1 (VG1) and Verification Gate 2 (VG2).
@@ -451,10 +502,14 @@ export async function runVerificationChecks(
       const minTTL = parseInt(soaParts[6], 10);
 
       const issues: string[] = [];
+      let serialFormatBad = false;
 
-      // Check serial format (YYYYMMDDNN)
-      if (!/^\d{10}$/.test(serial)) {
-        issues.push(`Serial ${serial} not in YYYYMMDDNN format`);
+      // See validateSOASerialFormat above for the rule set. Injects `new Date()`
+      // at runtime; the helper is pure for testability.
+      const serialCheck = validateSOASerialFormat(serial);
+      if (!serialCheck.ok) {
+        issues.push(serialCheck.issue!);
+        serialFormatBad = true;
       }
 
       // Check refresh >= 3600
@@ -478,13 +533,16 @@ export async function runVerificationChecks(
       }
 
       if (issues.length > 0) {
+        // Serial format is a distinct failure mode from timer issues — it
+        // requires a zone-file serial rewrite + peer AXFR retransfer, which
+        // `fix_soa` (v-change-dns-domain-soa) cannot do on its own.
         results.push({
           check: 'soa_record',
           domain,
           server,
           status: 'auto_fixable',
           details: `SOA issues: ${issues.join('; ')}`,
-          fixAction: 'fix_soa',
+          fixAction: serialFormatBad ? 'fix_soa_serial_format' : 'fix_soa',
         });
       } else {
         results.push({

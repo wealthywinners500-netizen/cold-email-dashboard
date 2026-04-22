@@ -282,12 +282,145 @@ async function cleanupDNSZoneDefaults(
   // Minimum TTL Value out of recommended range" warnings. Use RFC 1912 §2.2
   // safe values: Refresh 3600 (1hr), Retry 600 (10min), Expire 2419200 (4wk),
   // Minimum 3600 (1hr).
-  await ssh.exec(
-    `${HESTIA_PATH_PREFIX}v-change-dns-domain-soa admin ${domain} ns1.${nsDomain} '' 3600 600 2419200 3600`,
-    { timeout: 10000 }
-  ).catch(() => {
-    // Some HestiaCP versions don't have this command; we'll handle it via record editing
-  });
+  //
+  // HestiaCP 1.9.4 `v-change-dns-domain-soa` signature is `USER DOMAIN SOA
+  // [RESTART]` — the trailing 4 timer args are silently ignored. We pass them
+  // anyway (future-compat) but the actual timer enforcement comes from
+  // `patchDomainSHSOATemplate` which rewrites the hardcoded SOA block in
+  // `/usr/local/hestia/func/domain.sh` before any zone is created. This call
+  // here triggers `update_domain_zone()` which uses the patched template and
+  // updates the zone file MNAME.
+  //
+  // Prior behaviour swallowed all errors with `.catch(() => {})`, masking
+  // config drift (the P14 parity-to-P13 incident of 2026-04-22). We now
+  // surface unexpected failures.
+  try {
+    await ssh.exec(
+      `${HESTIA_PATH_PREFIX}v-change-dns-domain-soa admin ${domain} ns1.${nsDomain} '' 3600 600 2419200 3600`,
+      { timeout: 10000 }
+    );
+  } catch (err: unknown) {
+    const e = err as SSHCommandError | Error;
+    const stderr = (e as SSHCommandError)?.stderr ?? '';
+    const stdout = (e as SSHCommandError)?.stdout ?? '';
+    const msg = (e as Error)?.message ?? String(err);
+    // HestiaCP versions <1.x may lack this command entirely — "command not
+    // found" / "not installed" / exit 127 is the only failure we tolerate.
+    const notFound =
+      /command not found/i.test(stderr) ||
+      /command not found/i.test(msg) ||
+      /127/.test(String((e as SSHCommandError)?.code ?? ''));
+    if (!notFound) {
+      throw new Error(
+        `v-change-dns-domain-soa failed on ${domain} (non-ENOENT): code=${(e as SSHCommandError)?.code}; stderr=${stderr}; stdout=${stdout}; msg=${msg}`
+      );
+    }
+    // else: older Hestia — caller expected to have patched domain.sh, which
+    // takes effect on the next zone regen via any other DNS-modifying call.
+  }
+}
+
+/**
+ * HL #107 durable fix: patch `/usr/local/hestia/func/domain.sh` so the
+ * `update_domain_zone()` function's hardcoded SOA block uses RFC 1912 §2.2
+ * MXToolbox-safe timer values (`3600 600 2419200 3600`) instead of the
+ * HestiaCP factory defaults (`7200 $refresh 1209600 180`). Every subsequent
+ * zone regen — triggered by `v-add-dns-record`, `v-delete-dns-record`,
+ * `v-change-dns-domain-soa`, `v-rebuild-dns-domain`, or any Hestia CLI call
+ * that internally rebuilds (e.g. `v-add-letsencrypt-domain`) — writes the
+ * zone file from this template, so HL #107 timers persist through the full
+ * lifecycle of the pair.
+ *
+ * Idempotent via a bash-comment marker placed ABOVE the
+ * `update_domain_zone()` function. The marker MUST NOT appear inside the
+ * zone-template echo block — prior patch attempts that inlined the marker
+ * there leaked `# HL-107-patched` into zone files and broke
+ * `named-checkzone` with "near '#': extra input text" (observed during the
+ * P14 parity pass on 2026-04-22).
+ *
+ * Background: P13 (launta.info) received this patch manually during the
+ * 2026-04-19/20 Session 04d operational backfill and passes MXToolbox 0/0.
+ * P14 (savini.info) shipped without it and hit "SOA Serial Number Format is
+ * Invalid" / factory timers until the 2026-04-22 live parity pass. This
+ * function promotes that manual backfill into a deterministic saga step so
+ * all future pairs (P15+) inherit HL #107 timers from provisioning time.
+ *
+ * Failure modes:
+ *   - marker present → idempotent no-op (logs "already applied").
+ *   - factory SOA block not found → throws (HestiaCP version drift; halt
+ *     and escalate rather than apply a best-guess patch).
+ */
+export async function patchDomainSHSOATemplate(ssh: SSHManager): Promise<void> {
+  // The Python heredoc is single-quoted (`<<'PYEOF'`) so bash does not expand
+  // `$SERIAL`, `$refresh`, or any `$var` in the match/replace strings.
+  const script = [
+    'set -e',
+    "MARKER_SUBSTRING='HL-107-patched'",
+    'DOMAIN_SH=/usr/local/hestia/func/domain.sh',
+    'if [ ! -f "$DOMAIN_SH" ]; then',
+    '  echo "ERROR: $DOMAIN_SH not found (HestiaCP not installed?)" >&2',
+    '  exit 2',
+    'fi',
+    'if grep -q "$MARKER_SUBSTRING" "$DOMAIN_SH"; then',
+    '  echo "HL-107 domain.sh patch already applied — skipping."',
+    '  exit 0',
+    'fi',
+    "python3 - <<'PYEOF'",
+    'import sys',
+    "path = '/usr/local/hestia/func/domain.sh'",
+    "with open(path, 'r') as f:",
+    '    s = f.read()',
+    '',
+    "# Factory SOA block inside update_domain_zone() — matches Hestia 1.9.x.",
+    '# Matches the exact whitespace/lines as written by the echo statement.',
+    'factory = (',
+    "    '                                            $SERIAL\\n'",
+    "    '                                            7200\\n'",
+    "    '                                            $refresh\\n'",
+    "    '                                            1209600\\n'",
+    "    '                                            180 )\\n'",
+    ')',
+    'patched = (',
+    "    '                                            $SERIAL\\n'",
+    "    '                                            3600\\n'",
+    "    '                                            600\\n'",
+    "    '                                            2419200\\n'",
+    "    '                                            3600 )\\n'",
+    ')',
+    '',
+    'if factory not in s:',
+    "    print('ERROR: factory SOA block not found in domain.sh — HestiaCP version drift', file=sys.stderr)",
+    '    sys.exit(1)',
+    '',
+    's2 = s.replace(factory, patched, 1)',
+    "MARKER = '# HL-107-patched: SOA block uses 3600/600/2419200/3600 instead of factory 7200/$refresh/1209600/180'",
+    "anchor = '# Update domain zone\\nupdate_domain_zone() {'",
+    'if anchor in s2:',
+    "    s2 = s2.replace(anchor, MARKER + '\\n' + anchor, 1)",
+    'else:',
+    "    print('WARN: anchor not found — marker prepended to file', file=sys.stderr)",
+    "    s2 = MARKER + '\\n' + s2",
+    '',
+    "with open(path, 'w') as f:",
+    '    f.write(s2)',
+    "print('HL-107 domain.sh patch applied')",
+    'PYEOF',
+    'grep -q "$MARKER_SUBSTRING" "$DOMAIN_SH" && echo "marker confirmed"',
+  ].join('\n');
+
+  const result = await ssh.exec(script, { timeout: 30000 });
+  if (result.code !== 0) {
+    throw new Error(
+      `patchDomainSHSOATemplate failed on ${ssh.constructor.name}: code=${result.code}; stderr=${result.stderr}; stdout=${result.stdout}`
+    );
+  }
+  if (
+    !/HL-107 domain.sh patch applied|already applied/.test(result.stdout)
+  ) {
+    throw new Error(
+      `patchDomainSHSOATemplate did not confirm apply/skip: stdout=${result.stdout}; stderr=${result.stderr}`
+    );
+  }
 }
 
 /**

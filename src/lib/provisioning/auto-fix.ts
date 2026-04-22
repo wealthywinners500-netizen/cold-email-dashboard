@@ -1057,6 +1057,182 @@ async function addBIMI(
  * — which would re-create the slave zone as a Hestia-managed primary,
  * breaking the AXFR relationship and reintroducing dual-primary drift.
  */
+/**
+ * Fix SOA serial format: rewrite serial so yyyymmdd < today_UTC.
+ *
+ * HL-new 2026-04-22 (P14 parity pass): MXToolbox's Domain Health UI raises
+ * "SOA Serial Number Format is Invalid" on any serial whose yyyymmdd portion
+ * is today_UTC or future, regardless of the NN counter value. Empirically
+ * confirmed on P14 — zones with serial `2026042203` (counter 03, yyyymmdd =
+ * today UTC) were flagged at 03:05 UTC; rewriting to `2026042130` (counter
+ * 30, yyyymmdd = yesterday UTC) cleared the warning on the next scan.
+ *
+ * Mechanism:
+ *   1. Direct-edit the OWNING server's zone file: replace SOA serial line
+ *      with yesterday-dated value (yyyymmdd = today_UTC - 1 day, NN chosen
+ *      to be strictly unique per zone + numerically less than the prior
+ *      serial so we can force a retransfer).
+ *   2. Update HestiaCP metadata `/usr/local/hestia/data/users/admin/dns.conf`
+ *      so the next Hestia CLI call does not bump from the stale (today-
+ *      dated) value and reset the fix.
+ *   3. named-checkzone validate.
+ *   4. rndc reload $zone on owning server.
+ *   5. rndc retransfer $zone on peer — bypasses RFC 1982 serial comparison
+ *      (which would otherwise reject the lower serial as "older" via normal
+ *      NOTIFY/IXFR). Peer AXFR-pulls the rewritten zone.
+ *
+ * Direct zone-file editing of the SOA serial is the documented exception to
+ * HL #108 (never direct-edit Hestia zone files): HestiaCP does not expose a
+ * CLI command that sets a specific serial; the only Hestia-sanctioned paths
+ * reset to `${today}01` or bump sequentially. Direct edit + metadata
+ * update + AXFR retransfer is the minimum-blast-radius operation.
+ */
+async function fixSOASerialFormat(
+  ssh1: SSHManager,
+  ssh2: SSHManager,
+  domain: string,
+  params: {
+    server1IP: string;
+    server2IP: string;
+    server1Domains: string[];
+    server2Domains: string[];
+    log: (msg: string) => void;
+  }
+): Promise<void> {
+  const { ssh: owningSSH, serverName: owningServer } = pickOwningServer(
+    domain,
+    ssh1,
+    ssh2,
+    params.server1Domains,
+    params.server2Domains
+  );
+  const peerSSH = owningSSH === ssh1 ? ssh2 : ssh1;
+  const peerServer = owningServer === 'S1' ? 'S2' : 'S1';
+
+  // Build "yyyymmddNN" where yyyymmdd = today_UTC - 1 day.
+  // NN pool 30..98 gives us >11 unique slots for an 11-zone pair.
+  const now = new Date();
+  const yesterday = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1)
+  );
+  const y = yesterday.getUTCFullYear().toString();
+  const m = (yesterday.getUTCMonth() + 1).toString().padStart(2, '0');
+  const d = yesterday.getUTCDate().toString().padStart(2, '0');
+  // Hash domain to a stable 2-digit NN in the 30..98 range so two zones on
+  // the same pair won't collide. The collision-avoidance guarantee is only
+  // probabilistic — if two zones hash to the same NN the subsequent zone's
+  // rewrite is a no-op but the MXToolbox gate still passes (yyyymmdd <
+  // today), so this is acceptable.
+  let h = 0;
+  for (let i = 0; i < domain.length; i++) {
+    h = (h * 31 + domain.charCodeAt(i)) >>> 0;
+  }
+  const nn = (30 + (h % 69)).toString().padStart(2, '0');
+  const newSerial = `${y}${m}${d}${nn}`;
+
+  params.log(
+    `[Auto-Fix] fix_soa_serial_format/${owningServer}: ${domain} → serial ${newSerial} (yesterday-dated, bypasses MXToolbox "SOA Serial Number Format is Invalid")`
+  );
+
+  const remoteScript = [
+    'set -e',
+    `DOMAIN='${domain}'`,
+    `NEW_SERIAL='${newSerial}'`,
+    'DB=/home/admin/conf/dns/${DOMAIN}.db',
+    'META=/usr/local/hestia/data/users/admin/dns.conf',
+    'if [ ! -f "$DB" ]; then',
+    '  echo "ERROR: zone file not found: $DB" >&2',
+    '  exit 2',
+    'fi',
+    'BACKUP=/root/backups-auto-fix/$(date -u +%Y%m%dT%H%M%SZ)',
+    'mkdir -p "$BACKUP"',
+    'cp "$DB" "$BACKUP/$(basename $DB).bak"',
+    'cp "$META" "$BACKUP/dns.conf.bak"',
+    "python3 - <<'PYEOF'",
+    'import sys, os, re',
+    'db = os.environ["DB"]',
+    'meta = os.environ["META"]',
+    'domain = os.environ["DOMAIN"]',
+    'new = os.environ["NEW_SERIAL"]',
+    "with open(db, 'r') as f:",
+    '    content = f.read()',
+    'new_content = re.sub(',
+    "    r'(@\\s+IN\\s+SOA\\s+\\S+\\s+\\S+\\s+\\(\\s*\\n\\s+)\\d{10}(\\s*\\n)',",
+    "    r'\\g<1>' + new + r'\\g<2>',",
+    '    content,',
+    '    count=1,',
+    ')',
+    'if new_content == content:',
+    "    print(f'ERROR: no serial match in {db}', file=sys.stderr)",
+    '    sys.exit(1)',
+    "with open(db, 'w') as f:",
+    '    f.write(new_content)',
+    "with open(meta, 'r') as f:",
+    '    lines = f.readlines()',
+    'out = []',
+    'for line in lines:',
+    '    if f"DOMAIN=\'{domain}\'" in line:',
+    '        line = re.sub(r"SERIAL=\'\\d+\'", f"SERIAL=\'{new}\'", line)',
+    '    out.append(line)',
+    "with open(meta, 'w') as f:",
+    '    f.writelines(out)',
+    "print('zone+metadata rewritten')",
+    'PYEOF',
+    'named-checkzone "$DOMAIN" "$DB" | tail -1',
+    'rndc reload "$DOMAIN" | head -1',
+  ].join('\n');
+
+  const result = await owningSSH.exec(
+    `DB=/home/admin/conf/dns/${domain}.db META=/usr/local/hestia/data/users/admin/dns.conf DOMAIN='${domain}' NEW_SERIAL='${newSerial}' bash -c ${JSON.stringify(remoteScript)}`,
+    { timeout: 20000 }
+  );
+  if (result.code !== 0) {
+    throw new Error(
+      `${owningServer} fixSOASerialFormat rewrite failed for ${domain}: code=${result.code}; stderr=${result.stderr}; stdout=${result.stdout}`
+    );
+  }
+  if (!/zone\+metadata rewritten/.test(result.stdout)) {
+    throw new Error(
+      `${owningServer} fixSOASerialFormat rewrite did not confirm for ${domain}: ${result.stdout}`
+    );
+  }
+  params.log(
+    `[Auto-Fix] fix_soa_serial_format/${owningServer}: ${domain} rewritten — ${result.stdout.split('\n').slice(-3).join(' | ')}`
+  );
+
+  // Force AXFR retransfer on peer to bypass RFC 1982 serial comparison
+  // (the new serial is numerically less than the prior serial so NOTIFY
+  // would be ignored).
+  const retransfer = await peerSSH.exec(`rndc retransfer ${domain}`, {
+    timeout: 15000,
+  });
+  if (retransfer.code !== 0) {
+    params.log(
+      `[Auto-Fix] fix_soa_serial_format/${peerServer}: rndc retransfer warning for ${domain}: ${retransfer.stderr}`
+    );
+  } else {
+    params.log(
+      `[Auto-Fix] fix_soa_serial_format/${peerServer}: AXFR retransfer triggered for ${domain}`
+    );
+  }
+
+  // Verify peer serial
+  await new Promise((r) => setTimeout(r, 1500));
+  const peerDig = await peerSSH.exec(
+    `dig +short SOA ${domain} @127.0.0.1 +time=5 +tries=2 2>/dev/null`,
+    { timeout: 10000 }
+  );
+  const peerSerial = (peerDig.stdout || '').trim().split(/\s+/)[2];
+  if (peerSerial !== newSerial) {
+    throw new Error(
+      `${peerServer} serial=${peerSerial || 'empty'} does not match expected ${newSerial} after retransfer`
+    );
+  }
+  params.log(
+    `[Auto-Fix] fix_soa_serial_format: verified — ${peerServer} now serving ${peerSerial} for ${domain}`
+  );
+}
+
 async function fixSOASerialSync(
   ssh1: SSHManager,
   ssh2: SSHManager,
@@ -1185,6 +1361,10 @@ export async function runAutoFixes(
 
         case 'fix_soa':
           await fixSOA(ssh1, ssh2, issue.domain, params);
+          break;
+
+        case 'fix_soa_serial_format':
+          await fixSOASerialFormat(ssh1, ssh2, issue.domain, params);
           break;
 
         case 'fix_soa_serial_sync':
