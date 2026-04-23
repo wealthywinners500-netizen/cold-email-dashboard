@@ -2,6 +2,7 @@ import { createAdminClient } from "@/lib/supabase/server";
 import { NextResponse } from "next/server";
 import { createHmac, timingSafeEqual } from "crypto";
 import { decrypt, encrypt } from "@/lib/provisioning/encryption";
+import { readEncryptedPasswordForJob } from "@/lib/provisioning/smtp-pass-reader";
 import type { StepType } from "@/lib/provisioning/types";
 
 export const dynamic = "force-dynamic";
@@ -299,16 +300,19 @@ export async function POST(
           const allAccountsCreated = mailMeta.allAccountsCreated as Record<string, string[]> | undefined;
           const server1Domains = (mailMeta.server1Domains as string[]) || [];
 
-          // Get server password for smtp_pass (HL #132: smtp_user + smtp_pass are NOT NULL)
-          const { data: vpsStep } = await supabase
-            .from("provisioning_steps")
-            .select("metadata")
-            .eq("job_id", jobId)
-            .eq("step_type", "create_vps")
-            .single();
-          const vpsMeta = (vpsStep?.metadata as Record<string, unknown>) || {};
-          const encryptedPassword = vpsMeta.serverPassword_encrypted as string | undefined;
-          const serverPassword = encryptedPassword ? decrypt(encryptedPassword) : "";
+          // Get server password for smtp_pass. Canonical source =
+          // ssh_credentials.password_encrypted (HL #132/#133/#138).
+          const encryptedServerPassword = await readEncryptedPasswordForJob(
+            supabase,
+            jobId,
+            "WorkerCallback"
+          );
+          const serverPassword = decrypt(encryptedServerPassword);
+          if (!serverPassword) {
+            throw new Error(
+              `[WorkerCallback] decrypt returned empty for job ${jobId} — ENCRYPTION_KEY mismatch?`
+            );
+          }
 
           if (allAccountsCreated) {
             const accountRows = [];
@@ -370,35 +374,12 @@ export async function POST(
             }
           }
 
-          // Create SSH credentials
-          if (encryptedPassword) {
-            for (const [ip, hostname, label] of [
-              [server1IP, `mail1.${jobRow.ns_domain}`, "S1"],
-              [server2IP, `mail2.${jobRow.ns_domain}`, "S2"],
-            ]) {
-              const { data: credRow, error: credError } = await supabase
-                .from("ssh_credentials")
-                .insert({
-                  org_id: dbOrgId,
-                  server_ip: ip,
-                  hostname,
-                  username: "root",
-                  password_encrypted: encryptedPassword,
-                  port: 22,
-                  provisioning_job_id: jobId,
-                })
-                .select("id")
-                .single();
-
-              if (credError) {
-                console.error(`[CRITICAL] ssh_credentials insert FAILED for ${label} at ${ip} (job ${jobId}): ${JSON.stringify(credError)}`);
-              } else {
-                console.log(`[WorkerCallback] SSH credentials saved: id=${credRow.id} for ${label} at ${ip} (job ${jobId})`);
-              }
-            }
-          } else {
-            console.error(`[CRITICAL] No encrypted password available for ssh_credentials insert (job ${jobId})`);
-          }
+          // ssh_credentials is populated by persistPairCredentials() on the
+          // worker during the create_vps step (HL #133, see
+          // src/lib/provisioning/persist-credentials.ts:38-74). The legacy
+          // duplicate-insert block that used to live here was gated on
+          // vpsMeta.serverPassword_encrypted — a metadata key the worker
+          // never writes — so it has always been dead (HL #138).
 
           // Update server_pair total_accounts
           if (accountsCreated > 0) {
