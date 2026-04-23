@@ -3,6 +3,7 @@ import { createAdminClient } from "@/lib/supabase/server";
 import { NextResponse } from "next/server";
 import { getVPSProvider, getDNSRegistrar } from "@/lib/provisioning/provider-registry";
 import { decrypt } from "@/lib/provisioning/encryption";
+import { readEncryptedPasswordForJob } from "@/lib/provisioning/smtp-pass-reader";
 import type { StepType, ProvisioningJobRow, VPSProviderType, DNSRegistrarType } from "@/lib/provisioning/types";
 
 export const dynamic = "force-dynamic";
@@ -712,10 +713,19 @@ export async function POST(
         const allAccountsCreated = mailMeta.allAccountsCreated as Record<string, string[]> | undefined;
         const server1Domains = (mailMeta.server1Domains as string[]) || [];
 
-        // Get server password for smtp_pass
-        const vpsMetaForAccounts = (createVpsStep?.metadata as Record<string, unknown>) || {};
-        const encryptedPassword = vpsMetaForAccounts.serverPassword_encrypted as string | undefined;
-        const serverPassword = encryptedPassword ? decrypt(encryptedPassword) : "";
+        // Get server password for smtp_pass. Canonical source =
+        // ssh_credentials.password_encrypted (HL #132/#133/#138).
+        const encryptedServerPassword = await readEncryptedPasswordForJob(
+          supabase,
+          jobId,
+          "ExecuteStep"
+        );
+        const serverPassword = decrypt(encryptedServerPassword);
+        if (!serverPassword) {
+          throw new Error(
+            `[ExecuteStep] decrypt returned empty for job ${jobId} — ENCRYPTION_KEY mismatch?`
+          );
+        }
 
         if (allAccountsCreated) {
           const accountRows = [];
