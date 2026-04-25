@@ -1034,6 +1034,37 @@ export async function issueSSLCert(
     // Issue hostname cert: v-add-letsencrypt-host
     // HL #117: Use full PATH + explicit 'admin' arg + bash -lc for login shell
     await ssh.exec(`bash -lc "${HESTIA_FULL_PATH} && v-add-letsencrypt-host admin"`, { timeout: 120000 });
+
+    // HL #145 belt-and-suspenders (P18 α 14h-46m TLS outage, 2026-04-25):
+    // any code path that writes /usr/local/hestia/ssl/certificate.{crt,key}
+    // MUST end with `chmod 0640 certificate.key && chown Debian-exim:mail
+    // certificate.key`. v-add-letsencrypt-host normally lands the right
+    // perms, but a regression silently leaving 0600 root:root means Exim
+    // cannot read the key on next exim4 reload — TLS goes to STARTTLS-fail
+    // until manually fixed. See reports/2026-04-25-p18-tls-incident.md §3.
+    // Idempotent: no-op when already correct, save when not.
+    await ssh.exec(
+      `chmod 0640 /usr/local/hestia/ssl/certificate.key && chown Debian-exim:mail /usr/local/hestia/ssl/certificate.key`,
+      { timeout: 10000 }
+    );
+
+    // Defensive assertion: confirm the resulting mode is 640. This is NOT
+    // a saga failure (the chmod above should have made it true) — log a
+    // warning so a regression in the chmod path becomes visible.
+    try {
+      const { stdout: modeOut } = await ssh.exec(
+        `stat -c %a /usr/local/hestia/ssl/certificate.key 2>/dev/null || echo unknown`,
+        { timeout: 5000 }
+      );
+      const mode = modeOut.trim();
+      if (mode !== '640') {
+        console.warn(
+          `[issueSSLCert] WARN: /usr/local/hestia/ssl/certificate.key mode is ${mode} (expected 640). Exim may fail to read the key. HL #145.`
+        );
+      }
+    } catch {
+      // Swallow — defensive check only; LE issuance already succeeded.
+    }
   } else {
     // Issue domain cert: v-add-letsencrypt-domain
     // HL #118: Ensure v-add-web-domain exists first (required by HestiaCP)
