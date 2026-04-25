@@ -143,10 +143,13 @@ assert(/HL #106/.test(autoFixSrc), 'HL #106 cited in auto-fix.ts');
 assert(/HL #106/.test(sagaSrc), 'HL #106 cited in pair-provisioning-saga.ts');
 
 // 8. SOA timer fix (HL #107): auto-fix fixSOA uses Expire 2419200 (4 weeks),
-//    not the old 604800 (1 week, which failed MXToolbox range).
+//    not the old 604800 (1 week, which failed MXToolbox range). Per HL
+//    #145-companion (P19 Phase H), arg-3 is now an explicit
+//    `ns1.${params.nsDomain}` — never `''`. See fixsoa-mname-explicit.test.ts
+//    for the full MNAME invariant pin.
 assert(
-  /v-change-dns-domain-soa admin \$\{domain\} '' '' 3600 600 2419200 3600/.test(autoFixSrc),
-  'fixSOA uses 3600 600 2419200 3600 (HL #107 — MXToolbox-safe timers)'
+  /v-change-dns-domain-soa admin \$\{domain\} ns1\.\$\{params\.nsDomain\} '' 3600 600 2419200 3600/.test(autoFixSrc),
+  'fixSOA uses 3600 600 2419200 3600 (HL #107 — MXToolbox-safe timers) with explicit ns1.${params.nsDomain} MNAME (HL #145-companion)'
 );
 assert(
   !/v-change-dns-domain-soa.*604800/.test(autoFixSrc),
