@@ -291,12 +291,20 @@ async function fixMX(
  * Fix SOA record.
  *
  * PATCH 10d: runs on owning half only.
+ *
+ * HL #145-companion to #107 (P19 Phase H, 2026-04-25): arg-3 (MNAME) MUST be
+ * an explicit `ns1.${nsDomain}` — passing `''` is NOT silently ignored by
+ * HestiaCP 1.9.4. It writes `MNAME=""` into the BIND zone file, which BIND
+ * renders as `.` (root). MXToolbox's "Primary Name Server Listed At Parent"
+ * check then fails on every zone in the cluster. P19 reproduced this on
+ * 13/13 zones; the operational fix was `v-change-dns-domain-soa admin <z>
+ * ns1.<nsDomain>`. See reports/2026-04-25-p19-complete-summary.md §8.
  */
 async function fixSOA(
   ssh1: SSHManager,
   ssh2: SSHManager,
   domain: string,
-  params: { server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
+  params: { nsDomain: string; server1Domains: string[]; server2Domains: string[]; log: (msg: string) => void }
 ): Promise<void> {
   // HL #107 (Session 04d): MXToolbox flags SOA Expire < 1209600 (2 weeks) as
   // "out of recommended range" and Refresh > 7200 (2hr) / Minimum < 3600 (1hr).
@@ -304,7 +312,7 @@ async function fixSOA(
   // Minimum 3600 (1hr). Previous value `604800` for Expire was 1 week — failed
   // MXToolbox range. HestiaCP's factory default `7200 3600 1209600 180` also
   // fails (Refresh high, Retry high, Minimum too low).
-  const cmd = `${HESTIA_PATH_PREFIX}v-change-dns-domain-soa admin ${domain} '' '' 3600 600 2419200 3600`;
+  const cmd = `${HESTIA_PATH_PREFIX}v-change-dns-domain-soa admin ${domain} ns1.${params.nsDomain} '' 3600 600 2419200 3600`;
 
   const { ssh, serverName } = pickOwningServer(domain, ssh1, ssh2, params.server1Domains, params.server2Domains);
   const result = await ssh.exec(cmd, { timeout: 10000 });
