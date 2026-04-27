@@ -114,10 +114,23 @@ async function sweepOrg(
 
   if (data.pair_ids?.length) {
     // Explicit override — scan exactly these pairs regardless of
-    // provisioning_job_id. (Clouding-imported pairs reachable this way.)
+    // provisioning_job_id. (Clouding-imported pairs reachable this way
+    // when an admin needs to ad-hoc audit them.)
     pairsQ = pairsQ.in('id', data.pair_ids);
   } else {
     // Default cron scope — saga-generated Linode pairs only.
+    //
+    // INVARIANT (do not relax without rolling-out new pair_id-based
+    // sending_domains population for the imported pairs first):
+    // pairs with provisioning_job_id IS NULL are the four Clouding-
+    // imported pairs (P1, P2, P3, P12). Their sending_domains rows are
+    // stale leftovers from the P1–P8 + Salvage-Ionos migration that
+    // completed before Pair A/B; pairs 1, 3 have 0 rows and pair 2's
+    // table doesn't reflect current sending state (Pair B Wave 4 halt
+    // finding). Sweeping them produces false-positive alarms.
+    //
+    // Test pin: src/worker/handlers/__tests__/dbl-resweep.test.ts
+    // case 5a (default scope skips) and 5b (explicit pair_ids overrides).
     pairsQ = pairsQ.not('provisioning_job_id', 'is', null);
   }
 

@@ -552,6 +552,31 @@ const NOW = '2026-04-27T13:00:00.000Z';
       !cloudingDomain?.last_dbl_check_at,
       'case5a: Clouding-imported sending_domain is untouched'
     );
+    // Stronger pin: the row must be FULLY untouched, not just status-clean.
+    // This catches a regression where someone updates timestamp-only without
+    // re-introducing the filter. dbl_check_history must remain its seeded
+    // empty array; no probe means no entry.
+    const cloudingHistory = cloudingDomain?.dbl_check_history;
+    assert(
+      Array.isArray(cloudingHistory) && cloudingHistory.length === 0,
+      'case5a: Clouding-imported sending_domain has zero history entries (no code path ran)'
+    );
+    assert(
+      cloudingDomain?.dbl_first_burn_at === undefined ||
+        cloudingDomain?.dbl_first_burn_at === null,
+      'case5a: Clouding-imported sending_domain has no dbl_first_burn_at'
+    );
+    // And no system_alerts could have been fired against the Clouding pair
+    const cloudingAlerts = f.db
+      .rows('system_alerts')
+      .filter((a) => {
+        const det = a.details as Record<string, unknown> | undefined;
+        return det?.pair_id === 'pair_clouding';
+      });
+    assert(
+      cloudingAlerts.length === 0,
+      'case5a: zero system_alerts attributed to the Clouding pair'
+    );
   }
 
   // Explicit pair_ids override: Clouding pair IS scanned
