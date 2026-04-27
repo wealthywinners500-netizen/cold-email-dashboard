@@ -16,6 +16,7 @@ import { handleProvisionStep } from "./handlers/provision-step";
 import { handleRollbackProvision } from "./handlers/rollback-provision";
 import { handleHealthCheck } from "./handlers/health-check";
 import { handlePairVerify, type PairVerifyPayload } from "./handlers/pair-verify";
+import { dblResweepHandler, type DblResweepJobData } from "./handlers/dbl-resweep";
 import {
   handleListRegistrarDomains,
   type ListRegistrarDomainsPayload,
@@ -72,6 +73,8 @@ async function main() {
     "poll-provisioning-jobs",
     "list-registrar-domains",
     "pair-verify",
+    "dbl-resweep-cron",
+    "dbl-resweep",
   ];
   for (const name of queueNames) {
     await boss.createQueue(name);
@@ -325,6 +328,53 @@ async function main() {
   await boss.work<PairVerifyPayload>(
     "pair-verify",
     withErrorHandling(handlePairVerify, "pair-verify")
+  );
+
+  // Register dbl-resweep cron — weekly Monday 09:00 ET = Monday 13:00 UTC.
+  // (Picked UTC-stable instead of America/New_York to match every other cron
+  // in this file. DST drift means the run is at 09:00 ET in winter / 10:00
+  // ET in summer — within tolerance for a weekly check.)
+  //
+  // Pattern matches server-health-check-cron: schedule the cron-trigger
+  // queue, fan out a single dbl-resweep job with explicit data. This way the
+  // manual /api/admin/dbl-monitor/run endpoint can publish to the SAME
+  // dbl-resweep queue and share the handler code path.
+  await boss.schedule("dbl-resweep-cron", "0 13 * * 1");
+  await boss.work("dbl-resweep-cron", async () => {
+    console.log("[Worker] DBL re-sweep cron fired — enqueuing dbl-resweep job");
+    try {
+      await boss.send("dbl-resweep", { triggered_by: "cron" });
+    } catch (err) {
+      console.error("[Worker] Failed to enqueue dbl-resweep job:", err);
+      throw err;
+    }
+  });
+
+  // Register the actual dbl-resweep handler. localConcurrency=1 ensures the
+  // weekly cron and a manual Run Now never race — only one sweep at a time.
+  await boss.work<DblResweepJobData>(
+    "dbl-resweep",
+    {
+      batchSize: 1,
+      pollingIntervalSeconds: 10,
+      localConcurrency: 1,
+    },
+    async (jobs) => {
+      for (const job of jobs) {
+        console.log(
+          `[Worker] Starting dbl-resweep job ${job.id} (triggered_by=${job.data.triggered_by})`
+        );
+        try {
+          const summary = await dblResweepHandler(job.data);
+          console.log(
+            `[Worker] dbl-resweep job ${job.id} completed — ${JSON.stringify(summary)}`
+          );
+        } catch (err) {
+          console.error(`[Worker] dbl-resweep job ${job.id} failed:`, err);
+          throw err;
+        }
+      }
+    }
   );
 
   // Register provision-server-pair handler (B15-3, B16-hands-free)
