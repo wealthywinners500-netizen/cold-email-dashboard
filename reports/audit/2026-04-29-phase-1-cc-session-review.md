@@ -78,18 +78,20 @@ Batch reports:
 9. **P16 replacement domains** — `voilify.info` re-DQS + 1 fresh purchase to return P16 to 10/10 (HANDOFF P1)
 10. **Migration tracker cleanup** — 001–020 untracked, duplicate version files 008/008, 009/009, 012/012 (HANDOFF P3)
 
-### HL promotion candidates (across both batches; numbering proposed)
+### HL promotion candidates (Phase 9 — propose only NEW lessons #146–#149)
 
-| # | Title | Source |
-|---|---|---|
-| HL #146 candidate | Single-line cluster zone delete pattern (`/^zone "X" /d`, NOT range-sed) | HANDOFF + Batch A + Batch B (cc23c4c3's 25 sed iterations) |
-| HL #147 candidate | Post-TLS-fix re-enable is a manual step — auto-monitor disables but never re-enables | Batch B (P18 evidence: TLS fixed, accounts stuck) |
-| HL #148 candidate | Env-var gaps identified during saga work must block saga close, not be deferred | Batch B (`11e8da24` "if preflight needs it" deferral → 24h+ undetected defect) |
-| HL #149 candidate | Pair Verify scoring should distinguish plumbing failures from infra failures | Batch B (`b88ca92d` source quote — single failed check flips whole run RED) |
-| HL #137 (Batch A) | Single-observation empirical rule — require ≥2 observations + live counterexample before hard-fail VG gates | Batch A (`0d9e164d`) |
-| HL #136 (Batch A) | MAX_IP_REROLL_ATTEMPTS orphan bug in provision-step.ts — throw path leaves Linodes orphaned | Batch A (`853bada1` + `51915763`) |
+**Numbering note (Master Cowork cross-check 2026-04-29):** HL #136 and #137 are **already codified** in `.auto-memory/feedback_hard_lessons.md` at lines 939 and 965 respectively (authored 2026-04-22). The HL ledger currently tops at #145. Phase 9 should propose ONLY the four new candidates below; the two pre-existing entries appear in this table strictly for source traceability so the audit's drift inventory points back to the originating session.
 
-These are PROPOSALS only — Phase 9 will draft the formal HL bodies; Master Cowork will apply them in a separate session.
+| # | Title | Source | Phase 9 action |
+|---|---|---|---|
+| HL #146 candidate | Single-line cluster zone delete pattern (`/^zone "X" /d`, NOT range-sed) | HANDOFF + Batch A + Batch B (cc23c4c3's 25 sed iterations) | **Propose new HL** |
+| HL #147 candidate | Post-TLS-fix re-enable is a manual step — auto-monitor disables but never re-enables | Batch B (P18 evidence: TLS fixed, accounts stuck) | **Propose new HL** |
+| HL #148 candidate | Env-var gaps identified during saga work must block saga close, not be deferred | Batch B (`11e8da24` "if preflight needs it" deferral → 24h+ undetected defect) | **Propose new HL** |
+| HL #149 candidate | Pair Verify scoring should distinguish plumbing failures from infra failures | Batch B (`b88ca92d` source quote — single failed check flips whole run RED) | **Propose new HL** |
+| HL #137 (already codified at line 965) | Single-observation empirical rule — require ≥2 observations + live counterexample before hard-fail VG gates | Batch A (`0d9e164d`) | already-codified; included for source traceability only |
+| HL #136 (already codified at line 939) | MAX_IP_REROLL_ATTEMPTS orphan bug in provision-step.ts — throw path leaves Linodes orphaned | Batch A (`853bada1` + `51915763`) | already-codified; included for source traceability only |
+
+These are PROPOSALS only — Phase 9 will draft the formal HL bodies for #146–#149 only; Master Cowork will apply them in a separate session.
 
 ## Master state-change timeline (combined, chronological)
 
