@@ -24,7 +24,6 @@ import {
 interface Campaign {
   id: string;
   org_id: string;
-  snovio_id: string;
   name: string;
   region: string;
   store_chain: string;
