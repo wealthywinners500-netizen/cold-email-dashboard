@@ -1,17 +1,18 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import {
   Search,
   Star,
   Archive,
   Send,
-  ChevronDown,
   Loader2,
   Inbox as InboxIcon,
 } from "lucide-react";
 import { createClient } from "@supabase/supabase-js";
 import DOMPurify from "isomorphic-dompurify";
+import { parseTab, Tab } from "@/lib/inbox/tab-routing";
 
 // Lazy Supabase client for realtime only
 function getRealtimeClient() {
@@ -27,6 +28,7 @@ interface Thread {
   snippet: string | null;
   message_count: number;
   participants: string[];
+  account_emails: string[] | null;
   has_unread: boolean;
   is_starred: boolean;
   latest_classification: string | null;
@@ -57,6 +59,13 @@ interface Account {
   display_name: string | null;
 }
 
+interface Pagination {
+  page: number;
+  per_page: number;
+  total: number;
+  total_pages: number;
+}
+
 const CLASSIFICATION_COLORS: Record<string, string> = {
   INTERESTED: "bg-green-500/20 text-green-400 border-green-500/30",
   NOT_INTERESTED: "bg-gray-500/20 text-gray-400 border-gray-500/30",
@@ -67,13 +76,14 @@ const CLASSIFICATION_COLORS: Record<string, string> = {
   SPAM: "bg-gray-500/20 text-gray-400 border-gray-500/30",
 };
 
-const FILTER_TABS = [
+const FILTER_TABS: { key: Tab; label: string }[] = [
   { key: "all", label: "All" },
-  { key: "unread", label: "Unread" },
-  { key: "INTERESTED", label: "Interested" },
-  { key: "OBJECTION", label: "Objections" },
-  { key: "BOUNCE", label: "Bounces" },
+  { key: "warm-up", label: "Warm Up" },
+  { key: "hot-leads", label: "Hot Leads" },
+  { key: "spam", label: "Spam" },
 ];
+
+const PAGE_SIZE = 50;
 
 function timeAgo(dateStr: string): string {
   const now = new Date();
@@ -100,42 +110,77 @@ function ClassificationBadge({ classification }: { classification: string | null
 }
 
 export default function InboxClient() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const initialTab = useMemo(() => parseTab(searchParams.get("tab")), [searchParams]);
+
   const [threads, setThreads] = useState<Thread[]>([]);
+  const [pagination, setPagination] = useState<Pagination | null>(null);
   const [selectedThread, setSelectedThread] = useState<Thread | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [messagesLoading, setMessagesLoading] = useState(false);
-  const [activeFilter, setActiveFilter] = useState("all");
+  const [activeTab, setActiveTab] = useState<Tab>(initialTab);
   const [searchQuery, setSearchQuery] = useState("");
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
   const [replyText, setReplyText] = useState("");
   const [replyAccountId, setReplyAccountId] = useState("");
   const [sending, setSending] = useState(false);
 
-  // Fetch threads
-  const fetchThreads = useCallback(async () => {
-    try {
+  const buildQueryParams = useCallback(
+    (page: number) => {
       const params = new URLSearchParams();
-      if (activeFilter === "unread") {
-        params.set("unread", "true");
-      } else if (activeFilter !== "all") {
-        params.set("classification", activeFilter);
-      }
-      if (searchQuery) {
-        params.set("search", searchQuery);
-      }
+      params.set("tab", activeTab);
+      params.set("page", String(page));
+      params.set("per_page", String(PAGE_SIZE));
+      if (searchQuery) params.set("search", searchQuery);
+      if (fromDate) params.set("from_date", fromDate);
+      // Inclusive end-of-day so a same-day to_date returns that day's threads.
+      if (toDate) params.set("to_date", `${toDate}T23:59:59.999Z`);
+      return params;
+    },
+    [activeTab, searchQuery, fromDate, toDate]
+  );
 
+  // Initial / filter-changed fetch (resets to page 1).
+  const fetchThreads = useCallback(async () => {
+    setLoading(true);
+    try {
+      const params = buildQueryParams(1);
       const res = await fetch(`/api/inbox/threads?${params.toString()}`);
       if (res.ok) {
         const data = await res.json();
         setThreads(data.threads || []);
+        setPagination(data.pagination || null);
       }
     } catch (err) {
       console.error("Failed to fetch threads:", err);
     } finally {
       setLoading(false);
     }
-  }, [activeFilter, searchQuery]);
+  }, [buildQueryParams]);
+
+  // Append next page (load-more pagination, preserves scroll).
+  const loadMoreThreads = useCallback(async () => {
+    if (!pagination || pagination.page >= pagination.total_pages) return;
+    setLoadingMore(true);
+    try {
+      const params = buildQueryParams(pagination.page + 1);
+      const res = await fetch(`/api/inbox/threads?${params.toString()}`);
+      if (res.ok) {
+        const data = await res.json();
+        setThreads((prev) => [...prev, ...(data.threads || [])]);
+        setPagination(data.pagination || null);
+      }
+    } catch (err) {
+      console.error("Failed to load more threads:", err);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [pagination, buildQueryParams]);
 
   // Fetch accounts
   const fetchAccounts = useCallback(async () => {
@@ -251,10 +296,26 @@ export default function InboxClient() {
     }
   };
 
+  // Persist active tab to URL when it changes.
+  useEffect(() => {
+    const current = searchParams.get("tab");
+    if (current === activeTab) return;
+    const next = new URLSearchParams(searchParams.toString());
+    if (activeTab === "all") {
+      next.delete("tab");
+    } else {
+      next.set("tab", activeTab);
+    }
+    router.replace(`?${next.toString()}`);
+  }, [activeTab, router, searchParams]);
+
   useEffect(() => {
     fetchThreads();
+  }, [fetchThreads]);
+
+  useEffect(() => {
     fetchAccounts();
-  }, [fetchThreads, fetchAccounts]);
+  }, [fetchAccounts]);
 
   // Realtime subscription
   useEffect(() => {
@@ -287,6 +348,8 @@ export default function InboxClient() {
     );
   }
 
+  const hasMore = pagination ? pagination.page < pagination.total_pages : false;
+
   return (
     <div className="flex flex-col h-[calc(100vh-120px)]">
       <h1 className="text-2xl font-bold text-white mb-4">Inbox</h1>
@@ -299,9 +362,9 @@ export default function InboxClient() {
             {FILTER_TABS.map((tab) => (
               <button
                 key={tab.key}
-                onClick={() => setActiveFilter(tab.key)}
+                onClick={() => setActiveTab(tab.key)}
                 className={`px-3 py-2.5 text-xs font-medium transition-colors ${
-                  activeFilter === tab.key
+                  activeTab === tab.key
                     ? "text-blue-400 border-b-2 border-blue-400"
                     : "text-gray-500 hover:text-gray-300"
                 }`}
@@ -326,6 +389,35 @@ export default function InboxClient() {
             </div>
           </div>
 
+          {/* Date range */}
+          <div className="px-2 pb-2 border-b border-gray-800 flex items-center gap-2 text-xs text-gray-400">
+            <span className="text-gray-500">From</span>
+            <input
+              type="date"
+              value={fromDate}
+              onChange={(e) => setFromDate(e.target.value)}
+              className="bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-xs text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+            />
+            <span className="text-gray-500">to</span>
+            <input
+              type="date"
+              value={toDate}
+              onChange={(e) => setToDate(e.target.value)}
+              className="bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-xs text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+            />
+            {(fromDate || toDate) && (
+              <button
+                onClick={() => {
+                  setFromDate("");
+                  setToDate("");
+                }}
+                className="ml-auto text-gray-500 hover:text-gray-300 text-xs"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+
           {/* Thread list */}
           <div className="flex-1 overflow-y-auto">
             {threads.length === 0 ? (
@@ -334,97 +426,120 @@ export default function InboxClient() {
                 <p className="text-sm">No threads found</p>
               </div>
             ) : (
-              threads.map((thread) => (
-                <div
-                  key={thread.id}
-                  onClick={() => selectThread(thread)}
-                  className={`px-4 py-3 border-b border-gray-800 cursor-pointer hover:bg-gray-800/50 transition-colors ${
-                    selectedThread?.id === thread.id
-                      ? "bg-gray-800"
-                      : ""
-                  }`}
-                >
-                  <div className="flex items-start gap-3">
-                    {/* Avatar */}
-                    <div className="flex-shrink-0 w-9 h-9 rounded-full bg-blue-600 flex items-center justify-center">
-                      <span className="text-sm font-medium text-white">
-                        {(thread.participants?.[0] || "?")[0].toUpperCase()}
-                      </span>
-                    </div>
+              <>
+                {threads.map((thread) => (
+                  <div
+                    key={thread.id}
+                    onClick={() => selectThread(thread)}
+                    className={`group px-4 py-3 border-b border-gray-800 cursor-pointer hover:bg-gray-800/50 transition-colors ${
+                      selectedThread?.id === thread.id
+                        ? "bg-gray-800"
+                        : ""
+                    }`}
+                  >
+                    <div className="flex items-start gap-3">
+                      {/* Avatar */}
+                      <div className="flex-shrink-0 w-9 h-9 rounded-full bg-blue-600 flex items-center justify-center">
+                        <span className="text-sm font-medium text-white">
+                          {(thread.participants?.[0] || "?")[0].toUpperCase()}
+                        </span>
+                      </div>
 
-                    <div className="flex-1 min-w-0">
-                      {/* Top row: sender + time */}
-                      <div className="flex items-center justify-between gap-2">
-                        <span
-                          className={`text-sm truncate ${
-                            thread.has_unread
-                              ? "font-semibold text-white"
-                              : "text-gray-300"
+                      <div className="flex-1 min-w-0">
+                        {/* Top row: sender + time */}
+                        <div className="flex items-center justify-between gap-2">
+                          <span
+                            className={`text-sm truncate ${
+                              thread.has_unread
+                                ? "font-semibold text-white"
+                                : "text-gray-300"
+                            }`}
+                          >
+                            {thread.participants?.[0] || "Unknown"}
+                          </span>
+                          <div className="flex items-center gap-1.5 flex-shrink-0">
+                            {thread.has_unread && (
+                              <div className="w-2 h-2 rounded-full bg-blue-500" />
+                            )}
+                            <span className="text-xs text-gray-500">
+                              {timeAgo(thread.latest_message_date)}
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Subject */}
+                        <p
+                          className={`text-sm truncate mt-0.5 ${
+                            thread.has_unread ? "text-gray-200" : "text-gray-400"
                           }`}
                         >
-                          {thread.participants?.[0] || "Unknown"}
-                        </span>
-                        <div className="flex items-center gap-1.5 flex-shrink-0">
-                          {thread.has_unread && (
-                            <div className="w-2 h-2 rounded-full bg-blue-500" />
-                          )}
-                          <span className="text-xs text-gray-500">
-                            {timeAgo(thread.latest_message_date)}
-                          </span>
+                          {thread.subject || "(no subject)"}
+                        </p>
+
+                        {/* Snippet + badges */}
+                        <div className="flex items-center gap-2 mt-1">
+                          <p className="text-xs text-gray-500 truncate flex-1">
+                            {thread.snippet || ""}
+                          </p>
+                          <ClassificationBadge
+                            classification={thread.latest_classification}
+                          />
                         </div>
+
+                        {/* Campaign name */}
+                        {thread.campaign_name && (
+                          <p className="text-xs text-blue-400/60 mt-1 truncate">
+                            {thread.campaign_name}
+                          </p>
+                        )}
                       </div>
 
-                      {/* Subject */}
-                      <p
-                        className={`text-sm truncate mt-0.5 ${
-                          thread.has_unread ? "text-gray-200" : "text-gray-400"
-                        }`}
-                      >
-                        {thread.subject || "(no subject)"}
-                      </p>
-
-                      {/* Snippet + badges */}
-                      <div className="flex items-center gap-2 mt-1">
-                        <p className="text-xs text-gray-500 truncate flex-1">
-                          {thread.snippet || ""}
-                        </p>
-                        <ClassificationBadge
-                          classification={thread.latest_classification}
-                        />
+                      {/* Actions */}
+                      <div className="flex flex-col gap-1 flex-shrink-0 opacity-0 group-hover:opacity-100">
+                        <button
+                          onClick={(e) => toggleStar(thread, e)}
+                          className="p-1 hover:bg-gray-700 rounded"
+                        >
+                          <Star
+                            className={`w-3.5 h-3.5 ${
+                              thread.is_starred
+                                ? "fill-yellow-400 text-yellow-400"
+                                : "text-gray-600"
+                            }`}
+                          />
+                        </button>
+                        <button
+                          onClick={(e) => archiveThread(thread, e)}
+                          className="p-1 hover:bg-gray-700 rounded"
+                        >
+                          <Archive className="w-3.5 h-3.5 text-gray-600" />
+                        </button>
                       </div>
-
-                      {/* Campaign name */}
-                      {thread.campaign_name && (
-                        <p className="text-xs text-blue-400/60 mt-1 truncate">
-                          {thread.campaign_name}
-                        </p>
-                      )}
-                    </div>
-
-                    {/* Actions */}
-                    <div className="flex flex-col gap-1 flex-shrink-0 opacity-0 group-hover:opacity-100">
-                      <button
-                        onClick={(e) => toggleStar(thread, e)}
-                        className="p-1 hover:bg-gray-700 rounded"
-                      >
-                        <Star
-                          className={`w-3.5 h-3.5 ${
-                            thread.is_starred
-                              ? "fill-yellow-400 text-yellow-400"
-                              : "text-gray-600"
-                          }`}
-                        />
-                      </button>
-                      <button
-                        onClick={(e) => archiveThread(thread, e)}
-                        className="p-1 hover:bg-gray-700 rounded"
-                      >
-                        <Archive className="w-3.5 h-3.5 text-gray-600" />
-                      </button>
                     </div>
                   </div>
-                </div>
-              ))
+                ))}
+
+                {/* Load more */}
+                {hasMore && (
+                  <div className="p-3 flex justify-center border-t border-gray-800">
+                    <button
+                      onClick={loadMoreThreads}
+                      disabled={loadingMore}
+                      className="text-xs text-blue-400 hover:text-blue-300 disabled:opacity-50 flex items-center gap-1.5"
+                    >
+                      {loadingMore ? (
+                        <>
+                          <Loader2 className="w-3 h-3 animate-spin" /> Loading...
+                        </>
+                      ) : (
+                        <>
+                          Load more ({pagination!.total - threads.length} remaining)
+                        </>
+                      )}
+                    </button>
+                  </div>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -572,3 +687,4 @@ export default function InboxClient() {
     </div>
   );
 }
+
