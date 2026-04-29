@@ -12,7 +12,7 @@
 Insert AFTER line 1 (`## Core Memory Files...`), BEFORE the existing 2026-04-24 entry. The new entry becomes lines 2-X (and existing 2026-04-24 entry shifts to lines X+1...).
 
 ```markdown
-*2026-04-29 — **Full audit completed (Phases 0–10) on branch `audit/full-2026-04-29` PR open + UNMERGED.** 32 findings cataloged (5×P1 / 8×P2 / 13×P3 / 4×info / F-33 DROPPED per Directive 1 / F-24 RESOLVED Path A REFINED). 9 new HLs landed (#146 single-line zone delete, #147 post-TLS-fix re-enable manual, #148 env-var gaps must block saga close, #149 PV scoring plumbing-vs-infra distinction, #150 smtp_pass two-column storage split, #151 rolling-anchor pXX-golden-saga-YYYY-MM-DD convention, #152 cascade-disable rollback operator-driven, #153 pooler mode per consumer surface, #154 pre-DELETE FK enumeration via pg_constraint). 11 audit-prompt patches enumerated for the next iteration. **Phase 8 fixes applied:** F-1 (DATABASE_URL added to Vercel prod env, port 6543 transaction-mode pooler — initial port-5432 attempt surfaced HL #153) + 12 P2 cross-pair collision `email_accounts` rows DELETED via cascade-cleanup with 48 dependent `system_alerts` (forensic snapshot in [reports/audit/2026-04-29-phase-8.3-collision-delete.md](../dashboard-app/reports/audit/2026-04-29-phase-8.3-collision-delete.md)). **F-14 deferred** (no Docker / no sbp_ token; remediation queued in [FIX-BACKLOG.md](../dashboard-app/reports/audit/2026-04-29-FIX-BACKLOG.md)). **Live state post-audit:** `server_pairs`=14 / `email_accounts` active=258 / disabled=48 / total=306 / `sending_domains`=119 / `pair_verifications`=20 / `system_alerts`=605 (deltas: -12 email_accounts, -48 system_alerts vs Phase 8.3 pre). Saga golden tag `p16-golden-saga-2026-04-23` sha unchanged at `c1cc0bf96f7aed54a5e74c0f5cf20cb693263de1`. F-24 baseline (auto-fix.ts only, +10/-2 since p16) holds. **NEW tag `p17-golden-saga-2026-04-29` to be applied manually by Dean at audit close**: `git tag p17-golden-saga-2026-04-29 00b3260 && git push origin p17-golden-saga-2026-04-29`. Old tag stays immutable (rolling-anchor convention per HL #151). **Directive 1 propagated:** newserver1-19 (the 19 original Clouding mail servers) DELETED 2026-04-28 by Dean; surviving Clouding infra = 10 panel.* relay servers + worker VPS (200.234.226.226) only. `feedback_clouding_panel_servers_offlimits.md` STILL applies to the 10 panel.* set; relay-migration session is the right scope. **F-33 (P2 EHOSTUNREACH cascade) is expected state, not a finding** — old IPs route nowhere because the servers behind them are deleted. Post-audit roadmap (Dean stated order, 2026-04-25): preserve waves continuation (Salvage-Ionos Wave 3, Pair B re-launch) → P18+P19 reactivation (relay-migration session, 45 Snov accounts) → 10 panel.* relay-server preserve wave → P2 recommission (rebind 18 non-collision rows to NEW Linode pair, NOT reactivate Clouding) → app-building (B16 hands-free, etc.). Audit reports: `dashboard-app/reports/audit/2026-04-29-*.md` (18 files: phase-0 through phase-10 + 4 deliverable PROPOSALs + FIX-BACKLOG + 4 cross-infra drift). PR: <link added at Phase 10 close>.*
+*2026-04-29 — **Full audit completed (Phases 0–10) on branch `audit/full-2026-04-29` PR open + UNMERGED.** 32 findings cataloged (5×P1 / 8×P2 / 13×P3 / 4×info / F-33 DROPPED per Directive 1 / F-24 RESOLVED Path A REFINED). 9 new HLs landed (#146 single-line zone delete, #147 post-TLS-fix re-enable manual, #148 env-var gaps must block saga close, #149 PV scoring plumbing-vs-infra distinction, #150 smtp_pass two-column storage split, #151 rolling-anchor pXX-golden-saga-YYYY-MM-DD convention, #152 cascade-disable rollback operator-driven, #153 pooler mode per consumer surface, #154 pre-DELETE FK enumeration via pg_constraint). 11 audit-prompt patches enumerated for the next iteration. **Phase 8 fixes applied:** F-1 (DATABASE_URL added to Vercel prod env, port 6543 transaction-mode pooler — initial port-5432 attempt surfaced HL #153) + 12 P2 cross-pair collision `email_accounts` rows DELETED via cascade-cleanup with 48 dependent `system_alerts` (forensic snapshot in [reports/audit/2026-04-29-phase-8.3-collision-delete.md](../dashboard-app/reports/audit/2026-04-29-phase-8.3-collision-delete.md)). **F-14 deferred** (no Docker / no sbp_ token; remediation queued in [FIX-BACKLOG.md](../dashboard-app/reports/audit/2026-04-29-FIX-BACKLOG.md)). **Clerk org_id re-correction:** actual = `org_3C2CaQuMSFDyZ9wTXmvFRGPoOOq` (ends `OOq`, double capital-O); 2026-04-21 audit's correction went the wrong way (claimed ends `O0q` digit-zero). Verified via `LIST /v1/organizations` (StealthMail row) + direct `GET /v1/organizations/<id>` on both candidates (`O0q` returns `resource_not_found`, `OOq` returns full org object with `name="StealthMail"`, `created_by="user_3C2CZ4ZPd7Ud5CjqJLZ9WarMln9"`, `created_at=1775574340466`). `reference_credentials.md` patched in this audit; `project_saas_dashboard.md:26` deferred to Project 9 per memory-ownership rule (PROPOSE-only in this audit). The 2026-04-21 historical entry above stays untouched as the durable record of when the wrong direction was first applied. **Live state post-audit:** `server_pairs`=14 / `email_accounts` active=258 / disabled=48 / total=306 / `sending_domains`=119 / `pair_verifications`=20 / `system_alerts`=605 (deltas: -12 email_accounts, -48 system_alerts vs Phase 8.3 pre). Saga golden tag `p16-golden-saga-2026-04-23` sha unchanged at `c1cc0bf96f7aed54a5e74c0f5cf20cb693263de1`. F-24 baseline (auto-fix.ts only, +10/-2 since p16) holds. **NEW tag `p17-golden-saga-2026-04-29` to be applied manually by Dean at audit close**: `git tag p17-golden-saga-2026-04-29 00b3260 && git push origin p17-golden-saga-2026-04-29`. Old tag stays immutable (rolling-anchor convention per HL #151). **Directive 1 propagated:** newserver1-19 (the 19 original Clouding mail servers) DELETED 2026-04-28 by Dean; surviving Clouding infra = 10 panel.* relay servers + worker VPS (200.234.226.226) only. `feedback_clouding_panel_servers_offlimits.md` STILL applies to the 10 panel.* set; relay-migration session is the right scope. **F-33 (P2 EHOSTUNREACH cascade) is expected state, not a finding** — old IPs route nowhere because the servers behind them are deleted. Post-audit roadmap (Dean stated order, 2026-04-25): preserve waves continuation (Salvage-Ionos Wave 3, Pair B re-launch) → P18+P19 reactivation (relay-migration session, 45 Snov accounts) → 10 panel.* relay-server preserve wave → P2 recommission (rebind 18 non-collision rows to NEW Linode pair, NOT reactivate Clouding) → app-building (B16 hands-free, etc.). Audit reports: `dashboard-app/reports/audit/2026-04-29-*.md` (~22 files: phase-0 through phase-10 + 5 deliverable PROPOSALs + FIX-BACKLOG + 4 cross-infra drift + 9.6 prompt-file drift). PR: <link added at Phase 10 close>.*
 ```
 
 ### 1b. EDIT line 35 — Project 1 server-deployment description (annotate newserver1-19 deletion)
@@ -68,21 +68,36 @@ Now that newserver1-19 are deleted (per Directive 1), the 14-server framing in H
 
 ## File 3 — `.auto-memory/reference_credentials.md` (Project 8 owns; CC applies w/ ack)
 
-### 3a. EDIT line 22 — annotate stale CLOUDING_API_KEY reference
+### 3a. EDIT — Clerk org_id re-correction (CRITICAL — F-NEW-9.5-CLERK-1)
+
+**Anchor:** the line currently says (per `.auto-memory/reference_credentials.md`):
+```
+- **Dean's Org:** StealthMail — org_3C2CaqUMSFDyZ9wTXmvFRGPoO0q (created 2026-04-07; corrected 2026-04-21 audit — ends `O0q` = capital-O + digit-zero + lowercase-q)
+```
+
+**Patch:**
+```diff
+-- **Dean's Org:** StealthMail — org_3C2CaqUMSFDyZ9wTXmvFRGPoO0q (created 2026-04-07; corrected 2026-04-21 audit — ends `O0q` = capital-O + digit-zero + lowercase-q)
++- **Dean's Org:** StealthMail — `org_3C2CaQuMSFDyZ9wTXmvFRGPoOOq` (created 2026-04-07; **2026-04-29 audit re-correction:** actual ID ends `OOq` = capital-O + capital-O + lowercase-q. The 2026-04-21 "correction" went the wrong direction. Verified via `LIST /v1/organizations` (StealthMail = `org_3C2CaQuMSFDyZ9wTXmvFRGPoOOq`) + direct `GET /v1/organizations/<id>` on both candidates: `O0q` returns `resource_not_found`, `OOq` returns the full org object with `name=StealthMail`. 3-character delta from prior wrong value: positions 9-10 case-swapped (`qU` → `Qu`) AND last-3 had `0` (digit-zero) where actual is `O` (capital-O).)
+```
+
+This is the only auto-memory write that touches credentials. The runtime dashboard works fine because it uses `auth().orgId` from the live Clerk session — NOT a hardcoded constant. But scripts / one-off CC sessions that copy-paste the org_id from credentials hit 404. Patch must land before the next CC operator picks up the wrong value.
+
+### 3b. EDIT line 22 — annotate stale CLOUDING_API_KEY reference
 
 ```diff
 -- Older stale key `St/Ewg6WyfoabNA40J3tm+fFUE/69n+fT4LjoXpwXrI=` appears in several CC_PROMPT_*.md files — do not use; superseded by the Q14Q1 key above
 +- Older stale key `St/Ewg6WyfoabNA40J3tm+fFUE/69n+fT4LjoXpwXrI=` appears in several CC_PROMPT_*.md files — do not use; superseded by the Q14Q1 key above. **2026-04-29 audit note:** newserver1-19 deletion means most Clouding API uses are now moot — the 10 surviving panel.* servers are the only remaining Clouding consumers, and they're off-limits per `feedback_clouding_panel_servers_offlimits.md`. Phase 9.6 prompt-file sweep enumerates the prompt files that still reference the stale key for cleanup.
 ```
 
-### 3b. INSERT new "post-audit notes" subsection at the END of the Clouding.io section (after line 22)
+### 3c. INSERT new "post-audit notes" subsection at the END of the Clouding.io section (after line 22)
 
 ```markdown
 - **2026-04-29 audit note — newserver1-19 SSH access:** The 19 original Clouding mail servers are DELETED. Any prompt or doc that says "SSH to newserverN" is operating against deleted infrastructure. Surviving Clouding SSH targets: 10 panel.* hostnames (off-limits until relay-migration preserve wave activates) and the worker VPS at 200.234.226.226 (live, pubkey-authed for `dean-mac-dashboard-20260418` ed25519 since 2026-04-23).
 - **2026-04-29 audit note — Vercel DATABASE_URL** added to production env (id `X2Xjg3qtO5sjIvqb`, encrypted) at Phase 8.1 close. Value uses **transaction-mode pooler at port 6543** (not the worker's session-mode 5432). Per HL #153, pooler mode is per-consumer-surface — same host/user/password/db, port differs by surface. This was added to fix F-1 (the Pair Verify route's `enqueue_failed` cascade).
 ```
 
-### 3c. (Optional) Add SUPABASE_ACCESS_TOKEN slot
+### 3d. (Optional) Add SUPABASE_ACCESS_TOKEN slot
 
 Add to Supabase section at end:
 
@@ -118,9 +133,30 @@ CC does NOT apply these edits. Project 1 absorbs in a follow-on session referenc
 
 ---
 
-## File 5 — `.auto-memory/feedback_clouding_panel_servers_offlimits.md` (Project 8 owns; verify-only)
+## File 5 — `.auto-memory/project_saas_dashboard.md` (Project 9 owns; PROPOSE-ONLY — CC does NOT apply)
 
-### 5a. VERIFY still accurate (PASS)
+### 5a. PROPOSED EDIT — Clerk org_id re-correction at line 26
+
+The same wrong org_id propagated from `reference_credentials.md` into `project_saas_dashboard.md` line 26 during the 2026-04-21 audit's "correction." Per CLAUDE.md memory-ownership rule, Project 9 owns this file. CC writes the proposal here; Project 9 absorbs in its own session.
+
+**Anchor:**
+```
+- **Dean's Org:** org_3C2CaqUMSFDyZ9wTXmvFRGPoO0q (StealthMail; corrected 2026-04-21 audit — ends `O0q`)
+```
+
+**Proposed patch (Project 9 to apply):**
+```diff
+-- **Dean's Org:** org_3C2CaqUMSFDyZ9wTXmvFRGPoO0q (StealthMail; corrected 2026-04-21 audit — ends `O0q`)
++- **Dean's Org:** `org_3C2CaQuMSFDyZ9wTXmvFRGPoOOq` (StealthMail; 2026-04-29 audit re-correction — ends `OOq` = capital-O + capital-O + lowercase-q. The 2026-04-21 "correction" went the wrong way. Verified against `GET /v1/organizations` LIST endpoint 2026-04-29 + direct GET on both candidates. Same value patched in `.auto-memory/reference_credentials.md` per Project-8 ack.)
+```
+
+CC does NOT apply this edit. Project 9 absorbs in a follow-on session referencing this proposal. Cross-link: `2026-04-29-phase-9.5-clerk-drift.md` for the verification evidence.
+
+---
+
+## File 6 — `.auto-memory/feedback_clouding_panel_servers_offlimits.md` (Project 8 owns; verify-only)
+
+### 6a. VERIFY still accurate (PASS)
 
 Re-read at audit close: still accurate. The off-limits guardrail still applies to the 10 panel.* set. HL #143 stale-claim flag at line 15 is correctly noted; the correction landing in HL #143 (per File 2 §2b) honors the file's "don't fix HL #143 now per Dean's 'don't add to gameplan yet' directive" instruction by adding a 2026-04-29 audit annotation to HL #143 instead of rewriting it.
 
@@ -130,10 +166,11 @@ No edits required.
 
 ## Application order (per Dean's per-file ack at the 9.7 HALT)
 
-1. **`.auto-memory/MEMORY.md`** — file 1 (1a + 1b + 1c + 1d). CC applies on ack.
+1. **`.auto-memory/MEMORY.md`** — file 1 (1a + 1b + 1c + 1d). CC applies on ack. NOTE: do NOT rewrite the 2026-04-21 historical entry; the audit-close entry (1a) explicitly notes the re-correction and the historical entry stays as the durable record.
 2. **`.auto-memory/feedback_hard_lessons.md`** — files 2a (HL #146–#154 verbatim from sibling file) + 2b (HL #143 audit correction). CC applies on ack.
-3. **`.auto-memory/reference_credentials.md`** — file 3a + 3b + (optional 3c). CC applies on ack.
-4. **`.auto-memory/project_server_deployment.md`** — file 4. **PROPOSE ONLY**; surface to Dean and Project 1 takes it from here.
-5. **`.auto-memory/feedback_clouding_panel_servers_offlimits.md`** — file 5. **NO EDIT**; verify-only confirmation.
+3. **`.auto-memory/reference_credentials.md`** — file 3a (Clerk org_id re-correction — CRITICAL) + 3b (Clouding stale-key annotation) + 3c (post-audit notes incl. DATABASE_URL pooler-mode) + (optional 3d SUPABASE_ACCESS_TOKEN slot). CC applies on ack.
+4. **`.auto-memory/project_server_deployment.md`** — file 4. **PROPOSE ONLY**; Project 1 owns; surface to Dean and Project 1 takes it from here.
+5. **`.auto-memory/project_saas_dashboard.md`** — file 5. **PROPOSE ONLY**; Project 9 owns; same wrong org_id propagation as `reference_credentials.md` File 3a; Project 9 absorbs in a follow-on session.
+6. **`.auto-memory/feedback_clouding_panel_servers_offlimits.md`** — file 6. **NO EDIT**; verify-only confirmation.
 
 Phase 9.7 will surface each file in turn for explicit per-file ack before CC writes.
