@@ -11,6 +11,8 @@ import { handleAccountDeliverabilityMonitor } from "./handlers/account-deliverab
 import { handleCampaignPerformanceMonitor } from "./handlers/campaign-performance-monitor";
 import { handleDistributeCampaignSends } from "./handlers/distribute-campaign-sends";
 import { handleVerifyNewLeads } from "./handlers/verify-new-leads";
+import { handleOutscraperTaskPoll } from "./handlers/outscraper-task-poll";
+import { handleOutscraperTaskComplete } from "./handlers/outscraper-task-complete";
 import { handleProvisionPair } from "./handlers/provision-pair";
 import { handleProvisionStep } from "./handlers/provision-step";
 import { handleRollbackProvision } from "./handlers/rollback-provision";
@@ -75,6 +77,9 @@ async function main() {
     "pair-verify",
     "dbl-resweep-cron",
     "dbl-resweep",
+    "outscraper-task-poll-cron",
+    "outscraper-task-poll",
+    "outscraper-task-complete",
   ];
   for (const name of queueNames) {
     await boss.createQueue(name);
@@ -320,6 +325,72 @@ async function main() {
   await boss.work<VerifyNewLeadsPayload>(
     "verify-new-leads",
     withErrorHandling(handleVerifyNewLeads, "verify-new-leads")
+  );
+
+  // --- Leads V1a: async Outscraper task lifecycle ---
+  // Cron fans out one outscraper-task-poll job per pending row in
+  // outscraper_tasks every 2 minutes. Each poll either updates the row
+  // (still pending), enqueues outscraper-task-complete (success), or marks
+  // it failed (Outscraper terminal error). See:
+  //   - src/worker/handlers/outscraper-task-poll.ts
+  //   - src/worker/handlers/outscraper-task-complete.ts
+  await boss.schedule("outscraper-task-poll-cron", "*/2 * * * *");
+  await boss.work("outscraper-task-poll-cron", async () => {
+    try {
+      const supabase = getSupabase();
+      const { data: pending } = await supabase
+        .from("outscraper_tasks")
+        .select("outscraper_task_id")
+        .in("status", ["submitted", "polling"])
+        .order("created_at", { ascending: true })
+        .limit(50);
+      for (const row of pending || []) {
+        await boss.send("outscraper-task-poll", {
+          outscraperTaskId: row.outscraper_task_id,
+        });
+      }
+      if (pending && pending.length > 0) {
+        console.log(
+          `[Worker] Enqueued ${pending.length} outscraper-task-poll jobs`
+        );
+      }
+    } catch (err) {
+      console.error("[Worker] outscraper-task-poll-cron failed:", err);
+      throw err;
+    }
+  });
+
+  await boss.work<{ outscraperTaskId: string }>(
+    "outscraper-task-poll",
+    withErrorHandling(handleOutscraperTaskPoll, "outscraper-task-poll")
+  );
+
+  // localConcurrency=1 so two duplicate-delivered jobs can't double-insert
+  // the same Outscraper result set. The complete handler is also idempotent
+  // (status guard at top), but the concurrency cap is the cheaper guarantee.
+  await boss.work<{ outscraperTaskId: string }>(
+    "outscraper-task-complete",
+    {
+      batchSize: 1,
+      pollingIntervalSeconds: 5,
+      localConcurrency: 1,
+    },
+    async (jobs) => {
+      for (const job of jobs) {
+        try {
+          await handleOutscraperTaskComplete(job.data);
+          console.log(
+            `[Worker] outscraper-task-complete job ${job.id} done`
+          );
+        } catch (err) {
+          console.error(
+            `[Worker] outscraper-task-complete job ${job.id} failed:`,
+            err
+          );
+          throw err;
+        }
+      }
+    }
   );
 
   // Register pair-verify handler (in-app Pair Verify feature).
