@@ -177,17 +177,24 @@ export async function syncAccount(accountId: string): Promise<number> {
           }
         }
 
-        // Check for duplicate message_id
+        // Check for duplicate message_id (V1+b: also catches soft-deleted rows
+        // — Dean deleted the message, IMAP sync must NOT recreate it).
         if (parsed.message_id) {
           const { data: existing } = await supabase
             .from('inbox_messages')
-            .select('id')
+            .select('id, deleted_at')
             .eq('message_id', parsed.message_id)
-            .single();
+            .maybeSingle();
 
           if (existing) {
+            if (existing.deleted_at !== null) {
+              console.log(
+                `[Sync] Skipping deleted message_id ${parsed.message_id} ` +
+                  `(account ${accountId}, uid ${msg.uid})`
+              );
+            }
             if (msg.uid > maxUid) maxUid = msg.uid;
-            continue; // Skip duplicate
+            continue; // Skip duplicate (live OR soft-deleted)
           }
         }
 

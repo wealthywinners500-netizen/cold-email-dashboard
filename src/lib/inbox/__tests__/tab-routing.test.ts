@@ -260,6 +260,63 @@ test('null classification does NOT route to bounced', () => {
   assert(!isBouncedThread(thread), 'null leaked into bounced');
 });
 
+// ───── V1+b: warm-up exclusion in Bounced + Spam ─────
+console.log('\nV1+b warm-up exclusion (Bounced/Spam stop double-counting Snov warm-up):');
+
+test('warm-up + BOUNCE → NOT bounced (V1+b: warm-up wins)', () => {
+  // V1+a deploy report §4.1: 19 of 19 Bounced rows were also warm-up bounces
+  // — Snov manages its own warm-up bounce visibility, so we exclude here.
+  const thread = t({
+    subject: 'Following up on the new project idea - wsn',
+    latest_classification: 'BOUNCE',
+  });
+  assert(!isBouncedThread(thread), 'warm-up BOUNCE leaked into Bounced — V1+a regression');
+});
+
+test('non-warm-up + BOUNCE → still routes to bounced', () => {
+  // V1+b only excludes WHEN ALSO warm-up. Real bounces must still surface.
+  const thread = t({
+    subject: 'Re: your real cold-email campaign',
+    latest_classification: 'BOUNCE',
+  });
+  assert(isBouncedThread(thread), 'real bounce dropped from Bounced — V1+b over-tightened');
+});
+
+test('warm-up + SPAM → NOT spam (V1+b: warm-up wins)', () => {
+  const thread = t({
+    subject: 'Quick warm-up message - wsn',
+    latest_classification: 'SPAM',
+    participants: ['novel@unknown.example', 'gerald.murphy@krogerbrandimpact.info'],
+  });
+  assert(
+    !isSpamThread(thread, KNOWN_SENDERS),
+    'warm-up SPAM leaked into Spam — V1+a regression'
+  );
+});
+
+test('matchesTab("bounced") excludes warm-up BOUNCE', () => {
+  const thread = t({
+    subject: 'BBQ recipes - wsn',
+    latest_classification: 'BOUNCE',
+  });
+  assert(
+    !matchesTab('bounced', thread, KNOWN_SENDERS),
+    'matchesTab dispatch missed V1+b warm-up exclusion (Bounced)'
+  );
+});
+
+test('matchesTab("spam") excludes warm-up SPAM', () => {
+  const thread = t({
+    subject: 'Funny pet story - wsn',
+    latest_classification: 'SPAM',
+    participants: ['novel@unknown.example', 'gerald.murphy@krogerbrandimpact.info'],
+  });
+  assert(
+    !matchesTab('spam', thread, KNOWN_SENDERS),
+    'matchesTab dispatch missed V1+b warm-up exclusion (Spam)'
+  );
+});
+
 // ───── All ─────
 console.log('\nAll (V1+a — excludes warm-up + spam + bounced):');
 

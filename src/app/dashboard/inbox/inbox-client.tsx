@@ -9,6 +9,9 @@ import {
   Send,
   Loader2,
   Inbox as InboxIcon,
+  Trash2,
+  UserMinus,
+  X as XIcon,
 } from "lucide-react";
 import { createClient } from "@supabase/supabase-js";
 import DOMPurify from "isomorphic-dompurify";
@@ -132,6 +135,12 @@ export default function InboxClient() {
   const [replyText, setReplyText] = useState("");
   const [replyAccountId, setReplyAccountId] = useState("");
   const [sending, setSending] = useState(false);
+  // V1+b: bulk-select state. Set of thread IDs the user has checked.
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set());
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [unsubscribing, setUnsubscribing] = useState(false);
+  // After a successful unsub on the open thread, flip the button label.
+  const [unsubscribedFlag, setUnsubscribedFlag] = useState<string | null>(null);
 
   const buildQueryParams = useCallback(
     (page: number) => {
@@ -222,6 +231,8 @@ export default function InboxClient() {
   const selectThread = useCallback(
     async (thread: Thread) => {
       setSelectedThread(thread);
+      // Reset the per-thread unsubscribe flag when switching threads.
+      setUnsubscribedFlag(null);
       await fetchMessages(thread.id);
 
       // Mark as read
@@ -299,6 +310,103 @@ export default function InboxClient() {
     }
   };
 
+  // V1+b: soft-delete a single thread.
+  const deleteThread = async (thread: Thread, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!confirm(`Delete this thread?\n\n"${thread.subject || "(no subject)"}"`)) {
+      return;
+    }
+    const res = await fetch(`/api/inbox/threads/${thread.id}`, {
+      method: "DELETE",
+    });
+    if (res.ok) {
+      setThreads((prev) => prev.filter((t) => t.id !== thread.id));
+      setSelectedIds((prev) => {
+        if (!prev.has(thread.id)) return prev;
+        const next = new Set(prev);
+        next.delete(thread.id);
+        return next;
+      });
+      if (selectedThread?.id === thread.id) {
+        setSelectedThread(null);
+        setMessages([]);
+      }
+    }
+  };
+
+  // V1+b: bulk soft-delete via checkbox selection.
+  const bulkDeleteSelected = async () => {
+    if (selectedIds.size === 0) return;
+    if (
+      !confirm(
+        `Delete ${selectedIds.size} selected thread${selectedIds.size === 1 ? "" : "s"}? This cannot be undone from the UI.`
+      )
+    ) {
+      return;
+    }
+    setBulkDeleting(true);
+    try {
+      const ids = Array.from(selectedIds);
+      const res = await fetch("/api/inbox/threads/bulk-delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ thread_ids: ids }),
+      });
+      if (res.ok) {
+        setThreads((prev) => prev.filter((t) => !selectedIds.has(t.id)));
+        if (selectedThread && selectedIds.has(selectedThread.id)) {
+          setSelectedThread(null);
+          setMessages([]);
+        }
+        setSelectedIds(new Set());
+      } else {
+        const data = await res.json().catch(() => null);
+        alert(`Bulk delete failed: ${data?.error || res.statusText}`);
+      }
+    } finally {
+      setBulkDeleting(false);
+    }
+  };
+
+  // V1+b: per-row checkbox toggle. Stops propagation so toggling doesn't
+  // also open the thread.
+  const toggleSelect = (threadId: number, e: React.MouseEvent | React.ChangeEvent) => {
+    e.stopPropagation();
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(threadId)) next.delete(threadId);
+      else next.add(threadId);
+      return next;
+    });
+  };
+
+  // V1+b: manual unsubscribe of the open thread's contact.
+  const unsubscribeContact = async () => {
+    if (!selectedThread) return;
+    const inboundFrom = messages
+      .filter((m) => m.direction === "received")
+      .slice(-1)[0]?.from_email;
+    const target = inboundFrom || selectedThread.participants?.[0] || "this contact";
+    if (!confirm(`Unsubscribe ${target}?\n\nThey will be excluded from all future campaign sends.`)) {
+      return;
+    }
+    setUnsubscribing(true);
+    try {
+      const res = await fetch(
+        `/api/inbox/threads/${selectedThread.id}/unsubscribe-contact`,
+        { method: "POST" }
+      );
+      const data = await res.json().catch(() => null);
+      if (res.ok && data?.ok) {
+        setUnsubscribedFlag(target);
+      } else {
+        alert(`Unsubscribe failed: ${data?.error || res.statusText}`);
+      }
+    } finally {
+      setUnsubscribing(false);
+    }
+  };
+
   // Persist active tab to URL when it changes.
   useEffect(() => {
     const current = searchParams.get("tab");
@@ -365,7 +473,13 @@ export default function InboxClient() {
             {FILTER_TABS.map((tab) => (
               <button
                 key={tab.key}
-                onClick={() => setActiveTab(tab.key)}
+                onClick={() => {
+                  setActiveTab(tab.key);
+                  // V1+b: clear bulk selection when switching tabs to avoid
+                  // accidentally deleting threads from a tab the user is no
+                  // longer looking at.
+                  setSelectedIds(new Set());
+                }}
                 className={`px-3 py-2.5 text-xs font-medium transition-colors ${
                   activeTab === tab.key
                     ? "text-blue-400 border-b-2 border-blue-400"
@@ -376,6 +490,34 @@ export default function InboxClient() {
               </button>
             ))}
           </div>
+
+          {/* V1+b bulk-action toolbar — only visible when ≥1 thread selected */}
+          {selectedIds.size > 0 && (
+            <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-800 bg-blue-500/5">
+              <span className="text-xs text-blue-300">
+                {selectedIds.size} selected
+              </span>
+              <button
+                onClick={bulkDeleteSelected}
+                disabled={bulkDeleting}
+                className="ml-auto flex items-center gap-1.5 px-2.5 py-1 bg-red-600/20 hover:bg-red-600/30 disabled:opacity-50 rounded text-xs text-red-300 border border-red-500/30 transition-colors"
+              >
+                {bulkDeleting ? (
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                ) : (
+                  <Trash2 className="w-3 h-3" />
+                )}
+                Delete selected
+              </button>
+              <button
+                onClick={() => setSelectedIds(new Set())}
+                className="flex items-center gap-1 px-2 py-1 text-xs text-gray-400 hover:text-gray-200"
+              >
+                <XIcon className="w-3 h-3" />
+                Clear
+              </button>
+            </div>
+          )}
 
           {/* Search */}
           <div className="p-2 border-b border-gray-800">
@@ -441,6 +583,20 @@ export default function InboxClient() {
                     }`}
                   >
                     <div className="flex items-start gap-3">
+                      {/* V1+b checkbox for bulk select */}
+                      <div
+                        className="flex-shrink-0 pt-2"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedIds.has(thread.id)}
+                          onChange={(e) => toggleSelect(thread.id, e)}
+                          aria-label={`Select thread ${thread.id}`}
+                          className="w-4 h-4 cursor-pointer accent-blue-500"
+                        />
+                      </div>
+
                       {/* Avatar */}
                       <div className="flex-shrink-0 w-9 h-9 rounded-full bg-blue-600 flex items-center justify-center">
                         <span className="text-sm font-medium text-white">
@@ -502,6 +658,7 @@ export default function InboxClient() {
                         <button
                           onClick={(e) => toggleStar(thread, e)}
                           className="p-1 hover:bg-gray-700 rounded"
+                          aria-label="Toggle star"
                         >
                           <Star
                             className={`w-3.5 h-3.5 ${
@@ -514,8 +671,16 @@ export default function InboxClient() {
                         <button
                           onClick={(e) => archiveThread(thread, e)}
                           className="p-1 hover:bg-gray-700 rounded"
+                          aria-label="Archive thread"
                         >
                           <Archive className="w-3.5 h-3.5 text-gray-600" />
+                        </button>
+                        <button
+                          onClick={(e) => deleteThread(thread, e)}
+                          className="p-1 hover:bg-red-700/40 rounded"
+                          aria-label="Delete thread"
+                        >
+                          <Trash2 className="w-3.5 h-3.5 text-gray-600 hover:text-red-300" />
                         </button>
                       </div>
                     </div>
@@ -558,9 +723,35 @@ export default function InboxClient() {
             <>
               {/* Thread header */}
               <div className="px-6 py-4 border-b border-gray-800">
-                <h2 className="text-lg font-semibold text-white truncate">
-                  {selectedThread.subject || "(no subject)"}
-                </h2>
+                <div className="flex items-start justify-between gap-3">
+                  <h2 className="text-lg font-semibold text-white truncate flex-1">
+                    {selectedThread.subject || "(no subject)"}
+                  </h2>
+                  {/* V1+b: manual unsubscribe button + manual delete button */}
+                  <div className="flex items-center gap-1 flex-shrink-0">
+                    <button
+                      onClick={unsubscribeContact}
+                      disabled={unsubscribing || unsubscribedFlag !== null}
+                      className="flex items-center gap-1.5 px-2.5 py-1 bg-orange-500/10 hover:bg-orange-500/20 disabled:opacity-50 disabled:hover:bg-orange-500/10 rounded text-xs text-orange-300 border border-orange-500/30 transition-colors"
+                      title="Unsubscribe this contact (excludes from future campaign sends)"
+                    >
+                      {unsubscribing ? (
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                      ) : (
+                        <UserMinus className="w-3 h-3" />
+                      )}
+                      {unsubscribedFlag ? "Unsubscribed" : "Unsubscribe"}
+                    </button>
+                    <button
+                      onClick={(e) => deleteThread(selectedThread, e)}
+                      className="flex items-center gap-1.5 px-2.5 py-1 bg-red-500/10 hover:bg-red-500/20 rounded text-xs text-red-300 border border-red-500/30 transition-colors"
+                      title="Delete this thread"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                      Delete
+                    </button>
+                  </div>
+                </div>
                 <div className="flex items-center gap-3 mt-1">
                   <span className="text-sm text-gray-400">
                     {selectedThread.message_count} message

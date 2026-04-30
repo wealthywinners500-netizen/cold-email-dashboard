@@ -28,24 +28,26 @@ export async function GET(
     const supabase = await createAdminClient();
     const { threadId } = await params;
 
-    // Get all messages in thread
+    // Get all non-deleted messages in thread
     const { data: messages, error } = await supabase
       .from('inbox_messages')
       .select('*')
       .eq('thread_id', parseInt(threadId))
       .eq('org_id', orgId)
+      .is('deleted_at', null) // V1+b: hide soft-deleted
       .order('received_date', { ascending: true });
 
     if (error) {
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
-    // Get thread info
+    // Get thread info (404 if soft-deleted)
     const { data: thread } = await supabase
       .from('inbox_threads')
       .select('*')
       .eq('id', parseInt(threadId))
       .eq('org_id', orgId)
+      .is('deleted_at', null)
       .single();
 
     return NextResponse.json({ thread, messages });
@@ -76,6 +78,7 @@ export async function PATCH(
       .update(updates)
       .eq('id', parseInt(threadId))
       .eq('org_id', orgId)
+      .is('deleted_at', null) // V1+b: cannot patch a deleted thread
       .select()
       .single();
 
@@ -97,5 +100,58 @@ export async function PATCH(
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Internal error';
     return NextResponse.json({ error: message }, { status: 401 });
+  }
+}
+
+// V1+b: soft-delete a thread + all its messages.
+// Per spec: deleted_at is set on inbox_threads + every inbox_messages row in
+// the thread. Rows stay in DB; UI excludes; IMAP sync respects.
+export async function DELETE(
+  request: NextRequest,
+  { params }: { params: Promise<{ threadId: string }> }
+) {
+  try {
+    const orgId = await getInternalOrgId();
+    const supabase = await createAdminClient();
+    const { threadId } = await params;
+
+    const id = parseInt(threadId);
+    if (!Number.isFinite(id)) {
+      return NextResponse.json({ error: 'Invalid thread id' }, { status: 400 });
+    }
+
+    const now = new Date().toISOString();
+
+    const { data: thread, error: threadErr } = await supabase
+      .from('inbox_threads')
+      .update({ deleted_at: now, updated_at: now })
+      .eq('id', id)
+      .eq('org_id', orgId)
+      .is('deleted_at', null) // idempotent — re-delete is no-op
+      .select('id, deleted_at')
+      .maybeSingle();
+
+    if (threadErr) {
+      return NextResponse.json({ error: threadErr.message }, { status: 500 });
+    }
+
+    // Even if the thread was already deleted, fan out to messages — covers
+    // the rare case where a previous bulk-delete partial-failed.
+    await supabase
+      .from('inbox_messages')
+      .update({ deleted_at: now })
+      .eq('thread_id', id)
+      .eq('org_id', orgId)
+      .is('deleted_at', null);
+
+    return NextResponse.json({
+      ok: true,
+      thread_id: id,
+      deleted_at: thread?.deleted_at ?? now,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Internal error';
+    const status = message.includes('organization') ? 401 : 500;
+    return NextResponse.json({ error: message }, { status });
   }
 }

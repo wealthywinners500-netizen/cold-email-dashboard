@@ -105,9 +105,28 @@ async function getActiveAccountsCapacity(
 
 async function getPendingRecipients(
   supabase: ReturnType<typeof getSupabase>,
+  orgId: string,
   campaignId: string,
   limit: number
 ): Promise<CampaignRecipient[]> {
+  // V1+b: collect the org's unsubscribed emails, then exclude any pending
+  // recipient whose email matches. PostgREST has no NOT-IN-subquery, so a
+  // small in-process Set is the cleanest filter. Typical unsubscribed sets
+  // are small (sub-100s), so memory cost is negligible.
+  const { data: unsub } = await supabase
+    .from('lead_contacts')
+    .select('email')
+    .eq('org_id', orgId)
+    .not('unsubscribed_at', 'is', null);
+  const unsubSet = new Set(
+    (unsub || [])
+      .map((r: { email: string | null }) => (r.email || '').trim().toLowerCase())
+      .filter((e) => e.length > 0)
+  );
+
+  // Pad the limit so a heavily-unsubscribed campaign still produces `limit`
+  // sendable recipients per tick.
+  const fetchLimit = limit + unsubSet.size;
   const { data: recipients, error } = await supabase
     .from('campaign_recipients')
     .select(
@@ -115,14 +134,17 @@ async function getPendingRecipients(
     )
     .eq('campaign_id', campaignId)
     .eq('status', 'pending')
-    .limit(limit);
+    .limit(fetchLimit);
 
   if (error) {
     console.error(`Error fetching pending recipients for campaign ${campaignId}:`, error);
     return [];
   }
 
-  return (recipients as CampaignRecipient[]) || [];
+  const filtered = ((recipients as CampaignRecipient[]) || []).filter(
+    (r) => !unsubSet.has((r.email || '').trim().toLowerCase())
+  );
+  return filtered.slice(0, limit);
 }
 
 async function roundRobinAssign(
@@ -222,9 +244,10 @@ export async function handleDistributeCampaignSends(): Promise<void> {
       // Calculate how many recipients to process today
       const toDistribute = Math.min(schedule.max_per_day, totalCapacity);
 
-      // Fetch pending recipients
+      // Fetch pending recipients (V1+b: org-scoped to filter unsubscribed)
       const pendingRecipients = await getPendingRecipients(
         supabase,
+        campaign.org_id,
         campaign.id,
         toDistribute
       );
