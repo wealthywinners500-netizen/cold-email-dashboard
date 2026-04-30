@@ -35,7 +35,9 @@ const SYSTEM_PROMPT = `You are an email reply classifier for a B2B cold email ca
 - STOP: Unsubscribe request, "remove me", "stop emailing", threatening legal action, hostile response
 - SPAM: Spam filter notification, flagged as spam, marked as junk
 
-Respond with ONLY a JSON object: {"classification": "CATEGORY", "confidence": 0.0-1.0}`;
+Respond with ONLY a JSON object: {"classification": "CATEGORY", "confidence": 0.0-1.0}
+
+Respond with ONLY a JSON object on a single line. Do not wrap in markdown fences. Do not include any prose.`;
 
 /**
  * Classify a single email reply using Claude Haiku
@@ -63,13 +65,15 @@ export async function classifyReply(
     response.content[0].type === 'text' ? response.content[0].text : '';
 
   try {
-    const result = JSON.parse(text.trim());
+    let parseInput = text.trim();
+    const fenceMatch = parseInput.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
+    if (fenceMatch) parseInput = fenceMatch[1].trim();
+    const result = JSON.parse(parseInput);
     return {
       classification: result.classification as Classification,
       confidence: Math.min(1, Math.max(0, result.confidence || 0.5)),
     };
   } catch {
-    // If parsing fails, default to AUTO_REPLY with low confidence
     console.error('[Classifier] Failed to parse response:', text);
     return { classification: 'AUTO_REPLY', confidence: 0.3 };
   }
