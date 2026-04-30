@@ -1294,6 +1294,65 @@ export interface OutscraperSearchResult {
   contacts: LeadContact[];
 }
 
+// V1a: custom lists + async Outscraper task tracking (migration 023)
+
+export interface OutscraperFilters {
+  query: string;
+  location: string;
+  region?: string;
+  vertical?: string;
+  sub_vertical?: string;
+  places_per_query: number;
+  websites_only: boolean;
+  operational_only: boolean;
+  language: string;
+  max_per_query: number;
+  enrichment: string[];
+}
+
+export interface LeadList {
+  id: string;
+  org_id: string;
+  name: string;
+  description: string | null;
+  region: string | null;
+  vertical: string | null;
+  sub_vertical: string | null;
+  suggested_filters: Partial<OutscraperFilters> | Record<string, unknown>;
+  total_leads: number;
+  last_scrape_status: 'submitted' | 'polling' | 'downloading' | 'complete' | 'failed' | null;
+  last_scrape_started_at: string | null;
+  last_scrape_completed_at: string | null;
+  last_scrape_error: string | null;
+  archived_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type OutscraperTaskStatus =
+  | 'submitted'
+  | 'polling'
+  | 'downloading'
+  | 'complete'
+  | 'failed';
+
+export interface OutscraperTask {
+  id: string;
+  org_id: string;
+  lead_list_id: string;
+  outscraper_task_id: string;
+  status: OutscraperTaskStatus;
+  filters: OutscraperFilters | Record<string, unknown>;
+  estimated_count: number | null;
+  estimated_cost_cents: number | null;
+  actual_count: number | null;
+  results_location: string | null;
+  error_message: string | null;
+  last_polled_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+}
+
 export interface VerificationResult {
   verified: number;
   valid: number;
