@@ -1,11 +1,13 @@
 export const dynamic = 'force-dynamic';
 
 import { getLeads } from "@/lib/supabase/queries";
-import { getLeadContacts, getLeadContactStats, getOrganizationIntegrations } from "@/lib/supabase/queries";
+import { getLeadContacts, getLeadContactStats, getOrganizationIntegrations, getLeadLists } from "@/lib/supabase/queries";
 import { auth } from "@clerk/nextjs/server";
 import { createAdminClient } from "@/lib/supabase/server";
 import LeadsClient from "./leads-client";
 import LeadContactsClient from "./lead-contacts-client";
+import LeadListsClient from "./lead-lists-client";
+import type { LeadList } from "@/lib/supabase/types";
 
 async function getInternalOrgId(): Promise<string | null> {
   const { orgId } = await auth();
@@ -25,10 +27,21 @@ export default async function LeadsPage({
   searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
 }) {
   const params = await searchParams;
-  const tab = (params.tab as string) || "contacts";
+  const tab = (params.tab as string) || "lists";
   const page = parseInt((params.page as string) || "1", 10);
+  const activeListId = (params.list as string) || null;
 
   const orgId = await getInternalOrgId();
+
+  // V1a: pre-fetch lead_lists for the new "Lists" tab (cheap query, small N).
+  let leadLists: LeadList[] = [];
+  if (orgId) {
+    try {
+      leadLists = (await getLeadLists(orgId)) as LeadList[];
+    } catch (err) {
+      console.error("Failed to fetch lead lists:", err);
+    }
+  }
 
   // Fetch batch leads (existing)
   let leads: Awaited<ReturnType<typeof getLeads>> = [];
@@ -82,6 +95,16 @@ export default async function LeadsPage({
       {/* Tabs */}
       <div className="flex gap-1 bg-gray-900 rounded-lg p-1 w-fit">
         <a
+          href="/dashboard/leads?tab=lists"
+          className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+            tab === "lists"
+              ? "bg-blue-600 text-white"
+              : "text-gray-400 hover:text-white hover:bg-gray-800"
+          }`}
+        >
+          Lists ({leadLists.length})
+        </a>
+        <a
           href="/dashboard/leads?tab=contacts"
           className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
             tab === "contacts"
@@ -104,7 +127,13 @@ export default async function LeadsPage({
       </div>
 
       {/* Tab Content */}
-      {tab === "contacts" ? (
+      {tab === "lists" ? (
+        <LeadListsClient
+          initialLists={leadLists}
+          activeListId={activeListId}
+          initialView={(params.view as string) || "search"}
+        />
+      ) : tab === "contacts" ? (
         <LeadContactsClient
           contacts={contactsData.data}
           stats={contactStats}

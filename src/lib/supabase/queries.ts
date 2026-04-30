@@ -1358,3 +1358,105 @@ export async function updateSSHCredentials(credId: string, updates: {
   if (error) throw error;
   return data;
 }
+
+// ============================================
+// V1a: Lead Lists + Outscraper Tasks
+// ============================================
+
+export async function getLeadLists(orgId: string) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('lead_lists')
+    .select('*')
+    .eq('org_id', orgId)
+    .is('archived_at', null)
+    .order('created_at', { ascending: false });
+
+  if (error) throw error;
+  return data || [];
+}
+
+export async function getLeadList(orgId: string, listId: string) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('lead_lists')
+    .select('*')
+    .eq('org_id', orgId)
+    .eq('id', listId)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
+}
+
+export async function getLatestOutscraperTaskForList(orgId: string, listId: string) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('outscraper_tasks')
+    .select('*')
+    .eq('org_id', orgId)
+    .eq('lead_list_id', listId)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
+}
+
+export async function getLeadsInList(
+  orgId: string,
+  listId: string,
+  filters?: {
+    page?: number;
+    perPage?: number;
+    email_status?: string;
+    search?: string;
+  }
+) {
+  const supabase = await createAdminClient();
+  const page = filters?.page || 1;
+  const perPage = filters?.perPage || 50;
+
+  let query = supabase
+    .from('lead_contacts')
+    .select('*', { count: 'exact' })
+    .eq('org_id', orgId)
+    .eq('lead_list_id', listId);
+
+  if (filters?.email_status) {
+    query = query.eq('email_status', filters.email_status);
+  }
+  if (filters?.search) {
+    query = query.or(
+      `business_name.ilike.%${filters.search}%,email.ilike.%${filters.search}%`
+    );
+  }
+
+  query = query
+    .order('created_at', { ascending: false })
+    .range((page - 1) * perPage, page * perPage - 1);
+
+  const { data, error, count } = await query;
+  if (error) throw error;
+
+  return {
+    data: data || [],
+    total: count || 0,
+    page,
+    totalPages: Math.ceil((count || 0) / perPage),
+  };
+}
+
+export async function getOutscraperTaskById(orgId: string, outscraperTaskId: string) {
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from('outscraper_tasks')
+    .select('*')
+    .eq('org_id', orgId)
+    .eq('outscraper_task_id', outscraperTaskId)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
+}
