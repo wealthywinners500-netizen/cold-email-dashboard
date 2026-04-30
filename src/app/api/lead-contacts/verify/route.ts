@@ -55,8 +55,10 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Extract Reoon API key
-    const reoon_api_key = org.integrations?.reoon_api_key;
+    // Extract Reoon API key — prefer org-level (multi-tenant isolation), fall back
+    // to platform-level so orgs that haven't configured one still verify.
+    const reoon_api_key =
+      org.integrations?.reoon_api_key || process.env.REOON_API_KEY;
     if (!reoon_api_key) {
       return NextResponse.json(
         {

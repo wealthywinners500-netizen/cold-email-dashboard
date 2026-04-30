@@ -7,13 +7,22 @@ interface ReoonSingleResult {
   [key: string]: unknown;
 }
 
-function mapReoonStatus(status: string): 'valid' | 'invalid' | 'risky' | 'unknown' {
+// Reoon Power-mode `status` values seen in production: safe, invalid, disabled,
+// disposable, spamtrap, risky, role_account, catch_all, unknown. Legacy aliases
+// ('valid', 'accept_all', 'role') retained for forward-compat in case Reoon renames.
+export function mapReoonStatus(status: string): 'valid' | 'invalid' | 'risky' | 'unknown' {
   switch (status?.toLowerCase()) {
+    case 'safe':
     case 'valid':
       return 'valid';
     case 'invalid':
+    case 'disabled':
     case 'disposable':
+    case 'spamtrap':
       return 'invalid';
+    case 'risky':
+    case 'role_account':
+    case 'catch_all':
     case 'accept_all':
     case 'role':
       return 'risky';
