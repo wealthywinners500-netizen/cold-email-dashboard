@@ -1297,17 +1297,26 @@ export interface OutscraperSearchResult {
 // V1a: custom lists + async Outscraper task tracking (migration 023)
 
 export interface OutscraperFilters {
-  query: string;
-  location: string;
+  // V8 (2026-04-30): rewritten to /tasks API shape. `categories` + `locations`
+  // replace the V1a single-string `query` field. `query`/`location` kept for
+  // one cycle as deprecated free-text inputs the form may pre-populate from
+  // suggested_filters but no longer drive the request.
+  categories: string[];
+  locations: string[];
+  use_zip_codes: boolean;
+  ignore_without_emails: boolean;
+  drop_email_duplicates: boolean;
+  organizations_per_query_limit: number;
+  limit: number;
+  preferred_contacts: string[];
   region?: string;
   vertical?: string;
   sub_vertical?: string;
-  places_per_query: number;
-  websites_only: boolean;
-  operational_only: boolean;
   language: string;
-  max_per_query: number;
-  enrichment: string[];
+  /** @deprecated V1a — kept for one release cycle while UI migrates. */
+  query?: string;
+  /** @deprecated V1a — kept for one release cycle while UI migrates. */
+  location?: string;
 }
 
 export interface LeadList {

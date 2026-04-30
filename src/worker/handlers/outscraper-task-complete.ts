@@ -52,8 +52,21 @@ export function buildLeadContactInserts(
   rows: OutscraperBusinessRow[],
   nowIso = new Date().toISOString()
 ): Record<string, unknown>[] {
-  const filters = (task.filters || {}) as { query?: string };
-  const scrapeQuery = (filters.query || '').slice(0, 500);
+  const filters = (task.filters || {}) as {
+    query?: string;
+    categories?: string[];
+    locations?: string[];
+  };
+  const scrapeQuery = (() => {
+    if (typeof filters.query === 'string' && filters.query.length > 0) {
+      return filters.query.slice(0, 500);
+    }
+    if (Array.isArray(filters.categories) && Array.isArray(filters.locations)) {
+      const composed = `${filters.categories.join(',')} | ${filters.locations.slice(0, 10).join(',')}`;
+      return composed.slice(0, 500);
+    }
+    return null;
+  })();
   const inserts: Record<string, unknown>[] = [];
   for (const r of rows) {
     const mapped = mapOutscraperRowToLeadContact(r);
@@ -66,6 +79,8 @@ export function buildLeadContactInserts(
       business_name: mapped.business_name,
       business_type: mapped.business_type,
       email: mapped.email,
+      first_name: mapped.first_name,
+      last_name: mapped.last_name,
       phone: mapped.phone,
       website: mapped.website,
       address: mapped.full_address,
@@ -77,7 +92,7 @@ export function buildLeadContactInserts(
       google_reviews_count: mapped.google_reviews_count,
       google_place_id: mapped.google_place_id,
       scrape_source: 'outscraper',
-      scrape_query: scrapeQuery || null,
+      scrape_query: scrapeQuery,
       scraped_at: nowIso,
       email_status: 'pending',
     });

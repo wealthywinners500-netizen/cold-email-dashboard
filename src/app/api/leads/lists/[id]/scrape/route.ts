@@ -1,7 +1,13 @@
-// V1a: trigger an async Outscraper scrape for a list. Submits the task,
+// V1a + V8: trigger an async Outscraper scrape for a list. Submits the task,
 // records it in outscraper_tasks (status='submitted'), updates the list's
 // last_scrape_started_at, and returns the task id. The worker cron picks
 // it up within ~2 minutes.
+//
+// V8 (2026-04-30): rewrote filter resolution to the /tasks API shape —
+// categories[] + locations[] + use_zip_codes + organizations_per_query_limit
+// + preferred_contacts. Drops legacy single-string `query` from the wire
+// format; UI form may still pre-populate legacy fields from suggested_filters
+// for one cycle.
 import { auth } from "@clerk/nextjs/server";
 import { createAdminClient } from "@/lib/supabase/server";
 import { NextRequest, NextResponse } from "next/server";
@@ -9,6 +15,13 @@ import { submitMapsSearchTask } from "@/lib/outscraper/client";
 import { estimateCostCents } from "@/lib/outscraper/cost";
 import { getLeadList } from "@/lib/supabase/queries";
 import type { OutscraperFilters } from "@/lib/supabase/types";
+
+const DEFAULT_PREFERRED_CONTACTS = [
+  "decision makers",
+  "operations",
+  "marketing",
+  "sales",
+];
 
 async function getInternalOrgId(): Promise<string | null> {
   const { orgId } = await auth();
@@ -25,6 +38,22 @@ async function getInternalOrgId(): Promise<string | null> {
 interface ScrapeBody {
   filters?: Partial<OutscraperFilters>;
   estimated_count?: number;
+}
+
+function asStringArray(input: unknown): string[] {
+  if (Array.isArray(input)) {
+    return input
+      .filter((v): v is string => typeof v === "string")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  }
+  if (typeof input === "string") {
+    return input
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  }
+  return [];
 }
 
 export async function POST(
@@ -67,39 +96,58 @@ export async function POST(
   }
 
   const f = body.filters || {};
-  const query = (f.query || "").trim();
-  if (!query) {
+  const categories = asStringArray(
+    f.categories ?? (typeof f.query === "string" ? f.query : undefined)
+  );
+  const locations = asStringArray(
+    f.locations ?? (typeof f.location === "string" ? f.location : undefined)
+  );
+
+  if (categories.length === 0) {
     return NextResponse.json(
-      { error: "filters.query is required (e.g. 'senior care, Atlanta GA')" },
+      { error: "filters.categories must be a non-empty string array (e.g. ['dentist'])" },
+      { status: 400, headers: { "Cache-Control": "no-store" } }
+    );
+  }
+  if (locations.length === 0) {
+    return NextResponse.json(
+      { error: "filters.locations must be a non-empty string array of ZIP codes (e.g. ['30309'])" },
       { status: 400, headers: { "Cache-Control": "no-store" } }
     );
   }
 
-  // Resolved filters with skill defaults.
+  const orgsPerQuery =
+    typeof f.organizations_per_query_limit === "number" &&
+    f.organizations_per_query_limit > 0
+      ? Math.min(f.organizations_per_query_limit, 1000)
+      : 200;
+
+  const preferredContacts =
+    Array.isArray(f.preferred_contacts) && f.preferred_contacts.length > 0
+      ? f.preferred_contacts.map((s) => String(s).trim()).filter((s) => s.length > 0)
+      : DEFAULT_PREFERRED_CONTACTS;
+
   const resolved: OutscraperFilters = {
-    query,
-    location: (f.location || "").trim(),
+    categories,
+    locations,
+    use_zip_codes: f.use_zip_codes !== false,
+    ignore_without_emails: f.ignore_without_emails !== false,
+    drop_email_duplicates: f.drop_email_duplicates !== false,
+    organizations_per_query_limit: orgsPerQuery,
+    limit: typeof f.limit === "number" ? f.limit : 0,
+    preferred_contacts: preferredContacts,
     region: f.region || list.region || undefined,
     vertical: f.vertical || list.vertical || undefined,
     sub_vertical: f.sub_vertical || list.sub_vertical || undefined,
-    places_per_query:
-      typeof f.places_per_query === "number" && f.places_per_query > 0
-        ? Math.min(f.places_per_query, 1000)
-        : 200,
-    websites_only: f.websites_only !== false,
-    operational_only: f.operational_only !== false,
     language: f.language || "en",
-    max_per_query: typeof f.max_per_query === "number" ? f.max_per_query : 0,
-    enrichment:
-      Array.isArray(f.enrichment) && f.enrichment.length > 0
-        ? f.enrichment
-        : ["emails_and_contacts"],
   };
 
+  const queries = categories.length * locations.length;
+  const blendedLeadEstimate = queries * orgsPerQuery;
   const estimatedCount =
     typeof body.estimated_count === "number" && body.estimated_count > 0
       ? Math.floor(body.estimated_count)
-      : resolved.places_per_query;
+      : blendedLeadEstimate;
   const estimatedCostCents = estimateCostCents(estimatedCount);
 
   let submitResult;
