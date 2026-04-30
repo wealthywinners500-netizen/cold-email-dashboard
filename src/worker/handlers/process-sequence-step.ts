@@ -75,6 +75,31 @@ export async function handleProcessSequenceStep(
     throw new Error(`Recipient not found: ${recipientId}`);
   }
 
+  // V1+b: hard stop if the contact has been unsubscribed since enqueue.
+  // This catches the race window between distribute-campaign-sends queueing
+  // and the actual send tick (could be hours given send-window pacing).
+  const recipientEmail = String(recipient.email || "").trim().toLowerCase();
+  if (recipientEmail) {
+    const { data: unsubContact } = await supabase
+      .from("lead_contacts")
+      .select("id, unsubscribed_at")
+      .eq("org_id", orgId)
+      .ilike("email", recipientEmail)
+      .not("unsubscribed_at", "is", null)
+      .maybeSingle();
+
+    if (unsubContact?.unsubscribed_at) {
+      console.log(
+        `[Sequence] Skipping ${recipientEmail} — contact unsubscribed at ${unsubContact.unsubscribed_at}`
+      );
+      await supabase
+        .from("campaign_recipients")
+        .update({ status: "unsubscribed" })
+        .eq("id", recipientId);
+      return; // do not advance step, do not send
+    }
+  }
+
   // 5. Fetch email_accounts by state.assigned_account_id
   const { data: account, error: accountErr } = await supabase
     .from("email_accounts")

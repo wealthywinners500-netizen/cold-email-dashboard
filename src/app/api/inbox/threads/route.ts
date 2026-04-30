@@ -76,6 +76,7 @@ export async function GET(request: NextRequest) {
       .select('*', { count: 'exact' })
       .eq('org_id', orgId)
       .eq('is_archived', false)
+      .is('deleted_at', null) // V1+b: hide soft-deleted threads from every tab
       .order('latest_message_date', { ascending: false });
 
     if (hints.subjectIlike) query = query.ilike('subject', hints.subjectIlike);
@@ -107,6 +108,7 @@ export async function GET(request: NextRequest) {
         .from('inbox_messages')
         .select('thread_id')
         .eq('org_id', orgId)
+        .is('deleted_at', null) // V1+b: don't surface deleted message hits
         .textSearch('search_vector', search)
         .limit(500);
 

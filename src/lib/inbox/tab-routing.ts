@@ -76,7 +76,12 @@ export function isWarmUpThread(thread: ThreadLike): boolean {
 //   2. From-side participants are NOT in the org's known-sender set.
 // DKIM signal absent in schema; "needs >=2 of the remaining + content check"
 // resolves to (1) AND (2) given the keyword check would over-tighten to zero.
+//
+// V1+b (2026-04-30): warm-up wins. Snov.io warm-up SPAM-classified rows
+// surfaced in BOTH Warm Up and Spam tabs prior to V1+b — the double-count
+// cluttered Spam tab. Snov manages its own warm-up bounce/spam visibility.
 export function isSpamThread(thread: ThreadLike, knownSenders: Set<string>): boolean {
+  if (isWarmUpThread(thread)) return false;
   if (thread.latest_classification !== 'SPAM') return false;
 
   const accounts = new Set((thread.account_emails || []).map((e) => e.toLowerCase()));
@@ -94,7 +99,11 @@ export function isSpamThread(thread: ThreadLike, knownSenders: Set<string>): boo
   return true;
 }
 
+// V1+b: same warm-up exclusion as Spam — Snov warm-up bounces double-counted
+// across Warm Up + Bounced (V1+a deploy report §4.1, ~19 of 19 Bounced rows
+// were also warm-up).
 export function isBouncedThread(thread: ThreadLike): boolean {
+  if (isWarmUpThread(thread)) return false;
   return thread.latest_classification === 'BOUNCE';
 }
 

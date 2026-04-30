@@ -34,6 +34,7 @@ export async function GET(request: NextRequest) {
       .from('inbox_messages')
       .select('id, thread_id, subject, from_email, from_name, body_preview, received_date, classification')
       .eq('org_id', orgId)
+      .is('deleted_at', null) // V1+b: don't surface deleted messages in search
       .textSearch('search_vector', q)
       .order('received_date', { ascending: false })
       .limit(50);

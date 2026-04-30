@@ -7,6 +7,7 @@ import {
 } from '../../lib/email/reply-classifier';
 import { handleReply, handleBounce, handleOptOut } from '../../lib/email/sequence-engine';
 import { handleImapError } from '../../lib/email/error-handler';
+import { resolveLeadContactForEmail } from '../../lib/email/contact-lookup';
 
 function getSupabase() {
   return createClient(
@@ -45,6 +46,66 @@ export function isEmptyMessage(
     (!replyOnlyText || replyOnlyText.trim() === '') &&
     (!bodyText || bodyText.trim() === '')
   );
+}
+
+// V1+b auto-unsubscribe on STOP. Idempotent — short-circuits if classification
+// is not STOP, contact is missing, or contact is already unsubscribed.
+// Surfaces a system_alerts row of kind=auto_unsubscribe so the dashboard can
+// show a feed of recent auto-unsubs without a separate audit table.
+export async function applyAutoUnsubscribe(
+  supabase: SupabaseClient,
+  orgId: string,
+  fromEmail: string | null | undefined,
+  classification: Classification,
+  messageId: number
+): Promise<{ applied: boolean; contactId: string | null }> {
+  if (classification !== 'STOP') return { applied: false, contactId: null };
+
+  const contact = await resolveLeadContactForEmail(supabase, orgId, fromEmail);
+  if (!contact) return { applied: false, contactId: null };
+  if (contact.unsubscribed_at) return { applied: false, contactId: contact.id };
+
+  const now = new Date().toISOString();
+  const { error: updateErr } = await supabase
+    .from('lead_contacts')
+    .update({ unsubscribed_at: now, updated_at: now })
+    .eq('id', contact.id)
+    .eq('org_id', orgId)
+    .is('unsubscribed_at', null);
+
+  if (updateErr) {
+    console.error(`[AutoUnsub] Update failed for contact ${contact.id}:`, updateErr.message);
+    await supabase.from('system_alerts').insert({
+      org_id: orgId,
+      alert_type: 'auto_unsubscribe_error',
+      severity: 'warning',
+      title: 'Auto-unsubscribe failed',
+      details: {
+        contact_id: contact.id,
+        message_id: messageId,
+        error: updateErr.message?.substring(0, 500),
+      },
+    });
+    return { applied: false, contactId: contact.id };
+  }
+
+  await supabase.from('system_alerts').insert({
+    org_id: orgId,
+    alert_type: 'auto_unsubscribe',
+    severity: 'info',
+    title: `Auto-unsubscribed contact (STOP reply)`,
+    details: {
+      contact_id: contact.id,
+      message_id: messageId,
+      classification,
+      from_email: (fromEmail || '').toLowerCase(),
+      unsubscribed_at: now,
+    },
+  });
+  console.log(
+    `[AutoUnsub] STOP reply from ${(fromEmail || '').toLowerCase()} → contact ${contact.id} unsubscribed`
+  );
+  return { applied: true, contactId: contact.id };
 }
 
 async function pacedClassifyReply(
@@ -205,6 +266,17 @@ export async function handleClassifyReply(data: { messageId: number }): Promise<
       .eq('id', msg.thread_id);
   }
 
+  // V1+b: auto-unsub on STOP — fires regardless of campaign attachment so
+  // pure-IMAP STOP replies (replies to non-tracked sends, manual outreach,
+  // etc.) still mark the contact as unsubscribed.
+  await applyAutoUnsubscribe(
+    supabase,
+    message.org_id,
+    message.from_email,
+    result.classification as Classification,
+    data.messageId
+  );
+
   // Wire into B8 sequence engine
   if (message.campaign_id && message.recipient_id) {
     await wireClassificationToSequenceEngine(
@@ -232,7 +304,7 @@ export async function handleClassifyBatch(): Promise<void> {
   // Find unclassified received messages
   const { data: messages, error } = await supabase
     .from('inbox_messages')
-    .select('id, thread_id, reply_only_text, body_text, subject, campaign_id, recipient_id, org_id')
+    .select('id, thread_id, reply_only_text, body_text, subject, campaign_id, recipient_id, org_id, from_email')
     .eq('direction', 'received')
     .is('classification', null)
     .order('received_date', { ascending: true })
@@ -286,6 +358,15 @@ export async function handleClassifyBatch(): Promise<void> {
         })
         .eq('id', message.thread_id);
     }
+
+    // V1+b: auto-unsub on STOP — same idempotent flow as handleClassifyReply.
+    await applyAutoUnsubscribe(
+      supabase,
+      message.org_id,
+      message.from_email,
+      result.classification as Classification,
+      message.id
+    );
 
     if (message.campaign_id && message.recipient_id) {
       await wireClassificationToSequenceEngine(
