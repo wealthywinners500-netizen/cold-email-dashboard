@@ -68,6 +68,7 @@ interface Pagination {
 
 const CLASSIFICATION_COLORS: Record<string, string> = {
   INTERESTED: "bg-green-500/20 text-green-400 border-green-500/30",
+  HOT_LEAD: "bg-emerald-500/20 text-emerald-300 border-emerald-500/40",
   NOT_INTERESTED: "bg-gray-500/20 text-gray-400 border-gray-500/30",
   OBJECTION: "bg-yellow-500/20 text-yellow-400 border-yellow-500/30",
   AUTO_REPLY: "bg-blue-500/20 text-blue-400 border-blue-500/30",
@@ -79,7 +80,9 @@ const CLASSIFICATION_COLORS: Record<string, string> = {
 const FILTER_TABS: { key: Tab; label: string }[] = [
   { key: "all", label: "All" },
   { key: "warm-up", label: "Warm Up" },
+  { key: "interested", label: "Interested" },
   { key: "hot-leads", label: "Hot Leads" },
+  { key: "bounced", label: "Bounced" },
   { key: "spam", label: "Spam" },
 ];
 
