@@ -13,6 +13,7 @@ function getAnthropic(): Anthropic {
 
 export type Classification =
   | 'INTERESTED'
+  | 'HOT_LEAD'
   | 'NOT_INTERESTED'
   | 'OBJECTION'
   | 'AUTO_REPLY'
@@ -27,7 +28,8 @@ export interface ClassificationResult {
 
 const SYSTEM_PROMPT = `You are an email reply classifier for a B2B cold email campaign. Classify the email reply into exactly ONE category:
 
-- INTERESTED: The recipient expresses interest, asks questions, requests more info, wants to meet/call, or asks for pricing
+- INTERESTED: The recipient asks for general info or pricing, but does NOT ask substantive qualifying questions. First-touch soft positive.
+- HOT_LEAD: The recipient asks specific qualifying questions about pricing depth, contract terms, turnaround time, typical clients, decision-makers, or next steps. Engaged with substance, ready for direct follow-up.
 - NOT_INTERESTED: The recipient declines politely but does not ask to be removed
 - OBJECTION: The recipient raises a concern or objection but hasn't fully declined (budget, timing, authority, need)
 - AUTO_REPLY: Out-of-office, vacation, auto-responder, delivery notification, read receipt
@@ -79,30 +81,6 @@ export async function classifyReply(
   }
 }
 
-/**
- * Batch classify multiple replies
- * Uses sequential calls (Claude Batch API requires different setup)
- */
-export async function classifyBatch(
-  replies: { id: number; text: string; subject?: string }[]
-): Promise<Map<number, ClassificationResult>> {
-  const results = new Map<number, ClassificationResult>();
-
-  // Process in parallel batches of 10 for speed
-  const batchSize = 10;
-  for (let i = 0; i < replies.length; i += batchSize) {
-    const batch = replies.slice(i, i + batchSize);
-    const promises = batch.map(async (reply) => {
-      try {
-        const result = await classifyReply(reply.text, reply.subject);
-        results.set(reply.id, result);
-      } catch (err) {
-        console.error(`[Classifier] Error classifying message ${reply.id}:`, err);
-        results.set(reply.id, { classification: 'AUTO_REPLY', confidence: 0.1 });
-      }
-    });
-    await Promise.all(promises);
-  }
-
-  return results;
-}
+// Batching is handled at the worker layer (src/worker/handlers/sync-inbox.ts)
+// where the empty-text short-circuit + rate-limit pacing live alongside the
+// per-message persistence + sequence-engine wiring.

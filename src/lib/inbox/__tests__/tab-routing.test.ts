@@ -1,22 +1,26 @@
 /**
  * Unibox tab routing — pure-predicate unit tests.
  *
- * Pins the 4-tab UX shipped on 2026-04-29:
- *   All / Warm Up / Hot Leads / Spam
+ * V1+a (2026-04-30) extends the 4-tab UX to 6 tabs:
+ *   All / Warm Up / Interested / Hot Leads / Bounced / Spam
  *
- * Design doc: dashboard-app/reports/2026-04-29-unibox-ux-design.md
+ * Design docs:
+ *   dashboard-app/reports/2026-04-29-unibox-ux-design.md (PR #24, 4-tab base)
+ *   dashboard-app/reports/2026-04-29-unibox-v1a-design.md (V1+a, 6-tab)
  *
  * Locked decisions exercised here:
- *   - Warm Up signal: subject suffix '- wsn' (Snov.io warm-up marker; matched
- *     301/675 live threads as of 2026-04-29). Plus self-test secondary signal
- *     (all participants are our own accounts).
- *   - Spam routing: CONSERVATIVE multi-signal AND. Requires latest_classification
- *     = 'SPAM' AND no external participant is a known sender. Single signals
- *     (LLM SPAM only, or unknown sender only) MUST NOT route to Spam.
- *   - Hot Leads: classification IN (OBJECTION, INTERESTED) — engagement (pushback
- *     or interest) per Dean's mental model. Excludes warm-up + spam.
- *   - All: NOT warm-up AND NOT spam (Dean's stated intent: "separate Snov.io
- *     warm-up from real replies"; All is the useful default, not the union).
+ *   - Warm Up: subject suffix '- wsn' (Snov.io warm-up marker; matched 301/675
+ *     live threads as of 2026-04-29). Plus self-test (all-participants-our-accounts).
+ *   - Spam: CONSERVATIVE multi-signal AND. latest_classification = 'SPAM' AND
+ *     no external participant is a known sender. Single signals MUST NOT fire.
+ *   - Interested (V1+a): classification = 'INTERESTED' — soft first-touch
+ *     positive ("asks for info/pricing"). Distinct from HOT_LEAD.
+ *   - Hot Leads (V1+a redefined): classification IN (HOT_LEAD, OBJECTION) —
+ *     substantive qualifying questions or pushback. Excludes warm-up + spam.
+ *   - Bounced: classification = 'BOUNCE'.
+ *   - All: NOT (warm-up OR spam OR bounced). Includes Interested + Hot Leads
+ *     as visible subsets so Dean's default view shows engagement alongside
+ *     AUTO_REPLY/NOT_INTERESTED/STOP.
  *
  * No Supabase, no network. Runs standalone via `tsx`.
  */
@@ -24,7 +28,9 @@
 import {
   isWarmUpThread,
   isSpamThread,
+  isInterestedThread,
   isHotLeadThread,
+  isBouncedThread,
   isAllThread,
   matchesTab,
   parseTab,
@@ -165,17 +171,49 @@ test('null classification + unknown sender → NOT spam', () => {
   assert(!isSpamThread(thread, KNOWN_SENDERS), 'null classification leaked into spam');
 });
 
-// ───── Hot Leads ─────
-console.log('\nHot Leads:');
+// ───── Interested (V1+a — soft first-touch positive) ─────
+console.log('\nInterested (V1+a — soft first-touch positive):');
 
-test('OBJECTION classification routes to hot-leads', () => {
-  const thread = t({ latest_classification: 'OBJECTION' });
-  assert(isHotLeadThread(thread, KNOWN_SENDERS), 'OBJECTION should be a hot lead');
+test("INTERESTED routes to interested", () => {
+  const thread = t({ latest_classification: 'INTERESTED' });
+  assert(isInterestedThread(thread, KNOWN_SENDERS), 'INTERESTED should land in interested');
 });
 
-test('INTERESTED classification routes to hot-leads', () => {
+test('HOT_LEAD does NOT route to interested (vocab split)', () => {
+  // V1+a: HOT_LEAD is the upgrade path from INTERESTED — they should NOT
+  // both land in the same tab. This is the whole point of the vocab refine.
+  const thread = t({ latest_classification: 'HOT_LEAD' });
+  assert(!isInterestedThread(thread, KNOWN_SENDERS), 'HOT_LEAD leaked into interested — vocab split broken');
+});
+
+test('OBJECTION does NOT route to interested', () => {
+  const thread = t({ latest_classification: 'OBJECTION' });
+  assert(!isInterestedThread(thread, KNOWN_SENDERS), 'OBJECTION leaked into interested');
+});
+
+test('warm-up INTERESTED → NOT interested (warm-up wins)', () => {
+  const thread = t({ subject: 'Quick question - wsn', latest_classification: 'INTERESTED' });
+  assert(!isInterestedThread(thread, KNOWN_SENDERS), 'warm-up + INTERESTED leaked into interested');
+});
+
+// ───── Hot Leads (V1+a — redefined to HOT_LEAD + OBJECTION) ─────
+console.log('\nHot Leads (V1+a — substantive engagement):');
+
+test('HOT_LEAD routes to hot-leads', () => {
+  const thread = t({ latest_classification: 'HOT_LEAD' });
+  assert(isHotLeadThread(thread, KNOWN_SENDERS), 'HOT_LEAD should be a hot lead');
+});
+
+test('OBJECTION routes to hot-leads', () => {
+  const thread = t({ latest_classification: 'OBJECTION' });
+  assert(isHotLeadThread(thread, KNOWN_SENDERS), 'OBJECTION should still be a hot lead');
+});
+
+test('INTERESTED does NOT route to hot-leads (V1+a vocab split)', () => {
+  // V1+a: INTERESTED no longer routes here — it has its own tab.
+  // This is the inverse of the vocab-split test above.
   const thread = t({ latest_classification: 'INTERESTED' });
-  assert(isHotLeadThread(thread, KNOWN_SENDERS), 'INTERESTED should be a hot lead');
+  assert(!isHotLeadThread(thread, KNOWN_SENDERS), 'INTERESTED leaked into hot-leads — old vocab regression');
 });
 
 test('AUTO_REPLY does NOT route to hot-leads', () => {
@@ -183,15 +221,15 @@ test('AUTO_REPLY does NOT route to hot-leads', () => {
   assert(!isHotLeadThread(thread, KNOWN_SENDERS), 'AUTO_REPLY leaked into hot-leads');
 });
 
-test('OBJECTION on a warm-up thread does NOT route to hot-leads (warm-up wins)', () => {
+test('HOT_LEAD on a warm-up thread does NOT route to hot-leads (warm-up wins)', () => {
   const thread = t({
     subject: 'Following up on our chat - wsn',
-    latest_classification: 'OBJECTION',
+    latest_classification: 'HOT_LEAD',
   });
   assert(!isHotLeadThread(thread, KNOWN_SENDERS), 'warm-up engagement leaked into hot-leads');
 });
 
-test('OBJECTION + LLM SPAM + unknown sender → NOT hot-leads (spam wins over engagement)', () => {
+test('HOT_LEAD + LLM SPAM + unknown sender → NOT hot-leads (spam wins over engagement)', () => {
   const thread = t({
     latest_classification: 'SPAM',
     participants: ['novel@unknown.example', 'gerald.murphy@krogerbrandimpact.info'],
@@ -199,8 +237,31 @@ test('OBJECTION + LLM SPAM + unknown sender → NOT hot-leads (spam wins over en
   assert(!isHotLeadThread(thread, KNOWN_SENDERS), 'SPAM-classified leaked into hot-leads');
 });
 
+// ───── Bounced (V1+a — own terminal bucket) ─────
+console.log('\nBounced (V1+a):');
+
+test('BOUNCE routes to bounced', () => {
+  const thread = t({ latest_classification: 'BOUNCE' });
+  assert(isBouncedThread(thread), 'BOUNCE should land in bounced');
+});
+
+test('non-BOUNCE classifications do NOT route to bounced', () => {
+  for (const cls of ['INTERESTED', 'HOT_LEAD', 'OBJECTION', 'AUTO_REPLY', 'STOP', 'SPAM', 'NOT_INTERESTED']) {
+    const thread = t({ latest_classification: cls });
+    assert(
+      !isBouncedThread(thread),
+      `${cls} leaked into bounced`
+    );
+  }
+});
+
+test('null classification does NOT route to bounced', () => {
+  const thread = t({ latest_classification: null });
+  assert(!isBouncedThread(thread), 'null leaked into bounced');
+});
+
 // ───── All ─────
-console.log('\nAll (default — excludes warm-up + spam):');
+console.log('\nAll (V1+a — excludes warm-up + spam + bounced):');
 
 test('regular cold-email reply lives in All', () => {
   const thread = t({ latest_classification: 'AUTO_REPLY' });
@@ -220,6 +281,11 @@ test('spam thread does NOT live in All', () => {
   assert(!isAllThread(thread, KNOWN_SENDERS), 'spam leaked into All');
 });
 
+test('BOUNCE thread does NOT live in All (V1+a — own terminal bucket)', () => {
+  const thread = t({ latest_classification: 'BOUNCE' });
+  assert(!isAllThread(thread, KNOWN_SENDERS), 'BOUNCE leaked into All — V1+a Bounced split broken');
+});
+
 test('SPAM-with-known-sender (false-positive case) STAYS in All', () => {
   // Critical inverse of the spam test: real reply that was misclassified by
   // the LLM as SPAM must still appear under All so Dean can find it.
@@ -230,17 +296,34 @@ test('SPAM-with-known-sender (false-positive case) STAYS in All', () => {
   assert(isAllThread(thread, KNOWN_SENDERS), 'misclassified SPAM lost from All');
 });
 
-// ───── Bucket exclusivity ─────
-console.log('\nBucket partition (exclusivity invariant):');
+test('INTERESTED + HOT_LEAD live in All (subsets, not exclusive)', () => {
+  // V1+a contract: Interested + Hot Leads are visible UNDER All — not
+  // partitioned out. Bounced + Warm Up + Spam are the ones excluded.
+  for (const cls of ['INTERESTED', 'HOT_LEAD', 'OBJECTION', 'NOT_INTERESTED', 'STOP']) {
+    const thread = t({ latest_classification: cls });
+    assert(
+      isAllThread(thread, KNOWN_SENDERS),
+      `${cls} dropped from All — engagement subsets must remain under default view`
+    );
+  }
+});
 
-test('every thread lives in exactly one of {All, Warm Up, Spam}', () => {
+// ───── Bucket exclusivity (6-tab partition) ─────
+console.log('\nBucket partition (V1+a exclusivity invariant):');
+
+test('every thread lives in exactly one of {All, Warm Up, Bounced, Spam}', () => {
+  // Interested + Hot Leads are SUBSETS of All (not partitioned out), so the
+  // exclusive partition is 4-way: {Warm Up, Bounced, Spam, All}.
   const corpus: ThreadLike[] = [
-    t({ subject: 'Following up - wsn' }),                                                   // warm-up
-    t({ latest_classification: 'SPAM', participants: ['novel@x.example', 'gerald.murphy@krogerbrandimpact.info'] }), // spam
-    t({ latest_classification: 'INTERESTED' }),                                             // all (+ hot-leads)
-    t({ latest_classification: 'AUTO_REPLY' }),                                             // all
-    t({ latest_classification: 'OBJECTION', subject: 'Re: pricing question' }),             // all (+ hot-leads)
-    t({ latest_classification: null, subject: null }),                                      // all
+    t({ subject: 'Following up - wsn' }),                                                                                 // warm-up
+    t({ latest_classification: 'SPAM', participants: ['novel@x.example', 'gerald.murphy@krogerbrandimpact.info'] }),      // spam
+    t({ latest_classification: 'BOUNCE' }),                                                                               // bounced
+    t({ latest_classification: 'INTERESTED' }),                                                                           // all (+ interested)
+    t({ latest_classification: 'HOT_LEAD' }),                                                                             // all (+ hot-leads)
+    t({ latest_classification: 'OBJECTION', subject: 'Re: pricing question' }),                                           // all (+ hot-leads)
+    t({ latest_classification: 'AUTO_REPLY' }),                                                                           // all
+    t({ latest_classification: 'NOT_INTERESTED' }),                                                                       // all
+    t({ latest_classification: null, subject: null }),                                                                    // all
     t({ subject: 'Testing your new email with Snov.io', participants: ['zachary.king@nicema.info'], account_emails: ['zachary.king@nicema.info'] }), // warm-up
   ];
 
@@ -248,25 +331,61 @@ test('every thread lives in exactly one of {All, Warm Up, Spam}', () => {
     const inAll = isAllThread(thread, KNOWN_SENDERS);
     const inWarmUp = isWarmUpThread(thread);
     const inSpam = isSpamThread(thread, KNOWN_SENDERS);
-    const count = (inAll ? 1 : 0) + (inWarmUp ? 1 : 0) + (inSpam ? 1 : 0);
+    const inBounced = isBouncedThread(thread);
+    const count = (inAll ? 1 : 0) + (inWarmUp ? 1 : 0) + (inSpam ? 1 : 0) + (inBounced ? 1 : 0);
     assert(
       count === 1,
-      `partition broken for ${JSON.stringify({ subject: thread.subject, cls: thread.latest_classification })}: All=${inAll} WarmUp=${inWarmUp} Spam=${inSpam}`
+      `partition broken for ${JSON.stringify({ subject: thread.subject, cls: thread.latest_classification })}: All=${inAll} WarmUp=${inWarmUp} Spam=${inSpam} Bounced=${inBounced}`
     );
   }
 });
 
+test('Interested ⊂ All, Hot Leads ⊂ All (subset invariant)', () => {
+  // Both engagement tabs are subsets of All — every Interested thread also
+  // shows up under All, every Hot Leads thread also shows up under All.
+  const interestedThread = t({ latest_classification: 'INTERESTED' });
+  assert(
+    isInterestedThread(interestedThread, KNOWN_SENDERS) && isAllThread(interestedThread, KNOWN_SENDERS),
+    'Interested thread missing from All'
+  );
+  const hotLeadThread = t({ latest_classification: 'HOT_LEAD' });
+  assert(
+    isHotLeadThread(hotLeadThread, KNOWN_SENDERS) && isAllThread(hotLeadThread, KNOWN_SENDERS),
+    'HOT_LEAD thread missing from All'
+  );
+  const objectionThread = t({ latest_classification: 'OBJECTION' });
+  assert(
+    isHotLeadThread(objectionThread, KNOWN_SENDERS) && isAllThread(objectionThread, KNOWN_SENDERS),
+    'OBJECTION thread missing from All'
+  );
+});
+
 // ───── matchesTab dispatch ─────
-console.log('\nmatchesTab dispatch:');
+console.log('\nmatchesTab dispatch (6 tabs):');
 
 test('matchesTab("warm-up") agrees with isWarmUpThread', () => {
   const thread = t({ subject: 'Crazy delay at the airport! - wsn' });
   assert(matchesTab('warm-up', thread, KNOWN_SENDERS), 'dispatch broken for warm-up');
 });
 
-test('matchesTab("hot-leads") respects engagement set', () => {
+test('matchesTab("interested") for INTERESTED', () => {
   const thread = t({ latest_classification: 'INTERESTED' });
-  assert(matchesTab('hot-leads', thread, KNOWN_SENDERS), 'dispatch broken for hot-leads');
+  assert(matchesTab('interested', thread, KNOWN_SENDERS), 'dispatch broken for interested');
+});
+
+test('matchesTab("hot-leads") for HOT_LEAD', () => {
+  const thread = t({ latest_classification: 'HOT_LEAD' });
+  assert(matchesTab('hot-leads', thread, KNOWN_SENDERS), 'dispatch broken for hot-leads (HOT_LEAD)');
+});
+
+test('matchesTab("hot-leads") for OBJECTION', () => {
+  const thread = t({ latest_classification: 'OBJECTION' });
+  assert(matchesTab('hot-leads', thread, KNOWN_SENDERS), 'dispatch broken for hot-leads (OBJECTION)');
+});
+
+test('matchesTab("bounced") for BOUNCE', () => {
+  const thread = t({ latest_classification: 'BOUNCE' });
+  assert(matchesTab('bounced', thread, KNOWN_SENDERS), 'dispatch broken for bounced');
 });
 
 test('matchesTab("spam") requires multi-signal AND', () => {
@@ -290,6 +409,14 @@ test('parseTab("hot-leads") preserves valid tab', () => {
   assert(parseTab('hot-leads') === 'hot-leads', 'valid tab not preserved');
 });
 
+test('parseTab("interested") preserves V1+a tab', () => {
+  assert(parseTab('interested') === 'interested', 'interested tab not preserved');
+});
+
+test('parseTab("bounced") preserves V1+a tab', () => {
+  assert(parseTab('bounced') === 'bounced', 'bounced tab not preserved');
+});
+
 test('parseTab("OBJECTION") (legacy filter value) → "all"', () => {
   // Old URLs may have ?tab=OBJECTION etc. from the previous classification-as-tab
   // scheme. Defensive default to "all" (not crash).
@@ -309,11 +436,25 @@ test('warm-up hints uses subject ILIKE', () => {
   assert(!h.subjectNotIlike, 'warm-up should not negate the marker');
 });
 
-test('hot-leads hints includes engagement set + warm-up exclusion', () => {
+test('hot-leads hints includes V1+a engagement set + warm-up exclusion', () => {
   const h = postgrestHintsFor('hot-leads');
   assert(h.classificationIn?.includes('OBJECTION'), 'hot-leads missing OBJECTION');
-  assert(h.classificationIn?.includes('INTERESTED'), 'hot-leads missing INTERESTED');
+  assert(h.classificationIn?.includes('HOT_LEAD'), 'hot-leads missing HOT_LEAD (V1+a vocab)');
+  assert(!h.classificationIn?.includes('INTERESTED'), 'hot-leads should NOT include INTERESTED — own tab now');
   assert(h.subjectNotIlike?.includes('- wsn'), 'hot-leads should exclude warm-up');
+});
+
+test('interested hints (V1+a) scopes to classification=INTERESTED + warm-up exclusion', () => {
+  const h = postgrestHintsFor('interested');
+  assert(h.classificationIn?.includes('INTERESTED'), 'interested missing INTERESTED');
+  assert(!h.classificationIn?.includes('HOT_LEAD'), 'interested should NOT include HOT_LEAD');
+  assert(!h.classificationIn?.includes('OBJECTION'), 'interested should NOT include OBJECTION');
+  assert(h.subjectNotIlike?.includes('- wsn'), 'interested should exclude warm-up');
+});
+
+test('bounced hints (V1+a) pins classification=BOUNCE', () => {
+  const h = postgrestHintsFor('bounced');
+  assert(h.classificationEq === 'BOUNCE', 'bounced hint missing classification=BOUNCE');
 });
 
 test('spam hints scopes to classification=SPAM', () => {
@@ -321,10 +462,11 @@ test('spam hints scopes to classification=SPAM', () => {
   assert(h.classificationEq === 'SPAM', 'spam hint missing classification=SPAM');
 });
 
-test('all hints excludes warm-up and lets JS layer tighten spam', () => {
+test('all hints excludes warm-up + bounced and lets JS layer tighten spam', () => {
   const h = postgrestHintsFor('all');
   assert(h.subjectNotIlike?.includes('- wsn'), 'all hint should exclude warm-up subject');
-  assert(!h.classificationEq, 'all should not pin classification');
+  assert(h.classificationNotEq === 'BOUNCE', 'all hint should exclude BOUNCE classification');
+  assert(!h.classificationEq, 'all should not pin classification=');
 });
 
 // ───── Summary ─────

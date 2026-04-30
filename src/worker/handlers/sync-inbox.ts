@@ -1,6 +1,10 @@
-import { createClient } from '@supabase/supabase-js';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { syncAllAccounts } from '../../lib/email/imap-sync';
-import { classifyReply, classifyBatch, Classification } from '../../lib/email/reply-classifier';
+import {
+  classifyReply,
+  Classification,
+  ClassificationResult,
+} from '../../lib/email/reply-classifier';
 import { handleReply, handleBounce, handleOptOut } from '../../lib/email/sequence-engine';
 import { handleImapError } from '../../lib/email/error-handler';
 
@@ -10,6 +14,73 @@ function getSupabase() {
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
     { auth: { persistSession: false } }
   );
+}
+
+// V1+a rate-limit pacing — module-scope timestamp keeps consecutive LLM calls
+// ≥2000ms apart so the worker stays under Anthropic's 50 req/min cap on
+// claude-haiku-4-5-20251001 (target ~30 msg/min sustained).
+let lastClassifierCallAt = 0;
+const CLASSIFIER_PACING_MS = 2000;
+const CLASSIFIER_PACING_JITTER_MS = 200;
+
+export async function _waitForClassifierSlot(now: number = Date.now()): Promise<number> {
+  const elapsed = now - lastClassifierCallAt;
+  if (elapsed < CLASSIFIER_PACING_MS) {
+    const wait = CLASSIFIER_PACING_MS - elapsed + Math.random() * CLASSIFIER_PACING_JITTER_MS;
+    await new Promise((r) => setTimeout(r, wait));
+  }
+  lastClassifierCallAt = Date.now();
+  return lastClassifierCallAt;
+}
+
+// Empty-text short-circuit: ~36% of inbox_messages on 2026-04-29 were empty
+// Snov warm-up pings (no reply_only_text, no body_text). Calling Claude on
+// those is pure waste — they're deterministically AUTO_REPLY. Confidence 0.95
+// signals "deterministic skip" vs the 0.3/0.1 LLM-uncertainty fallbacks.
+export function isEmptyMessage(
+  replyOnlyText: string | null | undefined,
+  bodyText: string | null | undefined
+): boolean {
+  return (
+    (!replyOnlyText || replyOnlyText.trim() === '') &&
+    (!bodyText || bodyText.trim() === '')
+  );
+}
+
+async function pacedClassifyReply(
+  text: string,
+  subject: string | undefined,
+  orgId: string,
+  supabase: SupabaseClient
+): Promise<ClassificationResult> {
+  await _waitForClassifierSlot();
+
+  try {
+    return await classifyReply(text, subject);
+  } catch (err) {
+    const msg = (err as Error).message || '';
+    const is429 = msg.includes('429') || msg.toLowerCase().includes('rate');
+    if (is429) {
+      // Sleep a hard 5s, then retry once. lastClassifierCallAt resets so the
+      // next paced call has a clean cadence.
+      await new Promise((r) => setTimeout(r, 5000));
+      lastClassifierCallAt = Date.now();
+      try {
+        return await classifyReply(text, subject);
+      } catch (err2) {
+        await supabase.from('system_alerts').insert({
+          org_id: orgId,
+          alert_type: 'classifier_error',
+          severity: 'warning',
+          title: 'Classifier rate-limited after retry',
+          details: { error: (err2 as Error).message?.substring(0, 500) },
+        });
+        return { classification: 'AUTO_REPLY', confidence: 0.1 };
+      }
+    }
+    console.error('[Classifier] Error:', err);
+    return { classification: 'AUTO_REPLY', confidence: 0.1 };
+  }
 }
 
 /**
@@ -94,13 +165,19 @@ export async function handleClassifyReply(data: { messageId: number }): Promise<
     return;
   }
 
-  const textToClassify = message.reply_only_text || message.body_text;
-  if (!textToClassify) {
-    console.log(`[ClassifyReply] No text to classify for message ${data.messageId}`);
-    return;
+  let result: ClassificationResult;
+  if (isEmptyMessage(message.reply_only_text, message.body_text)) {
+    // V1+a short-circuit: deterministic AUTO_REPLY for empty Snov warm-up pings.
+    result = { classification: 'AUTO_REPLY', confidence: 0.95 };
+  } else {
+    const textToClassify = message.reply_only_text || message.body_text || '';
+    result = await pacedClassifyReply(
+      textToClassify,
+      message.subject || undefined,
+      message.org_id,
+      supabase
+    );
   }
-
-  const result = await classifyReply(textToClassify, message.subject || undefined);
 
   // Update message with classification
   await supabase
@@ -143,7 +220,11 @@ export async function handleClassifyReply(data: { messageId: number }): Promise<
 }
 
 /**
- * Batch classify all unclassified replies
+ * Batch classify all unclassified replies.
+ *
+ * V1+a: sequential paced loop, not parallel-batch-of-10.
+ *  - Empty-text rows short-circuit to AUTO_REPLY/0.95 with no LLM call.
+ *  - Real-text rows hit pacedClassifyReply (≥2000ms between calls + 429 retry).
  */
 export async function handleClassifyBatch(): Promise<void> {
   const supabase = getSupabase();
@@ -151,7 +232,7 @@ export async function handleClassifyBatch(): Promise<void> {
   // Find unclassified received messages
   const { data: messages, error } = await supabase
     .from('inbox_messages')
-    .select('id, reply_only_text, body_text, subject, campaign_id, recipient_id, org_id')
+    .select('id, thread_id, reply_only_text, body_text, subject, campaign_id, recipient_id, org_id')
     .eq('direction', 'received')
     .is('classification', null)
     .order('received_date', { ascending: true })
@@ -166,57 +247,61 @@ export async function handleClassifyBatch(): Promise<void> {
     return;
   }
 
-  console.log(`[ClassifyBatch] Classifying ${messages.length} messages...`);
+  console.log(`[ClassifyBatch] Classifying ${messages.length} messages (paced)...`);
 
-  const replies = messages.map((m) => ({
-    id: m.id,
-    text: m.reply_only_text || m.body_text || '',
-    subject: m.subject || undefined,
-  }));
+  let llmCalls = 0;
+  let shortCircuited = 0;
 
-  const results = await classifyBatch(replies);
+  for (const message of messages) {
+    let result: ClassificationResult;
 
-  // Update each message and wire to sequence engine
-  for (const [messageId, result] of results) {
+    if (isEmptyMessage(message.reply_only_text, message.body_text)) {
+      result = { classification: 'AUTO_REPLY', confidence: 0.95 };
+      shortCircuited++;
+    } else {
+      const text = message.reply_only_text || message.body_text || '';
+      result = await pacedClassifyReply(
+        text,
+        message.subject || undefined,
+        message.org_id,
+        supabase
+      );
+      llmCalls++;
+    }
+
     await supabase
       .from('inbox_messages')
       .update({
         classification: result.classification,
         classification_confidence: result.confidence,
       })
-      .eq('id', messageId);
+      .eq('id', message.id);
 
-    // Update thread classification
-    const { data: msg } = await supabase
-      .from('inbox_messages')
-      .select('thread_id')
-      .eq('id', messageId)
-      .single();
-
-    if (msg?.thread_id) {
+    if (message.thread_id) {
       await supabase
         .from('inbox_threads')
         .update({
           latest_classification: result.classification,
           updated_at: new Date().toISOString(),
         })
-        .eq('id', msg.thread_id);
+        .eq('id', message.thread_id);
     }
 
-    // Wire to sequence engine
-    const originalMessage = messages.find((m) => m.id === messageId);
-    if (originalMessage?.campaign_id && originalMessage?.recipient_id) {
+    if (message.campaign_id && message.recipient_id) {
       await wireClassificationToSequenceEngine(
         result.classification as Classification,
-        originalMessage.recipient_id,
-        originalMessage.campaign_id,
-        originalMessage.org_id,
-        originalMessage.reply_only_text || originalMessage.body_text || ''
+        message.recipient_id,
+        message.campaign_id,
+        message.org_id,
+        message.reply_only_text || message.body_text || ''
       );
     }
   }
 
-  console.log(`[ClassifyBatch] Classified ${results.size} messages`);
+  console.log(
+    `[ClassifyBatch] Done. Classified ${messages.length} messages ` +
+      `(${shortCircuited} short-circuit, ${llmCalls} via LLM).`
+  );
 }
 
 /**
@@ -234,6 +319,7 @@ async function wireClassificationToSequenceEngine(
   try {
     switch (classification) {
       case 'INTERESTED':
+      case 'HOT_LEAD':
       case 'OBJECTION':
         await handleReply(recipientId, campaignId, classification);
         break;

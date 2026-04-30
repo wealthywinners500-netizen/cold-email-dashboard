@@ -82,6 +82,8 @@ export async function GET(request: NextRequest) {
     if (hints.subjectNotIlike) query = query.not('subject', 'ilike', hints.subjectNotIlike);
     if (hints.classificationIn) query = query.in('latest_classification', hints.classificationIn);
     if (hints.classificationEq) query = query.eq('latest_classification', hints.classificationEq);
+    if (hints.classificationNotEq)
+      query = query.not('latest_classification', 'eq', hints.classificationNotEq);
 
     if (campaignId) query = query.eq('campaign_id', campaignId);
     if (unread === 'true') query = query.eq('has_unread', true);
@@ -114,15 +116,15 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    // Tighten with the JS-side predicate so the spam known-sender check and the
-    // self-test warm-up signal land on the right tab. PostgREST hints are the
-    // cheap pass; this is the exact match.
-    if (tab === 'all' || tab === 'spam' || tab === 'warm-up') {
-      const knownSenders = await getKnownSenders(supabase, orgId);
-      filteredData = filteredData.filter((t: ThreadLike & { id: number }) =>
-        matchesTab(tab, t, knownSenders)
-      );
-    }
+    // Tighten with the JS-side predicate so the spam known-sender check, the
+    // self-test warm-up signal, and the all-excludes-spam logic all land on
+    // the right tab. PostgREST hints are the cheap pass; this is the exact
+    // match. Bounced doesn't need it (single classification eq), but running
+    // for all tabs is cheap and keeps the contract uniform.
+    const knownSenders = await getKnownSenders(supabase, orgId);
+    filteredData = filteredData.filter((t: ThreadLike & { id: number }) =>
+      matchesTab(tab, t, knownSenders)
+    );
 
     return NextResponse.json({
       threads: filteredData,
