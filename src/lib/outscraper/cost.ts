@@ -1,8 +1,8 @@
-// V1a: cost preview for Outscraper scrapes.
+// V1a + V8: cost preview for Outscraper scrapes.
 //
 // Per the lead-gen-pipeline skill, budget cap is $0.0047 per lead blended
-// (Outscraper Maps Search V3 + emails_and_contacts enrichment).
-// Documented in dashboard-app/reports/2026-04-30-leads-v1a-design.md §10.
+// (Outscraper /tasks google_maps_service_v2 + contacts_n_leads enrichment).
+// Documented in dashboard-app/reports/2026-04-30-outscraper-tasks-api-design.md §7.
 
 export const COST_PER_LEAD_USD = 0.0047;
 
