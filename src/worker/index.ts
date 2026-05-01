@@ -9,7 +9,6 @@ import { handleWarmupIncrement } from "./handlers/warm-up-increment";
 import { handleSmtpConnectionMonitor } from "./handlers/smtp-connection-monitor";
 import { handleAccountDeliverabilityMonitor } from "./handlers/account-deliverability-monitor";
 import { handleCampaignPerformanceMonitor } from "./handlers/campaign-performance-monitor";
-import { handleDistributeCampaignSends } from "./handlers/distribute-campaign-sends";
 import { handleVerifyNewLeads } from "./handlers/verify-new-leads";
 import { handleOutscraperTaskPoll } from "./handlers/outscraper-task-poll";
 import { handleOutscraperTaskComplete } from "./handlers/outscraper-task-complete";
@@ -64,7 +63,6 @@ async function main() {
     "smtp-connection-monitor",
     "account-deliverability-monitor",
     "campaign-performance-monitor",
-    "distribute-campaign-sends",
     "verify-new-leads",
     "provision-server-pair",
     // NOTE: "provision-step" is created separately below with retryLimit=0
@@ -305,17 +303,16 @@ async function main() {
     }
   });
 
-  // Register distribute-campaign-sends cron (daily at 6 AM)
-  await boss.schedule("distribute-campaign-sends", "0 6 * * *");
-  await boss.work("distribute-campaign-sends", async () => {
-    console.log("[Worker] Distributing campaign sends...");
-    try {
-      await handleDistributeCampaignSends();
-    } catch (err) {
-      console.error("[Worker] Distribute campaign sends failed:", err);
-      throw err;
-    }
-  });
+  // distribute-campaign-sends cron REMOVED 2026-05-01 (V9 CC #4):
+  // the cron's payload-shape was wrong (4-key {recipientId,campaignId,accountId,step}
+  // vs the 6-key {stateId,recipientId,sequenceId,stepNumber,campaignId,orgId} that
+  // process-sequence-step.ts requires) AND the cron was the obsolete-model
+  // distribute-recipients-daily flow. The new flow is /api/campaigns/[id]/send
+  // → initializeSequence (creates lead_sequence_state + queues first step) +
+  // the queue-sequence-steps cron (every 5 min) which only operates on existing
+  // lead_sequence_state rows. The unsubscribe-filter logic that distribute-
+  // campaign-sends.getPendingRecipients held is preserved at process-sequence-
+  // step.ts:78-101 (per-tick check at send time).
 
   // Register verify-new-leads handler
   // V8 (2026-04-30): payload widened to include optional lead_list_id so the
