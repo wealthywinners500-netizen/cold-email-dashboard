@@ -165,6 +165,21 @@ test("validatePrimarySequenceContent helper is wired", () => {
   );
 });
 
+test("initBoss is awaited before initializeSequence (pg-boss start guard)", () => {
+  // sequence-engine.initializeSequence calls boss.send internally; without
+  // boss.start() (via initBoss) the call throws "Queue cache is not initialized"
+  // on each Vercel cold start. Pattern matches pairs/verify/route.ts:85 and
+  // admin/dbl-monitor/run/route.ts:80.
+  assert(
+    /\bawait\s+initBoss\s*\(\s*\)/.test(routeSrc),
+    "route must `await initBoss()` before initializeSequence"
+  );
+  assert(
+    /from\s+["']@\/lib\/email\/campaign-queue["']/.test(routeSrc),
+    "route must import initBoss from @/lib/email/campaign-queue"
+  );
+});
+
 // ───── Source-grep contract on src/worker/index.ts ─────
 console.log("\nsrc/worker/index.ts cron-deletion contract:");
 
