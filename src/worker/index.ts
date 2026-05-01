@@ -318,8 +318,13 @@ async function main() {
   });
 
   // Register verify-new-leads handler
+  // V8 (2026-04-30): payload widened to include optional lead_list_id so the
+  // one-shot trigger script (scripts/trigger-reoon-verify-list.ts) can scope
+  // verification to a single list. Omitting lead_list_id falls back to all
+  // pending rows for the org (legacy behavior).
   interface VerifyNewLeadsPayload {
     orgId: string;
+    lead_list_id?: string;
   }
 
   await boss.work<VerifyNewLeadsPayload>(
