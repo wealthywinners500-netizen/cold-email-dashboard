@@ -3,6 +3,7 @@ export const dynamic = "force-dynamic";
 import { auth } from "@clerk/nextjs/server";
 import { createAdminClient } from "@/lib/supabase/server";
 import { initializeSequence } from "@/lib/email/sequence-engine";
+import { initBoss } from "@/lib/email/campaign-queue";
 import { NextResponse } from "next/server";
 import {
   validatePrimarySequenceContent,
@@ -136,6 +137,13 @@ export async function POST(
     // pgboss `init-campaign` job and return 202 immediately when Dean
     // begins running real-volume launches. CC #4's smoke uses 1 recipient,
     // far under any limit.
+    // pg-boss must be started before initializeSequence's internal boss.send.
+    // Pattern matches src/app/api/pairs/[id]/verify/route.ts:85 and
+    // src/app/api/admin/dbl-monitor/run/route.ts:80 — initBoss is idempotent
+    // (boss.start() resolves immediately if already running) so each cold-
+    // start serverless invocation safely re-runs it.
+    await initBoss();
+
     let statesInitialized: number;
     try {
       statesInitialized = await initializeSequence(campaignId, orgId);
