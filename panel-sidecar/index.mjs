@@ -100,9 +100,23 @@ function parseMessageId(rawBody) {
   return m ? m[1] : null;
 }
 
-function eximSubmit(rawBody) {
+function parseFromAddress(rawBody) {
+  // Extract bare email from `From:` header: `Name <a@b>` or `a@b`.
+  // Without this, Exim sets envelope sender to the calling user's identity
+  // (root@hostname) and SPF alignment at the receiving MX fails.
+  const head = rawBody.slice(0, 8192).toString('utf8');
+  const m = head.match(/^From:\s*(?:.*?<([^>\r\n]+)>|([^\r\n<]+))/im);
+  if (!m) return null;
+  const addr = (m[1] || m[2] || '').trim();
+  if (/^[^\s<>"@]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(addr)) return addr;
+  return null;
+}
+
+function eximSubmit(rawBody, envelopeFrom) {
+  const args = ['-bm', '-i', '-t'];
+  if (envelopeFrom) args.unshift('-f', envelopeFrom);
   return new Promise((resolve) => {
-    const child = spawn('/usr/sbin/exim', ['-bm', '-i', '-t'], {
+    const child = spawn('/usr/sbin/exim', args, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -167,9 +181,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   const messageId = parseMessageId(body);
-  const result = await eximSubmit(body);
+  const envelopeFrom = parseFromAddress(body);
+  const result = await eximSubmit(body, envelopeFrom);
   if (!result.ok) {
-    console.error(`[sidecar] exim failed ip=${ip} mid=${messageId} exit=${result.exit_code} stderr=${result.stderr.slice(0, 500)}`);
+    console.error(`[sidecar] exim failed ip=${ip} mid=${messageId} envelope=${envelopeFrom} exit=${result.exit_code} stderr=${result.stderr.slice(0, 500)}`);
     jsonResponse(res, 502, {
       success: false,
       error: 'exim submission failed',
@@ -179,7 +194,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  console.log(`[sidecar] queued ip=${ip} mid=${messageId} bytes=${body.length}`);
+  console.log(`[sidecar] queued ip=${ip} envelope=${envelopeFrom} mid=${messageId} bytes=${body.length}`);
   jsonResponse(res, 200, {
     success: true,
     message_id: messageId,
