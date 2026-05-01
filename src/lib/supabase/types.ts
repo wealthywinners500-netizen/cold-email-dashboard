@@ -883,6 +883,7 @@ export type Database = {
           email_status: string;
           verified_at: string | null;
           verification_source: string | null;
+          verification_result: Record<string, unknown>;
           scrape_source: string;
           scrape_query: string | null;
           scraped_at: string | null;
@@ -915,6 +916,7 @@ export type Database = {
           email_status?: string;
           verified_at?: string | null;
           verification_source?: string | null;
+          verification_result?: Record<string, unknown>;
           scrape_source?: string;
           scrape_query?: string | null;
           scraped_at?: string | null;
@@ -947,6 +949,7 @@ export type Database = {
           email_status?: string;
           verified_at?: string | null;
           verification_source?: string | null;
+          verification_result?: Record<string, unknown>;
           scrape_source?: string;
           scrape_query?: string | null;
           scraped_at?: string | null;
@@ -1263,6 +1266,7 @@ export interface LeadContact {
   email_status: 'valid' | 'invalid' | 'risky' | 'unknown' | 'pending';
   verified_at: string | null;
   verification_source: string | null;
+  verification_result: Record<string, any>;
   scrape_source: 'outscraper' | 'csv' | 'manual';
   scrape_query: string | null;
   scraped_at: string | null;
