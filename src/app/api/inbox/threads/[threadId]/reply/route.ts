@@ -99,6 +99,7 @@ export async function POST(
     // Send via SMTP
     const result = await sendEmail(
       {
+        id: account.id,
         email: account.email,
         display_name: account.display_name,
         smtp_host: account.smtp_host,

@@ -1,0 +1,25 @@
+# Dashboard panel-sidecar — included by Hestia's nginx.ssl.conf for the
+# panel-hostname vhost (mail1.<ns_domain>) via the `nginx.ssl.conf_*` glob
+# at the bottom of the generated server { } block. Survives v-rebuild-web-domains.
+#
+# Only the panel-hostname vhost includes this — does NOT bind globally.
+
+location = /admin/send {
+    proxy_pass http://127.0.0.1:8825/admin/send;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Sidecar-Timestamp $http_x_sidecar_timestamp;
+    proxy_set_header X-Sidecar-Signature $http_x_sidecar_signature;
+    proxy_read_timeout 30s;
+    proxy_request_buffering off;
+    client_max_body_size 10m;
+}
+
+location = /admin/health {
+    proxy_pass http://127.0.0.1:8825/admin/health;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_read_timeout 5s;
+}

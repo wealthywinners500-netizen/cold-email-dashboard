@@ -1,0 +1,23 @@
+[Unit]
+Description=Dashboard panel-sidecar (HMAC-authenticated raw-mail relay to local Exim)
+After=network.target exim4.service nginx.service
+Wants=exim4.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/dashboard-panel-sidecar
+EnvironmentFile=/opt/dashboard-panel-sidecar/.env
+ExecStart=/usr/bin/node /opt/dashboard-panel-sidecar/index.mjs
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dashboard-panel-sidecar
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
