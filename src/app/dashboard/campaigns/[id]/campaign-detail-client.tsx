@@ -7,7 +7,8 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { SequenceStepEditor } from "@/components/sequence/sequence-step-editor";
 import { SequenceFlowDiagram } from "@/components/sequence/sequence-flow-diagram";
-import { Users, Mail, MessageCircle, AlertCircle, Eye, MousePointerClick, UserMinus, BarChart3, TrendingUp } from "lucide-react";
+import SequenceComposerModal from "@/components/modals/sequence-composer-modal";
+import { Users, Mail, MessageCircle, AlertCircle, Eye, MousePointerClick, UserMinus, BarChart3, TrendingUp, Pencil } from "lucide-react";
 import {
   LineChart,
   Line,
@@ -86,6 +87,11 @@ export default function CampaignDetailClient({
 }: CampaignDetailClientProps) {
   const [expandedSequence, setExpandedSequence] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState("overview");
+  const [composerState, setComposerState] = useState<{
+    open: boolean;
+    mode: "create" | "edit";
+    seq?: CampaignSequence;
+  }>({ open: false, mode: "create" });
 
   const statusBadge = statusColorMap[campaign.status] || "bg-gray-700 text-gray-200";
 
@@ -233,6 +239,17 @@ export default function CampaignDetailClient({
 
         {/* Sequences Tab */}
         <Tabs.Content value="sequences" className="space-y-6 pt-6">
+          {!primarySequence && sequences.length > 0 && (
+            <div className="flex justify-end">
+              <button
+                onClick={() => setComposerState({ open: true, mode: "create" })}
+                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors"
+              >
+                + New Primary Sequence
+              </button>
+            </div>
+          )}
+
           {primarySequence && (
             <div className="space-y-4">
               <h3 className="text-lg font-semibold text-white">Primary Sequence</h3>
@@ -252,9 +269,22 @@ export default function CampaignDetailClient({
                       </CardTitle>
                       <Badge className="bg-blue-900 text-blue-200">Primary</Badge>
                     </div>
-                    <span className="text-gray-400 text-sm">
-                      {primarySequence.steps.length} steps
-                    </span>
+                    <div className="flex items-center gap-3">
+                      <span className="text-gray-400 text-sm">
+                        {primarySequence.steps.length} steps
+                      </span>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setComposerState({ open: true, mode: "edit", seq: primarySequence });
+                        }}
+                        className="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 text-gray-200 rounded-lg flex items-center gap-1 transition-colors"
+                        aria-label="Edit primary sequence"
+                      >
+                        <Pencil size={12} />
+                        Edit
+                      </button>
+                    </div>
                   </div>
                 </CardHeader>
                 {expandedSequence === primarySequence.id && (
@@ -340,7 +370,10 @@ export default function CampaignDetailClient({
             <div className="flex flex-col items-center justify-center py-12 text-center">
               <Mail className="w-12 h-12 text-gray-600 mb-4" />
               <p className="text-gray-400">No sequences created yet</p>
-              <button className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors">
+              <button
+                onClick={() => setComposerState({ open: true, mode: "create" })}
+                className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+              >
                 Create Sequence
               </button>
             </div>
@@ -698,6 +731,16 @@ export default function CampaignDetailClient({
           )}
         </Tabs.Content>
       </Tabs.Root>
+
+      <SequenceComposerModal
+        open={composerState.open}
+        onOpenChange={(open) =>
+          setComposerState((prev) => ({ ...prev, open }))
+        }
+        campaignId={campaign.id}
+        mode={composerState.mode}
+        existingSequence={composerState.seq}
+      />
     </div>
   );
 }
