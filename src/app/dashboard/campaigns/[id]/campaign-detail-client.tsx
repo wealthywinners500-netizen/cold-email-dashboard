@@ -1,6 +1,8 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { toast } from "sonner";
 import * as Tabs from "@radix-ui/react-tabs";
 import { Campaign, CampaignSequence, LeadSequenceState, CampaignStats, CampaignAnalytics } from "@/lib/supabase/types";
 import { Badge } from "@/components/ui/badge";
@@ -8,7 +10,9 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { SequenceStepEditor } from "@/components/sequence/sequence-step-editor";
 import { SequenceFlowDiagram } from "@/components/sequence/sequence-flow-diagram";
 import SequenceComposerModal from "@/components/modals/sequence-composer-modal";
-import { Users, Mail, MessageCircle, AlertCircle, Eye, MousePointerClick, UserMinus, BarChart3, TrendingUp, Pencil } from "lucide-react";
+import SendScheduleModal from "@/components/modals/send-schedule-modal";
+import RecipientsUploadModal from "@/components/modals/recipients-upload-modal";
+import { Users, Mail, MessageCircle, AlertCircle, Eye, MousePointerClick, UserMinus, BarChart3, TrendingUp, Pencil, Play, Pause as PauseIcon } from "lucide-react";
 import {
   LineChart,
   Line,
@@ -85,6 +89,7 @@ export default function CampaignDetailClient({
   analyticsRecipients,
   analyticsRecipientsCount,
 }: CampaignDetailClientProps) {
+  const router = useRouter();
   const [expandedSequence, setExpandedSequence] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState("overview");
   const [composerState, setComposerState] = useState<{
@@ -93,22 +98,95 @@ export default function CampaignDetailClient({
     sequenceType: "primary" | "subsequence";
     seq?: CampaignSequence;
   }>({ open: false, mode: "create", sequenceType: "primary" });
+  const [scheduleModalOpen, setScheduleModalOpen] = useState(false);
+  const [recipientsModalOpen, setRecipientsModalOpen] = useState(false);
+  const [isStarting, setIsStarting] = useState(false);
+  const [isPausing, setIsPausing] = useState(false);
 
   const statusBadge = statusColorMap[campaign.status] || "bg-gray-700 text-gray-200";
 
-  const sendingSchedule = campaign.sending_schedule as any || {};
-  const sendingHours = sendingSchedule.hours || "9 AM - 5 PM";
-  const timezone = sendingSchedule.timezone || "UTC";
-  const dailyLimit = sendingSchedule.daily_limit || "Unlimited";
+  const sendingSchedule = (campaign.sending_schedule as Record<string, unknown>) || {};
+  const sbh = Array.isArray(sendingSchedule.send_between_hours)
+    ? (sendingSchedule.send_between_hours as [number, number])
+    : null;
+  const sendingHours = sbh ? `${sbh[0]}:00 – ${sbh[1]}:00` : "9:00 – 17:00";
+  const timezone = (sendingSchedule.timezone as string) || "America/New_York";
+  const dailyLimit = (sendingSchedule.max_per_day as number | null) ?? "Unlimited";
+  const sendingDays = Array.isArray(sendingSchedule.days)
+    ? (sendingSchedule.days as string[]).join(", ")
+    : "mon, tue, wed, thu, fri";
 
   const primarySequence = sequences.find((s) => s.sequence_type === "primary");
   const subsequences = sequences.filter((s) => s.sequence_type === "subsequence");
+
+  const isTerminalStatus = campaign.status === "completed" || campaign.status === "archived";
+  const canStart =
+    !isTerminalStatus &&
+    campaign.status !== "sending" &&
+    stats.total_recipients > 0 &&
+    !!primarySequence;
+  const canPause = campaign.status === "active" || campaign.status === "sending";
+  const canResume = campaign.status === "paused";
+
+  async function handleStatusChange(newStatus: "active" | "paused") {
+    setIsPausing(true);
+    try {
+      const response = await fetch(`/api/campaigns/${campaign.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: newStatus }),
+      });
+      const json = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const msg = json?.error || `Failed to set status to ${newStatus}`;
+        toast.error(msg);
+        return;
+      }
+      toast.success(newStatus === "paused" ? "Campaign paused" : "Campaign resumed");
+      router.refresh();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Network error");
+    } finally {
+      setIsPausing(false);
+    }
+  }
+
+  async function handleStartCampaign() {
+    if (!canStart) return;
+    setIsStarting(true);
+    try {
+      const response = await fetch(`/api/campaigns/${campaign.id}/send`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const json = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const detailMsg = Array.isArray(json?.details) ? json.details.join("; ") : "";
+        const msg = detailMsg || json?.error || "Failed to start campaign";
+        toast.error(msg);
+        return;
+      }
+      const initialized =
+        typeof json?.statesInitialized === "number" ? json.statesInitialized : null;
+      toast.success(
+        initialized !== null
+          ? `Campaign starting — initialized ${initialized} recipients`
+          : "Campaign started"
+      );
+      router.refresh();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Network error");
+    } finally {
+      setIsStarting(false);
+    }
+  }
 
   return (
     <div className="space-y-6">
       {/* Header */}
       <div>
-        <div className="flex items-start justify-between mb-4">
+        <div className="flex items-start justify-between mb-4 gap-4">
           <div>
             <h1 className="text-3xl font-bold text-white mb-2">{campaign.name}</h1>
             <div className="flex items-center gap-3">
@@ -120,6 +198,50 @@ export default function CampaignDetailClient({
                 <span className="text-gray-400">{campaign.store_chain}</span>
               )}
             </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {canPause && (
+              <button
+                type="button"
+                onClick={() => handleStatusChange("paused")}
+                disabled={isPausing}
+                className="inline-flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 disabled:bg-gray-800/50 text-white rounded-lg font-medium transition-colors"
+              >
+                <PauseIcon size={16} />
+                {isPausing ? "Pausing…" : "Pause"}
+              </button>
+            )}
+            {canResume && (
+              <button
+                type="button"
+                onClick={() => handleStatusChange("active")}
+                disabled={isPausing}
+                className="inline-flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 disabled:bg-gray-800/50 text-white rounded-lg font-medium transition-colors"
+              >
+                <Play size={16} />
+                {isPausing ? "Resuming…" : "Resume"}
+              </button>
+            )}
+            {!isTerminalStatus && (
+              <button
+                type="button"
+                onClick={handleStartCampaign}
+                disabled={!canStart || isStarting}
+                title={
+                  !primarySequence
+                    ? "Add a primary sequence first"
+                    : stats.total_recipients === 0
+                    ? "Add recipients first"
+                    : campaign.status === "sending"
+                    ? "Campaign is already sending"
+                    : ""
+                }
+                className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-600/40 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors"
+              >
+                <Play size={16} />
+                {isStarting ? "Starting…" : "Start Campaign"}
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -217,10 +339,21 @@ export default function CampaignDetailClient({
           {/* Schedule Info */}
           <Card className="bg-gray-900 border-gray-800">
             <CardHeader>
-              <CardTitle className="text-white">Sending Schedule</CardTitle>
+              <div className="flex items-center justify-between">
+                <CardTitle className="text-white">Sending Schedule</CardTitle>
+                <button
+                  type="button"
+                  onClick={() => setScheduleModalOpen(true)}
+                  className="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 text-gray-200 rounded-lg flex items-center gap-1 transition-colors"
+                  aria-label="Edit Schedule"
+                >
+                  <Pencil size={12} />
+                  Edit Schedule
+                </button>
+              </div>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="grid grid-cols-3 gap-6">
+              <div className="grid grid-cols-4 gap-6">
                 <div>
                   <p className="text-gray-400 text-sm">Sending Hours</p>
                   <p className="text-white font-medium mt-2">{sendingHours}</p>
@@ -232,6 +365,10 @@ export default function CampaignDetailClient({
                 <div>
                   <p className="text-gray-400 text-sm">Daily Limit</p>
                   <p className="text-white font-medium mt-2">{dailyLimit}</p>
+                </div>
+                <div>
+                  <p className="text-gray-400 text-sm">Days</p>
+                  <p className="text-white font-medium mt-2 capitalize">{sendingDays}</p>
                 </div>
               </div>
             </CardContent>
@@ -408,6 +545,18 @@ export default function CampaignDetailClient({
 
         {/* Recipients Tab */}
         <Tabs.Content value="recipients" className="space-y-6 pt-6">
+          <div className="flex items-center justify-between">
+            <p className="text-sm text-gray-400">
+              {stats.total_recipients} total recipient{stats.total_recipients === 1 ? "" : "s"}
+            </p>
+            <button
+              type="button"
+              onClick={() => setRecipientsModalOpen(true)}
+              className="px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors"
+            >
+              + Add Recipients
+            </button>
+          </div>
           <Card className="bg-gray-900 border-gray-800 overflow-hidden">
             <div className="overflow-x-auto">
               <table className="w-full">
@@ -767,6 +916,19 @@ export default function CampaignDetailClient({
         mode={composerState.mode}
         sequenceType={composerState.sequenceType}
         existingSequence={composerState.seq}
+      />
+
+      <SendScheduleModal
+        open={scheduleModalOpen}
+        onOpenChange={setScheduleModalOpen}
+        campaignId={campaign.id}
+        initial={(campaign.sending_schedule as Record<string, unknown> | null) ?? null}
+      />
+
+      <RecipientsUploadModal
+        open={recipientsModalOpen}
+        onOpenChange={setRecipientsModalOpen}
+        campaignId={campaign.id}
       />
     </div>
   );

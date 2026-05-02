@@ -46,6 +46,9 @@ export async function POST(request: NextRequest) {
     if (contact_ids && contact_ids.length > 0) {
       contactsQuery = contactsQuery.in("id", contact_ids);
     } else if (filter) {
+      if (filter.lead_list_id) {
+        contactsQuery = contactsQuery.eq("lead_list_id", filter.lead_list_id);
+      }
       if (filter.email_status) {
         contactsQuery = contactsQuery.eq("email_status", filter.email_status);
       }
