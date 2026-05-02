@@ -43,14 +43,14 @@ const navigationItems = [
     icon: Inbox,
   },
   {
-    label: "Campaigns",
-    href: "/dashboard/campaigns",
-    icon: Mail,
-  },
-  {
     label: "Leads",
     href: "/dashboard/leads",
     icon: Users,
+  },
+  {
+    label: "Campaigns",
+    href: "/dashboard/campaigns",
+    icon: Mail,
   },
   {
     label: "Follow-Ups",

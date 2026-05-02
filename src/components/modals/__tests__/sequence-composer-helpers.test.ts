@@ -363,25 +363,27 @@ test("detail page imports the modal", () => {
   );
 });
 
-test("dead 'Create Sequence' button now has an onClick", () => {
-  // Pre-fix line was: <button className="mt-4 px-4 py-2 ...">Create Sequence</button>
-  // Post-fix must include an onClick that opens the composer in create mode.
-  const emptyStateBlock = detailSrc.match(/No sequences created yet[\s\S]{0,500}Create Sequence/);
-  assert(emptyStateBlock, "expected to find the 'Create Sequence' empty-state block");
+test("empty-state primary sequence button has an onClick (CC #UI-3-rev: text changed to '+ New Primary Sequence')", () => {
+  // CC #UI-3-rev moved the empty state's button text from "Create Sequence" to
+  // "+ New Primary Sequence" (subsequences no longer rendered in this file).
+  const emptyStateBlock = detailSrc.match(/No primary sequence yet[\s\S]{0,500}New Primary Sequence/);
+  assert(emptyStateBlock, "expected to find the 'No primary sequence yet' empty-state with '+ New Primary Sequence' button");
   assert(
     /onClick=\{[^}]*setComposerState\(\{[^}]*open:\s*true[^}]*mode:\s*["']create["']/.test(emptyStateBlock![0]),
-    "Create Sequence button must wire onClick → setComposerState({open:true, mode:'create'})"
+    "primary-sequence empty-state button must wire onClick → setComposerState({open:true, mode:'create'})"
   );
 });
 
 test("primary sequence card has an Edit affordance opening the composer in edit mode", () => {
+  // CC #UI-3-rev: composerState no longer carries `sequenceType` (subsequences gone),
+  // and the modal receives sequenceType="primary" as a literal at the mount point.
   assert(
     /Edit primary sequence/.test(detailSrc) || /aria-label="Edit primary sequence"/.test(detailSrc),
     "primary card must expose an Edit button (aria-label preferred)"
   );
   assert(
-    /mode:\s*["']edit["'],\s*sequenceType:\s*["']primary["'],\s*seq:\s*primarySequence/.test(detailSrc),
-    "Edit button must pass mode:'edit' + sequenceType:'primary' + seq:primarySequence to composer"
+    /mode:\s*["']edit["'],\s*seq:\s*primarySequence/.test(detailSrc),
+    "Edit button must pass mode:'edit' + seq:primarySequence to composer"
   );
 });
 
@@ -394,9 +396,11 @@ test("modal is rendered once at end of component with composerState bound", () =
     /campaignId=\{campaign\.id\}/.test(detailSrc),
     "modal must receive campaignId from the campaign prop"
   );
+  // CC #UI-3-rev: sequenceType is now hard-coded "primary" (subsequences moved
+  // to /dashboard/follow-ups in CC #UI-4) — match the literal prop on the mount.
   assert(
-    /sequenceType=\{composerState\.sequenceType\}/.test(detailSrc),
-    "<SequenceComposerModal> must receive sequenceType from composerState"
+    /sequenceType=\{?\s*["']primary["']\s*\}?/.test(detailSrc),
+    "<SequenceComposerModal> must receive sequenceType=\"primary\" (hard-coded post CC #UI-3-rev)"
   );
 });
 
@@ -410,46 +414,13 @@ test("existing read-only <SequenceStepEditor> render path is preserved", () => {
   );
 });
 
-// ───── CC #UI-2: detail-page subsequence wiring ─────
-console.log("\ncampaign-detail-client.tsx subsequence wiring (CC #UI-2):");
-
-test("detail page contains '+ New Subsequence' button", () => {
-  assert(/\+ New Subsequence/.test(detailSrc), "detail page must contain '+ New Subsequence' button text");
-});
-
-test("'+ New Subsequence' button opens composer with sequenceType:'subsequence'", () => {
-  // Match a setComposerState call with both create + sequenceType:'subsequence' near the button text
-  const subseqRegion = detailSrc.match(/\+ New Subsequence[\s\S]*?setComposerState\(\{[\s\S]*?sequenceType:\s*["']subsequence["']/);
-  assert(
-    subseqRegion ||
-      /setComposerState\(\{[^}]*sequenceType:\s*["']subsequence["']/.test(detailSrc),
-    "'+ New Subsequence' must wire onClick → setComposerState({..., sequenceType:'subsequence'})"
-  );
-});
-
-test("each subsequence card has an Edit affordance with sequenceType:'subsequence'", () => {
-  assert(
-    /aria-label="Edit subsequence"/.test(detailSrc),
-    "subsequence card must expose an Edit button with aria-label='Edit subsequence'"
-  );
-  assert(
-    /mode:\s*["']edit["'],\s*sequenceType:\s*["']subsequence["'],\s*seq\b/.test(detailSrc),
-    "Edit subsequence button must pass mode:'edit' + sequenceType:'subsequence' + seq to composer"
-  );
-});
-
-test("subsequence trigger labels read snake_case canonical values", () => {
-  // After CC #UI-2, persisted trigger_event is snake_case (matches sequence-engine.ts:337,540).
-  // Display layer must accept snake_case (and may keep tolerating display strings for legacy rows).
-  assert(
-    /trigger_event\s*===\s*["']reply_classified["']/.test(detailSrc),
-    "detail page must match seq.trigger_event === 'reply_classified' (snake_case canon)"
-  );
-  assert(
-    /trigger_event\s*===\s*["']no_reply["']/.test(detailSrc),
-    "detail page must match seq.trigger_event === 'no_reply' (snake_case canon)"
-  );
-});
+// CC #UI-3-rev REMOVED the in-file subsequence section from campaign-detail-client.tsx.
+// Subsequences are now managed on /dashboard/follow-ups (CC #UI-4 will rebuild).
+// The CC #UI-2 detail-page subsequence assertions have been intentionally deleted —
+// the composer-modal subsequence contract above (lines ~163-237, 283-298) still
+// covers the helper behavior. The CC #UI-3-rev test file
+// (../app/dashboard/campaigns/[id]/__tests__/campaign-detail-client.test.ts)
+// asserts the in-file removal directly.
 
 // ───── Summary ─────
 console.log(`\n${tests - failed}/${tests} passed`);
