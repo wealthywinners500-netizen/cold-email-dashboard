@@ -159,6 +159,35 @@ console.log('\nsmtp-manager-sidecar tests\n');
     assert(src.includes('SIDECAR_HMAC_SECRET'), 'HMAC secret env var');
   });
 
+  // ───── CC #5b1 — smtp-connection-monitor sidecar-aware skip guards ─────
+  // Verify the legacy testConnection() loop now respects USE_PANEL_SIDECAR_ACCOUNT_IDS
+  // and skips those rows. Without this, the monitor would cascade-disable any
+  // sidecar-flagged account on legacy SMTP-AUTH failures from the worker IP.
+  const monitorPath = resolve(here, '..', '..', '..', 'worker', 'handlers', 'smtp-connection-monitor.ts');
+  const monitorSrc = readFileSync(monitorPath, 'utf8');
+
+  await test('smtp-connection-monitor.ts: references USE_PANEL_SIDECAR_ACCOUNT_IDS env var', () => {
+    assert(monitorSrc.includes('USE_PANEL_SIDECAR_ACCOUNT_IDS'),
+      'monitor must read the same canary flag the sender pipeline reads');
+  });
+
+  await test('smtp-connection-monitor.ts: defines getSidecarAccountIds helper', () => {
+    assert(monitorSrc.includes('function getSidecarAccountIds'),
+      'parsing helper must be present');
+    assert(/Set<string>/.test(monitorSrc),
+      'helper returns Set<string> for O(1) membership test');
+  });
+
+  await test('smtp-connection-monitor.ts: filters fetched accounts via sidecarIds.has(...)', () => {
+    assert(/sidecarIds\.has\(\s*a\.id\s*\)/.test(monitorSrc),
+      'must filter rawAccounts by sidecarIds.has(a.id)');
+  });
+
+  await test('smtp-connection-monitor.ts: emits the skip log so post-deploy probe can grep', () => {
+    assert(monitorSrc.includes('Skipping') && monitorSrc.includes('sidecar-routed'),
+      'skip-log message phrase required for Probe 2');
+  });
+
   // ───── Final ─────
   console.log(`\n${tests - failed}/${tests} passed${failed ? `, ${failed} FAILED` : ''}`);
   if (failed > 0) process.exit(1);

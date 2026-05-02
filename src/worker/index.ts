@@ -7,6 +7,7 @@ import { handleProcessBounce } from "./handlers/process-bounce";
 import { handleQueueSequenceSteps } from "./handlers/queue-sequence-steps";
 import { handleWarmupIncrement } from "./handlers/warm-up-increment";
 import { handleSmtpConnectionMonitor } from "./handlers/smtp-connection-monitor";
+import { handleSidecarHealthMonitor } from "./handlers/sidecar-health-monitor";
 import { handleAccountDeliverabilityMonitor } from "./handlers/account-deliverability-monitor";
 import { handleCampaignPerformanceMonitor } from "./handlers/campaign-performance-monitor";
 import { handleVerifyNewLeads } from "./handlers/verify-new-leads";
@@ -61,6 +62,7 @@ async function main() {
     "queue-sequence-steps",
     "warm-up-increment-cron",
     "smtp-connection-monitor",
+    "sidecar-health-monitor",
     "account-deliverability-monitor",
     "campaign-performance-monitor",
     "verify-new-leads",
@@ -275,6 +277,22 @@ async function main() {
       await handleSmtpConnectionMonitor();
     } catch (err) {
       console.error("[Worker] SMTP connection monitor failed:", err);
+      throw err;
+    }
+  });
+
+  // Register sidecar-health-monitor cron (every 15 minutes)
+  // Probes /admin/health on each host in SIDECAR_DEPLOYED_HOSTS env var.
+  // Alerts via system_alerts.alert_type='sidecar_unhealthy' on 3 consecutive
+  // failures (60-min dedup window). ALERTS ONLY — does NOT auto-disable
+  // accounts. With SIDECAR_DEPLOYED_HOSTS empty (default) this is a no-op.
+  await boss.schedule("sidecar-health-monitor", "*/15 * * * *");
+  await boss.work("sidecar-health-monitor", async () => {
+    console.log("[Worker] Probing sidecar health...");
+    try {
+      await handleSidecarHealthMonitor();
+    } catch (err) {
+      console.error("[Worker] Sidecar health monitor failed:", err);
       throw err;
     }
   });
