@@ -12,6 +12,13 @@
 // 'subsequence', the trigger editor renders ABOVE the steps editor and feeds
 // triggerConfig into buildCreatePayload/validateComposerInput.
 //
+// CC #UI-4 (2026-05-02): campaignId made OPTIONAL (string | null). When the
+// modal is invoked from the org-wide /dashboard/follow-ups Subsequences tab
+// without a fixed campaign context, it renders <CampaignPicker> at the top
+// so the user can pick which campaign the subsequence attaches to. The
+// pickedCampaignId then drives endpointFor()/methodFor(). On edit, the
+// picker pre-fills from existingSequence.campaign_id and is locked.
+//
 // API contract consumed (NOT modified — see V8/V10 NO-GO):
 //   POST   /api/campaigns/[id]/sequences           — create primary or subsequence
 //   PATCH  /api/campaigns/[id]/sequences/[seqId]  — update existing sequence
@@ -30,6 +37,7 @@ import { X } from "lucide-react";
 import { toast } from "sonner";
 import { SequenceStepEditor } from "@/components/sequence/sequence-step-editor";
 import { SubsequenceTriggerEditor } from "@/components/sequence/subsequence-trigger-editor";
+import { CampaignPicker } from "@/components/sequence/campaign-picker";
 import type { SequenceStep, CampaignSequence } from "@/lib/supabase/types";
 import {
   type ComposerMode,
@@ -44,13 +52,24 @@ import {
   methodFor,
 } from "./sequence-composer-helpers";
 
+interface CampaignOption {
+  id: string;
+  name: string;
+  status: string;
+}
+
 interface SequenceComposerModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  campaignId: string;
+  // CC #UI-4: nullable when invoked from org-wide /dashboard/follow-ups; the
+  // CampaignPicker then collects the attachment target. Existing call sites
+  // on campaign-detail-client.tsx still pass a non-null id and behave as before.
+  campaignId: string | null;
   mode: ComposerMode;
   sequenceType?: SequenceType;
   existingSequence?: CampaignSequence;
+  // CC #UI-4: required when campaignId is null so the picker can render options.
+  campaigns?: CampaignOption[];
   onSuccess?: (seq: CampaignSequence) => void;
 }
 
@@ -70,6 +89,7 @@ export default function SequenceComposerModal({
   mode,
   sequenceType,
   existingSequence,
+  campaigns,
   onSuccess,
 }: SequenceComposerModalProps) {
   const router = useRouter();
@@ -88,6 +108,10 @@ export default function SequenceComposerModal({
   const [triggerConfig, setTriggerConfig] = useState<SubsequenceTriggerConfig>(
     initialTriggerConfig(existingSequence)
   );
+  const [pickedCampaignId, setPickedCampaignId] = useState<string | null>(
+    existingSequence?.campaign_id ?? campaignId ?? null
+  );
+  const [pickerError, setPickerError] = useState<string | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [apiError, setApiError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<{
@@ -105,10 +129,12 @@ export default function SequenceComposerModal({
       setPersona(existingSequence?.persona ?? "");
       setSteps(initialStepsFor(mode, existingSequence));
       setTriggerConfig(initialTriggerConfig(existingSequence));
+      setPickedCampaignId(existingSequence?.campaign_id ?? campaignId ?? null);
+      setPickerError(undefined);
       setApiError(null);
       setFieldErrors({});
     }
-  }, [open, mode, existingSequence]);
+  }, [open, mode, existingSequence, campaignId]);
 
   const titleText = (() => {
     if (mode === "create" && isSubsequence) return "New Subsequence";
@@ -120,6 +146,16 @@ export default function SequenceComposerModal({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setApiError(null);
+    setPickerError(undefined);
+
+    // CC #UI-4: enforce a campaign selection before any server hit when the
+    // modal was opened without a fixed campaignId. endpointFor() asserts a
+    // non-null id, so resolve picker state before validation.
+    const submitCampaignId = pickedCampaignId;
+    if (!submitCampaignId) {
+      setPickerError("Please pick a campaign for this subsequence.");
+      return;
+    }
 
     const errors = validateComposerInput(
       { name, persona, steps },
@@ -131,7 +167,7 @@ export default function SequenceComposerModal({
 
     setLoading(true);
     try {
-      const url = endpointFor(mode, campaignId, existingSequence?.id);
+      const url = endpointFor(mode, submitCampaignId, existingSequence?.id);
       const method = methodFor(mode);
       const body =
         mode === "create"
@@ -189,6 +225,16 @@ export default function SequenceComposerModal({
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-5">
+            {isSubsequence && campaignId === null && campaigns && (
+              <CampaignPicker
+                value={pickedCampaignId}
+                onChange={setPickedCampaignId}
+                campaigns={campaigns}
+                disabled={mode === "edit"}
+                error={pickerError}
+              />
+            )}
+
             <div>
               <label className="block text-sm font-medium text-gray-300 mb-1">
                 Sequence Name

@@ -270,6 +270,26 @@ export async function getCampaignStats(campaignId: string) {
   return stats;
 }
 
+// CC #UI-4 (2026-05-02): org-wide subsequence list for /dashboard/follow-ups.
+// Joins campaigns(name) so the UI can show which campaign each subsequence
+// is attached to. Per-campaign attachment preserved this CC; CC #UI-5 will
+// refactor to true org-scoped reuse via applies_to_* columns.
+export async function getOrgSubsequences() {
+  const orgId = await getInternalOrgId();
+  const supabase = await createAdminClient();
+  const { data, error } = await supabase
+    .from("campaign_sequences")
+    .select(
+      "id, org_id, name, persona, trigger_event, trigger_condition, trigger_priority, campaign_id, status, created_at, updated_at, sequence_type, steps, sort_order, campaigns(name)"
+    )
+    .eq("org_id", orgId)
+    .eq("sequence_type", "subsequence")
+    .order("created_at", { ascending: false });
+
+  if (error) throw error;
+  return data || [];
+}
+
 export async function getSequences(campaignId: string) {
   const orgId = await getInternalOrgId();
   const supabase = await createAdminClient();

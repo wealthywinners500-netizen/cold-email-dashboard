@@ -319,7 +319,13 @@ test("modal POSTs to /api/campaigns/[id]/sequences via helper", () => {
     /from\s+["']\.\/sequence-composer-helpers["']/.test(modalSrc),
     "modal must import its helpers (route + payload builders are tested separately)"
   );
-  assert(/endpointFor\(\s*mode\s*,\s*campaignId/.test(modalSrc), "modal must call endpointFor with mode + campaignId");
+  // CC #UI-4 (2026-05-02): modal now resolves a `submitCampaignId` from
+  // pickedCampaignId (which falls back to the prop) before calling
+  // endpointFor — the prop alias rename keeps the contract intact.
+  assert(
+    /endpointFor\(\s*mode\s*,\s*(submitCampaignId|campaignId)/.test(modalSrc),
+    "modal must call endpointFor with mode + (submitCampaignId|campaignId)"
+  );
   assert(/methodFor\(\s*mode\s*\)/.test(modalSrc), "modal must call methodFor with mode");
 });
 
@@ -345,7 +351,13 @@ test("modal resets form state when (re)opened (useEffect on [open, mode, existin
   // Without this, opening Edit on sequence A then closing and opening Edit on
   // sequence B would show A's data. The useEffect resets on prop change.
   assert(/useEffect/.test(modalSrc), "modal must use useEffect for prop-change resets");
-  assert(/\[open\s*,\s*mode\s*,\s*existingSequence\]/.test(modalSrc), "useEffect deps must include all reset triggers");
+  // CC #UI-4 (2026-05-02): campaignId added to the deps array so the picker
+  // re-prefills when a fresh campaign target is bound (e.g., Edit reopened
+  // for a different subsequence).
+  assert(
+    /\[\s*open\s*,\s*mode\s*,\s*existingSequence(\s*,\s*campaignId)?\s*\]/.test(modalSrc),
+    "useEffect deps must include open, mode, existingSequence (and optionally campaignId)"
+  );
 });
 
 // ───── Source-grep contract on the detail page wiring ─────
