@@ -1,12 +1,12 @@
 "use client";
 
-import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { useState, useEffect } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import * as Tabs from "@radix-ui/react-tabs";
 import { Campaign, CampaignSequence, LeadSequenceState, CampaignStats, CampaignAnalytics } from "@/lib/supabase/types";
 import { Badge } from "@/components/ui/badge";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { SequenceStepEditor } from "@/components/sequence/sequence-step-editor";
 import { SequenceFlowDiagram } from "@/components/sequence/sequence-flow-diagram";
 import SequenceComposerModal from "@/components/modals/sequence-composer-modal";
@@ -79,6 +79,9 @@ const STATUS_COLORS: Record<string, string> = {
 
 const PIE_COLORS = ["#6b7280", "#3b82f6", "#22c55e", "#f59e0b", "#a855f7", "#ef4444", "#f97316"];
 
+const TAB_VALUES = ["analytics", "leads", "sequences", "schedule", "options"] as const;
+type TabValue = typeof TAB_VALUES[number];
+
 export default function CampaignDetailClient({
   campaign,
   sequences,
@@ -90,18 +93,36 @@ export default function CampaignDetailClient({
   analyticsRecipientsCount,
 }: CampaignDetailClientProps) {
   const router = useRouter();
+  const searchParams = useSearchParams();
+
+  const initialTab: TabValue = (() => {
+    const t = searchParams.get("tab");
+    return (TAB_VALUES as readonly string[]).includes(t || "")
+      ? (t as TabValue)
+      : "analytics";
+  })();
+  const [activeTab, setActiveTab] = useState<TabValue>(initialTab);
   const [expandedSequence, setExpandedSequence] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState("overview");
   const [composerState, setComposerState] = useState<{
     open: boolean;
     mode: "create" | "edit";
-    sequenceType: "primary" | "subsequence";
     seq?: CampaignSequence;
-  }>({ open: false, mode: "create", sequenceType: "primary" });
+  }>({ open: false, mode: "create" });
   const [scheduleModalOpen, setScheduleModalOpen] = useState(false);
   const [recipientsModalOpen, setRecipientsModalOpen] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
   const [isPausing, setIsPausing] = useState(false);
+  const [tagsCsv, setTagsCsv] = useState((campaign.tags || []).join(", "));
+  const [savingTags, setSavingTags] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("tab") !== activeTab) {
+      url.searchParams.set("tab", activeTab);
+      window.history.replaceState(null, "", url.pathname + url.search);
+    }
+  }, [activeTab]);
 
   const statusBadge = statusColorMap[campaign.status] || "bg-gray-700 text-gray-200";
 
@@ -115,9 +136,10 @@ export default function CampaignDetailClient({
   const sendingDays = Array.isArray(sendingSchedule.days)
     ? (sendingSchedule.days as string[]).join(", ")
     : "mon, tue, wed, thu, fri";
+  const perAccountPerHour =
+    (sendingSchedule.per_account_per_hour as number | null) ?? "—";
 
   const primarySequence = sequences.find((s) => s.sequence_type === "primary");
-  const subsequences = sequences.filter((s) => s.sequence_type === "subsequence");
 
   const isTerminalStatus = campaign.status === "completed" || campaign.status === "archived";
   const canStart =
@@ -182,6 +204,35 @@ export default function CampaignDetailClient({
     }
   }
 
+  async function saveTags() {
+    const newTags = tagsCsv
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const currentJoined = (campaign.tags || []).join(",");
+    const nextJoined = newTags.join(",");
+    if (currentJoined === nextJoined) return;
+    setSavingTags(true);
+    try {
+      const response = await fetch(`/api/campaigns/${campaign.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tags: newTags }),
+      });
+      const json = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        toast.error(json?.error || "Failed to save tags");
+        return;
+      }
+      toast.success("Tags saved");
+      router.refresh();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Network error");
+    } finally {
+      setSavingTags(false);
+    }
+  }
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -189,7 +240,7 @@ export default function CampaignDetailClient({
         <div className="flex items-start justify-between mb-4 gap-4">
           <div>
             <h1 className="text-3xl font-bold text-white mb-2">{campaign.name}</h1>
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-3 flex-wrap">
               <Badge className={statusBadge}>{campaign.status}</Badge>
               {campaign.region && (
                 <span className="text-gray-400">{campaign.region}</span>
@@ -197,63 +248,30 @@ export default function CampaignDetailClient({
               {campaign.store_chain && (
                 <span className="text-gray-400">{campaign.store_chain}</span>
               )}
+              {(campaign.tags || []).map((t) => (
+                <Badge key={t} className="bg-blue-950 text-blue-300 border border-blue-900">
+                  {t}
+                </Badge>
+              ))}
             </div>
-          </div>
-          <div className="flex items-center gap-2">
-            {canPause && (
-              <button
-                type="button"
-                onClick={() => handleStatusChange("paused")}
-                disabled={isPausing}
-                className="inline-flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 disabled:bg-gray-800/50 text-white rounded-lg font-medium transition-colors"
-              >
-                <PauseIcon size={16} />
-                {isPausing ? "Pausing…" : "Pause"}
-              </button>
-            )}
-            {canResume && (
-              <button
-                type="button"
-                onClick={() => handleStatusChange("active")}
-                disabled={isPausing}
-                className="inline-flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 disabled:bg-gray-800/50 text-white rounded-lg font-medium transition-colors"
-              >
-                <Play size={16} />
-                {isPausing ? "Resuming…" : "Resume"}
-              </button>
-            )}
-            {!isTerminalStatus && (
-              <button
-                type="button"
-                onClick={handleStartCampaign}
-                disabled={!canStart || isStarting}
-                title={
-                  !primarySequence
-                    ? "Add a primary sequence first"
-                    : stats.total_recipients === 0
-                    ? "Add recipients first"
-                    : campaign.status === "sending"
-                    ? "Campaign is already sending"
-                    : ""
-                }
-                className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-600/40 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors"
-              >
-                <Play size={16} />
-                {isStarting ? "Starting…" : "Start Campaign"}
-              </button>
-            )}
           </div>
         </div>
       </div>
 
       {/* Tabs */}
-      <Tabs.Root value={activeTab} onValueChange={setActiveTab} className="w-full">
+      <Tabs.Root value={activeTab} onValueChange={(v) => setActiveTab(v as TabValue)} className="w-full">
         <Tabs.List className="flex gap-1 border-b border-gray-800 bg-gray-900/50 rounded-t-lg p-1">
           <Tabs.Trigger
-            value="overview"
+            value="analytics"
             className="px-4 py-3 text-sm font-medium text-gray-400 hover:text-white transition-colors data-[state=active]:text-white data-[state=active]:border-b-2 data-[state=active]:border-blue-600"
           >
-            Overview
+            Analytics
+          </Tabs.Trigger>
+          <Tabs.Trigger
+            value="leads"
+            className="px-4 py-3 text-sm font-medium text-gray-400 hover:text-white transition-colors data-[state=active]:text-white data-[state=active]:border-b-2 data-[state=active]:border-blue-600"
+          >
+            Leads
           </Tabs.Trigger>
           <Tabs.Trigger
             value="sequences"
@@ -262,390 +280,20 @@ export default function CampaignDetailClient({
             Sequences
           </Tabs.Trigger>
           <Tabs.Trigger
-            value="recipients"
+            value="schedule"
             className="px-4 py-3 text-sm font-medium text-gray-400 hover:text-white transition-colors data-[state=active]:text-white data-[state=active]:border-b-2 data-[state=active]:border-blue-600"
           >
-            Recipients
+            Schedule
           </Tabs.Trigger>
           <Tabs.Trigger
-            value="analytics"
+            value="options"
             className="px-4 py-3 text-sm font-medium text-gray-400 hover:text-white transition-colors data-[state=active]:text-white data-[state=active]:border-b-2 data-[state=active]:border-blue-600"
           >
-            Analytics
+            Options
           </Tabs.Trigger>
         </Tabs.List>
 
-        {/* Overview Tab */}
-        <Tabs.Content value="overview" className="space-y-6 pt-6">
-          {/* Stats Grid */}
-          <div className="grid grid-cols-4 gap-4">
-            <Card className="bg-gray-900 border-gray-800">
-              <CardContent className="p-4">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-gray-400 text-sm">Total Recipients</p>
-                    <p className="text-2xl font-bold text-white mt-2">
-                      {stats.total_recipients}
-                    </p>
-                  </div>
-                  <Users className="w-8 h-8 text-blue-500" />
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card className="bg-gray-900 border-gray-800">
-              <CardContent className="p-4">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-gray-400 text-sm">Sent</p>
-                    <p className="text-2xl font-bold text-white mt-2">
-                      {stats.sent}
-                    </p>
-                  </div>
-                  <Mail className="w-8 h-8 text-green-500" />
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card className="bg-gray-900 border-gray-800">
-              <CardContent className="p-4">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-gray-400 text-sm">Replied</p>
-                    <p className="text-2xl font-bold text-white mt-2">
-                      {stats.replied}
-                    </p>
-                  </div>
-                  <MessageCircle className="w-8 h-8 text-purple-500" />
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card className="bg-gray-900 border-gray-800">
-              <CardContent className="p-4">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-gray-400 text-sm">Bounced</p>
-                    <p className="text-2xl font-bold text-white mt-2">
-                      {stats.bounced}
-                    </p>
-                  </div>
-                  <AlertCircle className="w-8 h-8 text-red-500" />
-                </div>
-              </CardContent>
-            </Card>
-          </div>
-
-          {/* Schedule Info */}
-          <Card className="bg-gray-900 border-gray-800">
-            <CardHeader>
-              <div className="flex items-center justify-between">
-                <CardTitle className="text-white">Sending Schedule</CardTitle>
-                <button
-                  type="button"
-                  onClick={() => setScheduleModalOpen(true)}
-                  className="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 text-gray-200 rounded-lg flex items-center gap-1 transition-colors"
-                  aria-label="Edit Schedule"
-                >
-                  <Pencil size={12} />
-                  Edit Schedule
-                </button>
-              </div>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="grid grid-cols-4 gap-6">
-                <div>
-                  <p className="text-gray-400 text-sm">Sending Hours</p>
-                  <p className="text-white font-medium mt-2">{sendingHours}</p>
-                </div>
-                <div>
-                  <p className="text-gray-400 text-sm">Timezone</p>
-                  <p className="text-white font-medium mt-2">{timezone}</p>
-                </div>
-                <div>
-                  <p className="text-gray-400 text-sm">Daily Limit</p>
-                  <p className="text-white font-medium mt-2">{dailyLimit}</p>
-                </div>
-                <div>
-                  <p className="text-gray-400 text-sm">Days</p>
-                  <p className="text-white font-medium mt-2 capitalize">{sendingDays}</p>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-        </Tabs.Content>
-
-        {/* Sequences Tab */}
-        <Tabs.Content value="sequences" className="space-y-6 pt-6">
-          {!primarySequence && sequences.length > 0 && (
-            <div className="flex justify-end">
-              <button
-                onClick={() => setComposerState({ open: true, mode: "create", sequenceType: "primary" })}
-                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors"
-              >
-                + New Primary Sequence
-              </button>
-            </div>
-          )}
-
-          {primarySequence && (
-            <div className="space-y-4">
-              <h3 className="text-lg font-semibold text-white">Primary Sequence</h3>
-              <Card
-                className="bg-gray-900 border-l-4 border-l-blue-600 border-gray-800 cursor-pointer transition-all hover:bg-gray-800/80"
-                onClick={() =>
-                  setExpandedSequence(
-                    expandedSequence === primarySequence.id ? null : primarySequence.id
-                  )
-                }
-              >
-                <CardHeader>
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-3">
-                      <CardTitle className="text-white">
-                        {primarySequence.name}
-                      </CardTitle>
-                      <Badge className="bg-blue-900 text-blue-200">Primary</Badge>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <span className="text-gray-400 text-sm">
-                        {primarySequence.steps.length} steps
-                      </span>
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setComposerState({ open: true, mode: "edit", sequenceType: "primary", seq: primarySequence });
-                        }}
-                        className="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 text-gray-200 rounded-lg flex items-center gap-1 transition-colors"
-                        aria-label="Edit primary sequence"
-                      >
-                        <Pencil size={12} />
-                        Edit
-                      </button>
-                    </div>
-                  </div>
-                </CardHeader>
-                {expandedSequence === primarySequence.id && (
-                  <CardContent className="space-y-4">
-                    <SequenceStepEditor
-                      steps={primarySequence.steps}
-                      onChange={() => {}}
-                      readOnly={true}
-                    />
-                  </CardContent>
-                )}
-              </Card>
-            </div>
-          )}
-
-          {(primarySequence || subsequences.length > 0) && (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <h3 className="text-lg font-semibold text-white">Subsequences</h3>
-                {primarySequence && (
-                  <button
-                    onClick={() =>
-                      setComposerState({ open: true, mode: "create", sequenceType: "subsequence" })
-                    }
-                    className="px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors"
-                  >
-                    + New Subsequence
-                  </button>
-                )}
-              </div>
-              {subsequences.map((seq) => {
-                let triggerLabel = "Trigger: ";
-                if (seq.trigger_event === "reply_classified" || seq.trigger_event === "Reply Classified") {
-                  const condition = seq.trigger_condition as any;
-                  triggerLabel += `Reply classified as ${condition?.classification || "Unknown"}`;
-                } else if (seq.trigger_event === "no_reply" || seq.trigger_event === "No Reply") {
-                  const condition = seq.trigger_condition as any;
-                  triggerLabel += `No reply after ${condition?.days || 0} days`;
-                } else if (seq.trigger_event) {
-                  triggerLabel += seq.trigger_event;
-                }
-
-                return (
-                  <Card
-                    key={seq.id}
-                    className="bg-gray-900 border-gray-800 cursor-pointer transition-all hover:bg-gray-800/80"
-                    onClick={() =>
-                      setExpandedSequence(
-                        expandedSequence === seq.id ? null : seq.id
-                      )
-                    }
-                  >
-                    <CardHeader>
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-3">
-                          <CardTitle className="text-white">
-                            {seq.name}
-                          </CardTitle>
-                          <Badge className="bg-amber-900 text-amber-200">
-                            Subsequence
-                          </Badge>
-                        </div>
-                        <div className="flex items-center gap-3">
-                          <span className="text-gray-400 text-sm">
-                            {seq.steps.length} steps
-                          </span>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setComposerState({ open: true, mode: "edit", sequenceType: "subsequence", seq });
-                            }}
-                            className="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 text-gray-200 rounded-lg flex items-center gap-1 transition-colors"
-                            aria-label="Edit subsequence"
-                          >
-                            <Pencil size={12} />
-                            Edit
-                          </button>
-                        </div>
-                      </div>
-                      <CardDescription className="text-gray-400 mt-2">
-                        {triggerLabel}
-                      </CardDescription>
-                    </CardHeader>
-                    {expandedSequence === seq.id && (
-                      <CardContent className="space-y-4">
-                        <SequenceStepEditor
-                          steps={seq.steps}
-                          onChange={() => {}}
-                          readOnly={true}
-                        />
-                      </CardContent>
-                    )}
-                  </Card>
-                );
-              })}
-            </div>
-          )}
-
-          {/* Flow Diagram */}
-          {sequences.length > 0 && (
-            <div className="space-y-4">
-              <h3 className="text-lg font-semibold text-white">Sequence Flow</h3>
-              <SequenceFlowDiagram sequences={sequences} />
-            </div>
-          )}
-
-          {sequences.length === 0 && (
-            <div className="flex flex-col items-center justify-center py-12 text-center">
-              <Mail className="w-12 h-12 text-gray-600 mb-4" />
-              <p className="text-gray-400">No sequences created yet</p>
-              <button
-                onClick={() => setComposerState({ open: true, mode: "create", sequenceType: "primary" })}
-                className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-              >
-                Create Sequence
-              </button>
-            </div>
-          )}
-        </Tabs.Content>
-
-        {/* Recipients Tab */}
-        <Tabs.Content value="recipients" className="space-y-6 pt-6">
-          <div className="flex items-center justify-between">
-            <p className="text-sm text-gray-400">
-              {stats.total_recipients} total recipient{stats.total_recipients === 1 ? "" : "s"}
-            </p>
-            <button
-              type="button"
-              onClick={() => setRecipientsModalOpen(true)}
-              className="px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors"
-            >
-              + Add Recipients
-            </button>
-          </div>
-          <Card className="bg-gray-900 border-gray-800 overflow-hidden">
-            <div className="overflow-x-auto">
-              <table className="w-full">
-                <thead className="bg-gray-800 border-b border-gray-700">
-                  <tr>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">
-                      Name
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">
-                      Email
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">
-                      Sequence
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">
-                      Step
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">
-                      Status
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">
-                      Variant
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">
-                      Last Activity
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {leadStates && leadStates.length > 0 ? (
-                    leadStates.map((state) => {
-                      const sequence = sequences.find(s => s.id === state.sequence_id);
-                      const statusColor =
-                        state.status === "active"
-                          ? "bg-blue-900 text-blue-200"
-                          : state.status === "completed"
-                          ? "bg-green-900 text-green-200"
-                          : state.status === "replied"
-                          ? "bg-purple-900 text-purple-200"
-                          : state.status === "bounced"
-                          ? "bg-red-900 text-red-200"
-                          : state.status === "opted_out"
-                          ? "bg-gray-700 text-gray-200"
-                          : "bg-gray-700 text-gray-200";
-
-                      return (
-                        <tr key={state.id} className="border-b border-gray-700 hover:bg-gray-800/50 transition-colors">
-                          <td className="px-6 py-4 text-sm text-gray-300">
-                            <span className="font-medium">Recipient</span>
-                          </td>
-                          <td className="px-6 py-4 text-sm text-gray-400">
-                            {state.recipient_id.substring(0, 8)}...
-                          </td>
-                          <td className="px-6 py-4 text-sm text-gray-400">
-                            {sequence?.name || "Unknown"}
-                          </td>
-                          <td className="px-6 py-4 text-sm text-gray-400">
-                            {state.current_step} / {state.total_steps}
-                          </td>
-                          <td className="px-6 py-4 text-sm">
-                            <Badge className={statusColor}>
-                              {state.status}
-                            </Badge>
-                          </td>
-                          <td className="px-6 py-4 text-sm text-gray-400">
-                            {state.assigned_variant || "—"}
-                          </td>
-                          <td className="px-6 py-4 text-sm text-gray-400">
-                            {state.last_sent_at
-                              ? new Date(state.last_sent_at).toLocaleDateString()
-                              : "—"}
-                          </td>
-                        </tr>
-                      );
-                    })
-                  ) : (
-                    <tr>
-                      <td colSpan={7} className="px-6 py-8 text-center text-gray-400">
-                        No recipients yet
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </Card>
-        </Tabs.Content>
-
-        {/* Analytics Tab (B10) */}
+        {/* Analytics Tab */}
         <Tabs.Content value="analytics" className="space-y-6 pt-6">
           {analytics ? (
             <>
@@ -905,6 +553,359 @@ export default function CampaignDetailClient({
             </Card>
           )}
         </Tabs.Content>
+
+        {/* Leads Tab */}
+        <Tabs.Content value="leads" className="space-y-6 pt-6">
+          <div className="flex items-center justify-between">
+            <p className="text-sm text-gray-400">
+              {stats.total_recipients} total lead{stats.total_recipients === 1 ? "" : "s"}
+            </p>
+            <button
+              type="button"
+              onClick={() => setRecipientsModalOpen(true)}
+              className="px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors"
+            >
+              + Add Leads
+            </button>
+          </div>
+          <Card className="bg-gray-900 border-gray-800 overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead className="bg-gray-800 border-b border-gray-700">
+                  <tr>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">
+                      Name
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">
+                      Email
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">
+                      Sequence
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">
+                      Step
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">
+                      Status
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">
+                      Variant
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">
+                      Last Activity
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {leadStates && leadStates.length > 0 ? (
+                    leadStates.map((state) => {
+                      const sequence = sequences.find(s => s.id === state.sequence_id);
+                      const statusColor =
+                        state.status === "active"
+                          ? "bg-blue-900 text-blue-200"
+                          : state.status === "completed"
+                          ? "bg-green-900 text-green-200"
+                          : state.status === "replied"
+                          ? "bg-purple-900 text-purple-200"
+                          : state.status === "bounced"
+                          ? "bg-red-900 text-red-200"
+                          : state.status === "opted_out"
+                          ? "bg-gray-700 text-gray-200"
+                          : "bg-gray-700 text-gray-200";
+
+                      return (
+                        <tr key={state.id} className="border-b border-gray-700 hover:bg-gray-800/50 transition-colors">
+                          <td className="px-6 py-4 text-sm text-gray-300">
+                            <span className="font-medium">Recipient</span>
+                          </td>
+                          <td className="px-6 py-4 text-sm text-gray-400">
+                            {state.recipient_id.substring(0, 8)}...
+                          </td>
+                          <td className="px-6 py-4 text-sm text-gray-400">
+                            {sequence?.name || "Unknown"}
+                          </td>
+                          <td className="px-6 py-4 text-sm text-gray-400">
+                            {state.current_step} / {state.total_steps}
+                          </td>
+                          <td className="px-6 py-4 text-sm">
+                            <Badge className={statusColor}>
+                              {state.status}
+                            </Badge>
+                          </td>
+                          <td className="px-6 py-4 text-sm text-gray-400">
+                            {state.assigned_variant || "—"}
+                          </td>
+                          <td className="px-6 py-4 text-sm text-gray-400">
+                            {state.last_sent_at
+                              ? new Date(state.last_sent_at).toLocaleDateString()
+                              : "—"}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  ) : (
+                    <tr>
+                      <td colSpan={7} className="px-6 py-8 text-center text-gray-400">
+                        No leads yet
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        </Tabs.Content>
+
+        {/* Sequences Tab */}
+        <Tabs.Content value="sequences" className="space-y-6 pt-6">
+          {!primarySequence && sequences.length === 0 && (
+            <div className="flex flex-col items-center justify-center py-12 text-center">
+              <Mail className="w-12 h-12 text-gray-600 mb-4" />
+              <p className="text-gray-400">No primary sequence yet</p>
+              <button
+                onClick={() => setComposerState({ open: true, mode: "create" })}
+                className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+              >
+                + New Primary Sequence
+              </button>
+            </div>
+          )}
+
+          {!primarySequence && sequences.length > 0 && (
+            <div className="flex justify-end">
+              <button
+                onClick={() => setComposerState({ open: true, mode: "create" })}
+                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors"
+              >
+                + New Primary Sequence
+              </button>
+            </div>
+          )}
+
+          {primarySequence && (
+            <div className="space-y-4">
+              <h3 className="text-lg font-semibold text-white">Primary Sequence</h3>
+              <Card
+                className="bg-gray-900 border-l-4 border-l-blue-600 border-gray-800 cursor-pointer transition-all hover:bg-gray-800/80"
+                onClick={() =>
+                  setExpandedSequence(
+                    expandedSequence === primarySequence.id ? null : primarySequence.id
+                  )
+                }
+              >
+                <CardHeader>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <CardTitle className="text-white">
+                        {primarySequence.name}
+                      </CardTitle>
+                      <Badge className="bg-blue-900 text-blue-200">Primary</Badge>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <span className="text-gray-400 text-sm">
+                        {primarySequence.steps.length} steps
+                      </span>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setComposerState({ open: true, mode: "edit", seq: primarySequence });
+                        }}
+                        className="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 text-gray-200 rounded-lg flex items-center gap-1 transition-colors"
+                        aria-label="Edit primary sequence"
+                      >
+                        <Pencil size={12} />
+                        Edit
+                      </button>
+                    </div>
+                  </div>
+                </CardHeader>
+                {expandedSequence === primarySequence.id && (
+                  <CardContent className="space-y-4">
+                    <SequenceStepEditor
+                      steps={primarySequence.steps}
+                      onChange={() => {}}
+                      readOnly={true}
+                    />
+                  </CardContent>
+                )}
+              </Card>
+            </div>
+          )}
+
+          {/* Flow Diagram (primary only) */}
+          {primarySequence && (
+            <div className="space-y-4">
+              <h3 className="text-lg font-semibold text-white">Sequence Flow</h3>
+              <SequenceFlowDiagram sequences={[primarySequence]} />
+            </div>
+          )}
+
+          <p className="text-xs text-gray-500 italic">
+            Subsequences (auto-replies, no-reply nudges) are managed on the Follow-Ups page.
+          </p>
+        </Tabs.Content>
+
+        {/* Schedule Tab */}
+        <Tabs.Content value="schedule" className="space-y-6 pt-6">
+          <Card className="bg-gray-900 border-gray-800">
+            <CardHeader>
+              <div className="flex items-center justify-between">
+                <CardTitle className="text-white">Sending Schedule</CardTitle>
+                <button
+                  type="button"
+                  onClick={() => setScheduleModalOpen(true)}
+                  className="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 text-gray-200 rounded-lg flex items-center gap-1 transition-colors"
+                  aria-label="Edit Schedule"
+                >
+                  <Pencil size={12} />
+                  Edit Schedule
+                </button>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
+                <div>
+                  <p className="text-gray-400 text-sm">Sending Hours</p>
+                  <p className="text-white font-medium mt-2">{sendingHours}</p>
+                </div>
+                <div>
+                  <p className="text-gray-400 text-sm">Timezone</p>
+                  <p className="text-white font-medium mt-2">{timezone}</p>
+                </div>
+                <div>
+                  <p className="text-gray-400 text-sm">Daily Limit</p>
+                  <p className="text-white font-medium mt-2">{dailyLimit}</p>
+                </div>
+                <div>
+                  <p className="text-gray-400 text-sm">Per Account / Hour</p>
+                  <p className="text-white font-medium mt-2">{perAccountPerHour}</p>
+                </div>
+                <div className="md:col-span-4">
+                  <p className="text-gray-400 text-sm">Days</p>
+                  <p className="text-white font-medium mt-2 capitalize">{sendingDays}</p>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        </Tabs.Content>
+
+        {/* Options Tab */}
+        <Tabs.Content value="options" className="space-y-6 pt-6">
+          {/* Action Cluster */}
+          <Card className="bg-gray-900 border-gray-800">
+            <CardHeader>
+              <CardTitle className="text-white">Campaign Controls</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="flex flex-wrap items-center gap-3">
+                {!isTerminalStatus && (
+                  <button
+                    type="button"
+                    onClick={handleStartCampaign}
+                    disabled={!canStart || isStarting}
+                    title={
+                      !primarySequence
+                        ? "Add a primary sequence first"
+                        : stats.total_recipients === 0
+                        ? "Add leads first"
+                        : campaign.status === "sending"
+                        ? "Campaign is already sending"
+                        : ""
+                    }
+                    className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-600/40 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors"
+                  >
+                    <Play size={16} />
+                    {isStarting ? "Starting…" : "Start Campaign"}
+                  </button>
+                )}
+                {canPause && (
+                  <button
+                    type="button"
+                    onClick={() => handleStatusChange("paused")}
+                    disabled={isPausing}
+                    className="inline-flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 disabled:bg-gray-800/50 text-white rounded-lg font-medium transition-colors"
+                  >
+                    <PauseIcon size={16} />
+                    {isPausing ? "Pausing…" : "Pause"}
+                  </button>
+                )}
+                {canResume && (
+                  <button
+                    type="button"
+                    onClick={() => handleStatusChange("active")}
+                    disabled={isPausing}
+                    className="inline-flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 disabled:bg-gray-800/50 text-white rounded-lg font-medium transition-colors"
+                  >
+                    <Play size={16} />
+                    {isPausing ? "Resuming…" : "Resume"}
+                  </button>
+                )}
+                <span className="text-sm text-gray-400 ml-auto">
+                  Status: <Badge className={statusBadge}>{campaign.status}</Badge>
+                </span>
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* Metadata */}
+          <Card className="bg-gray-900 border-gray-800">
+            <CardHeader>
+              <CardTitle className="text-white">Details</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-2 md:grid-cols-3 gap-6">
+                <div>
+                  <p className="text-gray-400 text-sm">Region</p>
+                  <p className="text-white font-medium mt-2">{campaign.region || "—"}</p>
+                </div>
+                <div>
+                  <p className="text-gray-400 text-sm">Store Chain</p>
+                  <p className="text-white font-medium mt-2">{campaign.store_chain || "—"}</p>
+                </div>
+                <div>
+                  <p className="text-gray-400 text-sm">Created</p>
+                  <p className="text-white font-medium mt-2">
+                    {new Date(campaign.created_at).toLocaleDateString()}
+                  </p>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* Tags */}
+          <Card className="bg-gray-900 border-gray-800">
+            <CardHeader>
+              <CardTitle className="text-white">Tags</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <p className="text-xs text-gray-500">
+                Comma-separated. Tags are used to match Follow-Up sequences.
+              </p>
+              {(campaign.tags || []).length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {(campaign.tags || []).map((t) => (
+                    <Badge
+                      key={t}
+                      className="bg-blue-950 text-blue-300 border border-blue-900"
+                    >
+                      {t}
+                    </Badge>
+                  ))}
+                </div>
+              )}
+              <input
+                type="text"
+                value={tagsCsv}
+                onChange={(e) => setTagsCsv(e.target.value)}
+                onBlur={saveTags}
+                disabled={savingTags}
+                placeholder="e.g. priority, q2, healthcare"
+                className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:outline-none focus:border-blue-600 disabled:opacity-50"
+                aria-label="Campaign tags"
+              />
+            </CardContent>
+          </Card>
+        </Tabs.Content>
       </Tabs.Root>
 
       <SequenceComposerModal
@@ -914,7 +915,7 @@ export default function CampaignDetailClient({
         }
         campaignId={campaign.id}
         mode={composerState.mode}
-        sequenceType={composerState.sequenceType}
+        sequenceType="primary"
         existingSequence={composerState.seq}
       />
 

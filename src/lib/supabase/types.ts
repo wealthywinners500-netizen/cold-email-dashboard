@@ -1060,6 +1060,8 @@ export interface Campaign {
   started_at: string | null;
   completed_at: string | null;
   created_at: string;
+  tags: string[];
+  assigned_account_id: string | null;
 }
 
 export interface CampaignStats {
