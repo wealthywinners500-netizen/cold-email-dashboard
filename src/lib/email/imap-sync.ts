@@ -341,8 +341,25 @@ export async function syncAllAccounts(orgId: string): Promise<{ synced: number; 
       // class of failure is visible from the dashboard instead of silent
       // (HL #155 candidate — invisible per-account TLS failures looked
       // like ops-worker-down for ~20 days, 2026-04-09 → 2026-04-29).
+      // Capture imapflow's NO/BAD context fields (CC #5b1.5): pre-existing
+      // alerts persisted only error.message="Command failed", losing
+      // responseStatus/responseText/executedCommand/code — the actual
+      // diagnostic data needed to root-cause cascading IMAP failures.
+      const e = errObj as Error & {
+        responseStatus?: string;
+        responseText?: string;
+        executedCommand?: string;
+        code?: string | number;
+        cause?: unknown;
+      };
       try {
-        await handleImapError(errObj, account.id, orgId);
+        await handleImapError(errObj, account.id, orgId, {
+          responseStatus: e.responseStatus,
+          responseText: typeof e.responseText === 'string' ? e.responseText.substring(0, 500) : undefined,
+          executedCommand: typeof e.executedCommand === 'string' ? e.executedCommand.substring(0, 500) : undefined,
+          code: e.code,
+          cause: e.cause ? String(e.cause).substring(0, 500) : undefined,
+        });
       } catch (alertErr) {
         console.error(`[IMAP] handleImapError failed for ${account.email}:`, alertErr);
       }

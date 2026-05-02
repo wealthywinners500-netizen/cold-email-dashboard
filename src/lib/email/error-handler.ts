@@ -131,15 +131,52 @@ export async function handleSmtpError(
 }
 
 /**
+ * Optional imapflow error context. Verified field names against
+ * node_modules/imapflow/lib/imap-flow.js NO/BAD throw site (CC #5b1.5).
+ *
+ * imapflow throws `new Error('Command failed')` on NO/BAD server responses
+ * and decorates the error with `responseStatus` ('NO'|'BAD'), `responseText`,
+ * `executedCommand` (full IMAP command string), and `code` (e.g. 'ETHROTTLE').
+ * Pre-CC#5b1.5 alerts captured only `error.message` — losing every diagnostic
+ * field. Caller in imap-sync.ts wraps these into the new context arg so
+ * future "Command failed" cascades surface real root-cause data.
+ */
+export interface ImapErrorContext {
+  responseStatus?: string;
+  responseText?: string;
+  executedCommand?: string;
+  code?: string | number;
+  cause?: string;
+}
+
+/**
+ * Sidecar-routed accounts (CC #5a v2) write outbound via Exim local-pipe;
+ * the worker IP can't SMTP-AUTH to those panels. Imap-sync still polls them
+ * (Unibox needs inbox reads), but if imapflow returns an opaque "Command
+ * failed" mid-poll we should NOT cascade-disable — the canonical liveness
+ * path is sidecar-health-monitor (CC #5b1) hitting /admin/health, not
+ * imap-sync command success. Mirrors getSidecarAccountIds() in
+ * smtp-connection-monitor.ts (CC #5b1).
+ */
+function getSidecarAccountIds(): Set<string> {
+  const raw = process.env.USE_PANEL_SIDECAR_ACCOUNT_IDS || '';
+  return new Set(raw.split(',').map((s) => s.trim()).filter(Boolean));
+}
+
+/**
  * Handle IMAP errors with classification and auto-disable logic.
+ * @param context optional imapflow fields captured by caller for diagnostics.
  */
 export async function handleImapError(
   error: Error,
   accountId: string,
-  orgId: string
+  orgId: string,
+  context?: ImapErrorContext
 ): Promise<void> {
   const supabase = getSupabase();
   const message = error.message || '';
+  const sidecarIds = getSidecarAccountIds();
+  const isSidecarAccount = sidecarIds.has(accountId);
 
   // Get current failure count
   const { data: account } = await supabase
@@ -158,44 +195,66 @@ export async function handleImapError(
   };
 
   if (message.includes('AUTHENTICATIONFAILED') || message.includes('Invalid credentials') || message.includes('LOGIN failed')) {
-    // Auth failure
+    // Auth failure — cascade for ALL accounts including sidecar (real creds problem;
+    // sidecar can't help with wrong credentials, would block sending too).
     if (failures >= 3) {
       updateData.status = 'disabled';
       await createAlert(orgId, 'imap_error', 'critical',
         `IMAP auth failed 3x — ${email} auto-disabled`,
-        { error: message, failures },
+        { error: message, failures, ...(context || {}) },
         accountId
       );
     } else {
       await createAlert(orgId, 'imap_error', 'warning',
         `IMAP auth failure on ${email} (${failures}/3)`,
-        { error: message, failures },
+        { error: message, failures, ...(context || {}) },
         accountId
       );
     }
   } else if (message.includes('ECONNREFUSED') || message.includes('ETIMEDOUT') || message.includes('Connection lost')) {
-    // Connection lost — will retry on next cron cycle
+    // Connection lost — will retry on next cron cycle (no cascade for anyone, existing behavior)
     await createAlert(orgId, 'imap_error', 'warning',
       `IMAP connection lost for ${email} — will retry next sync`,
-      { error: message },
+      { error: message, ...(context || {}) },
       accountId
     );
   } else if (message.includes('Mailbox not found') || message.includes('NO [NONEXISTENT]')) {
-    // Mailbox not found — critical
+    // Mailbox not found — critical alert for ALL accounts (real mailbox problem; sidecar can't help)
     await createAlert(orgId, 'imap_error', 'critical',
       `Mailbox not found for ${email}`,
-      { error: message },
+      { error: message, ...(context || {}) },
       accountId
     );
   } else {
-    // Generic IMAP error
+    // Generic IMAP error (imapflow's "Command failed" + others)
     if (failures >= 3) {
-      updateData.status = 'disabled';
-      await createAlert(orgId, 'imap_error', 'critical',
-        `${email} auto-disabled after ${failures} IMAP failures`,
-        { error: message, failures },
-        accountId
-      );
+      if (isSidecarAccount) {
+        // Sidecar-routed account: don't cascade-disable on opaque generic errors.
+        // sidecar-health-monitor (CC #5b1) owns liveness for these accounts via
+        // /admin/health probes. Alert for visibility but keep status='active'.
+        // CC #5b1.5 — closes the second cascade-disable path CC #5b1 missed.
+        await createAlert(orgId, 'imap_error', 'warning',
+          `Sidecar-routed account ${email} hit ${failures} generic IMAP failures (cascade-disable suppressed)`,
+          {
+            error: message,
+            failures,
+            sidecar_protected: true,
+            ...(context || {}),
+          },
+          accountId
+        );
+      } else {
+        updateData.status = 'disabled';
+        await createAlert(orgId, 'imap_error', 'critical',
+          `${email} auto-disabled after ${failures} IMAP failures`,
+          {
+            error: message,
+            failures,
+            ...(context || {}),
+          },
+          accountId
+        );
+      }
     }
   }
 
