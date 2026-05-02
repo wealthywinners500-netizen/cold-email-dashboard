@@ -4,7 +4,7 @@ import { useState, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Mail, Filter } from "lucide-react";
+import { Mail, Filter, Pencil } from "lucide-react";
 import CreateCampaignModal from "@/components/modals/create-campaign-modal";
 import { useRealtimeRefresh } from "@/hooks/use-realtime";
 import {
@@ -46,6 +46,7 @@ export default function CampaignsClient({ campaigns }: CampaignsClientProps) {
   const [selectedStatus, setSelectedStatus] = useState<string>("All");
   const [modalOpen, setModalOpen] = useState(false);
   const [editingCampaign, setEditingCampaign] = useState<any>(null);
+  const router = useRouter();
   useRealtimeRefresh("campaigns");
 
   const regions = useMemo(() => {
@@ -375,6 +376,7 @@ export default function CampaignsClient({ campaigns }: CampaignsClientProps) {
                     Reply Rate
                   </th>
                   <th className="text-left py-3 px-4 text-gray-400">Status</th>
+                  <th className="text-right py-3 px-4 text-gray-400">Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -382,8 +384,7 @@ export default function CampaignsClient({ campaigns }: CampaignsClientProps) {
                   <tr
                     key={campaign.id}
                     onClick={() => {
-                      setEditingCampaign(campaign);
-                      setModalOpen(true);
+                      router.push(`/dashboard/campaigns/${campaign.id}`);
                     }}
                     className="border-b border-gray-800 hover:bg-gray-800/50 cursor-pointer"
                   >
@@ -426,6 +427,20 @@ export default function CampaignsClient({ campaigns }: CampaignsClientProps) {
                           {campaign.status}
                         </Badge>
                       )}
+                    </td>
+                    <td className="py-3 px-4 text-right">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setEditingCampaign(campaign);
+                          setModalOpen(true);
+                        }}
+                        className="p-2 text-gray-400 hover:text-white hover:bg-gray-700 rounded transition-colors"
+                        aria-label="Edit campaign"
+                        title="Edit campaign"
+                      >
+                        <Pencil className="h-4 w-4" />
+                      </button>
                     </td>
                   </tr>
                 ))}
