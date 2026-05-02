@@ -90,8 +90,9 @@ export default function CampaignDetailClient({
   const [composerState, setComposerState] = useState<{
     open: boolean;
     mode: "create" | "edit";
+    sequenceType: "primary" | "subsequence";
     seq?: CampaignSequence;
-  }>({ open: false, mode: "create" });
+  }>({ open: false, mode: "create", sequenceType: "primary" });
 
   const statusBadge = statusColorMap[campaign.status] || "bg-gray-700 text-gray-200";
 
@@ -242,7 +243,7 @@ export default function CampaignDetailClient({
           {!primarySequence && sequences.length > 0 && (
             <div className="flex justify-end">
               <button
-                onClick={() => setComposerState({ open: true, mode: "create" })}
+                onClick={() => setComposerState({ open: true, mode: "create", sequenceType: "primary" })}
                 className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors"
               >
                 + New Primary Sequence
@@ -276,7 +277,7 @@ export default function CampaignDetailClient({
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
-                          setComposerState({ open: true, mode: "edit", seq: primarySequence });
+                          setComposerState({ open: true, mode: "edit", sequenceType: "primary", seq: primarySequence });
                         }}
                         className="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 text-gray-200 rounded-lg flex items-center gap-1 transition-colors"
                         aria-label="Edit primary sequence"
@@ -300,15 +301,27 @@ export default function CampaignDetailClient({
             </div>
           )}
 
-          {subsequences.length > 0 && (
+          {(primarySequence || subsequences.length > 0) && (
             <div className="space-y-4">
-              <h3 className="text-lg font-semibold text-white">Subsequences</h3>
+              <div className="flex items-center justify-between">
+                <h3 className="text-lg font-semibold text-white">Subsequences</h3>
+                {primarySequence && (
+                  <button
+                    onClick={() =>
+                      setComposerState({ open: true, mode: "create", sequenceType: "subsequence" })
+                    }
+                    className="px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors"
+                  >
+                    + New Subsequence
+                  </button>
+                )}
+              </div>
               {subsequences.map((seq) => {
                 let triggerLabel = "Trigger: ";
-                if (seq.trigger_event === "Reply Classified") {
+                if (seq.trigger_event === "reply_classified" || seq.trigger_event === "Reply Classified") {
                   const condition = seq.trigger_condition as any;
                   triggerLabel += `Reply classified as ${condition?.classification || "Unknown"}`;
-                } else if (seq.trigger_event === "No Reply") {
+                } else if (seq.trigger_event === "no_reply" || seq.trigger_event === "No Reply") {
                   const condition = seq.trigger_condition as any;
                   triggerLabel += `No reply after ${condition?.days || 0} days`;
                 } else if (seq.trigger_event) {
@@ -335,9 +348,22 @@ export default function CampaignDetailClient({
                             Subsequence
                           </Badge>
                         </div>
-                        <span className="text-gray-400 text-sm">
-                          {seq.steps.length} steps
-                        </span>
+                        <div className="flex items-center gap-3">
+                          <span className="text-gray-400 text-sm">
+                            {seq.steps.length} steps
+                          </span>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setComposerState({ open: true, mode: "edit", sequenceType: "subsequence", seq });
+                            }}
+                            className="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 text-gray-200 rounded-lg flex items-center gap-1 transition-colors"
+                            aria-label="Edit subsequence"
+                          >
+                            <Pencil size={12} />
+                            Edit
+                          </button>
+                        </div>
                       </div>
                       <CardDescription className="text-gray-400 mt-2">
                         {triggerLabel}
@@ -371,7 +397,7 @@ export default function CampaignDetailClient({
               <Mail className="w-12 h-12 text-gray-600 mb-4" />
               <p className="text-gray-400">No sequences created yet</p>
               <button
-                onClick={() => setComposerState({ open: true, mode: "create" })}
+                onClick={() => setComposerState({ open: true, mode: "create", sequenceType: "primary" })}
                 className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
               >
                 Create Sequence
@@ -739,6 +765,7 @@ export default function CampaignDetailClient({
         }
         campaignId={campaign.id}
         mode={composerState.mode}
+        sequenceType={composerState.sequenceType}
         existingSequence={composerState.seq}
       />
     </div>

@@ -7,6 +7,10 @@
  * a source-grep of the .tsx file to assert the contract (fetch URLs, body
  * shape, persona validation, etc.) without importing browser-only modules.
  *
+ * CC #UI-2 (2026-05-02): extended with subsequence-shape assertions covering
+ * the new sequenceType prop / triggerConfig threading. Existing primary tests
+ * stay GREEN via default-arg backward compat.
+ *
  * Helpers under test live in ../sequence-composer-helpers.ts (no React, no
  * Radix, no sonner — safe to import here).
  *
@@ -23,6 +27,10 @@ import {
   buildUpdatePayload,
   endpointFor,
   methodFor,
+  normalizeTriggerEvent,
+  type SubsequenceTriggerConfig,
+  type CreateSubsequencePayload,
+  type UpdateSubsequencePayload,
 } from "../sequence-composer-helpers";
 import type { CampaignSequence, SequenceStep } from "@/lib/supabase/types";
 import { readFileSync } from "node:fs";
@@ -121,36 +129,113 @@ test("valid input → no errors", () => {
 // ───── buildCreatePayload / buildUpdatePayload ─────
 console.log("\npayload builders:");
 
-test("create payload pins sequence_type to 'primary' (v1 lock)", () => {
+test("create payload defaults to 'primary' (backward-compat, no second arg)", () => {
   const payload = buildCreatePayload({ name: "  Test  ", persona: "  Victor  ", steps: [makeDefaultStep(1)] });
-  assert(payload.sequence_type === "primary", "sequence_type must be 'primary' for v1 — subsequences are out of scope");
+  assert(payload.sequence_type === "primary", "default sequenceType must be 'primary' for backward compat");
   assert(payload.name === "Test", "name must be trimmed");
   assert(payload.persona === "Victor", "persona must be trimmed");
   assert(payload.steps.length === 1, "steps must be passed through");
 });
 
-test("create payload matches the API POST body shape (verbatim API contract)", () => {
+test("create payload (primary) matches the API POST body shape (verbatim API contract)", () => {
   // src/app/api/campaigns/[id]/sequences/route.ts:69-78 destructures:
   //   { name, sequence_type, trigger_event, trigger_condition, trigger_priority, persona, steps }
-  // For primary v1 we only send name, sequence_type, persona, steps (trigger_* unused).
+  // For primary we only send name, sequence_type, persona, steps (trigger_* unused).
   const payload = buildCreatePayload({ name: "x", persona: "y", steps: [makeDefaultStep(1)] });
   const keys = Object.keys(payload).sort();
   assert(
     JSON.stringify(keys) === JSON.stringify(["name", "persona", "sequence_type", "steps"]),
-    `unexpected payload keys: ${JSON.stringify(keys)}`
+    `unexpected primary payload keys: ${JSON.stringify(keys)}`
   );
 });
 
-test("update payload is name+persona+steps (NO sequence_type — PATCH ignores it anyway)", () => {
+test("update payload (primary) is name+persona+steps (NO sequence_type — PATCH ignores it anyway)", () => {
   // src/app/api/campaigns/[id]/sequences/[seqId]/route.ts:70-72 — PATCH explicitly
   // ignores sequence_type. Sending it is harmless but we keep the body minimal.
   const payload = buildUpdatePayload({ name: "x", persona: "y", steps: [makeDefaultStep(1)] });
   const keys = Object.keys(payload).sort();
   assert(
     JSON.stringify(keys) === JSON.stringify(["name", "persona", "steps"]),
-    `unexpected update payload keys: ${JSON.stringify(keys)}`
+    `unexpected primary update payload keys: ${JSON.stringify(keys)}`
   );
 });
+
+// ───── CC #UI-2: subsequence helpers ─────
+console.log("\nsubsequence (CC #UI-2):");
+
+const sampleTrigger: SubsequenceTriggerConfig = {
+  trigger_event: "Reply Classified",
+  trigger_condition: { classification: "INTERESTED" },
+  trigger_priority: 1,
+  persona: "Decision Maker",
+};
+
+test("normalizeTriggerEvent maps display strings → DB-canonical snake_case", () => {
+  assert(normalizeTriggerEvent("Reply Classified") === "reply_classified", "Reply Classified must map to reply_classified");
+  assert(normalizeTriggerEvent("No Reply") === "no_reply", "No Reply must map to no_reply");
+  assert(normalizeTriggerEvent("Opened") === "opened", "Opened must map to opened");
+  assert(normalizeTriggerEvent("Clicked") === "clicked", "Clicked must map to clicked");
+});
+
+test("buildCreatePayload(input, 'subsequence', triggerConfig) returns sequence_type:'subsequence' with all 4 trigger fields canonicalized", () => {
+  const payload = buildCreatePayload(
+    { name: "INTERESTED follow-up", persona: "ignored", steps: [makeDefaultStep(1)] },
+    "subsequence",
+    sampleTrigger
+  ) as CreateSubsequencePayload;
+  assert(payload.sequence_type === "subsequence", "sequence_type must be 'subsequence'");
+  assert(payload.trigger_event === "reply_classified", "trigger_event must be canonicalized (Reply Classified → reply_classified)");
+  assert(JSON.stringify(payload.trigger_condition) === JSON.stringify({ classification: "INTERESTED" }), "trigger_condition must round-trip");
+  assert(payload.trigger_priority === 1, "trigger_priority must round-trip");
+  assert(payload.persona === "Decision Maker", "persona must come from triggerConfig (not input.persona) for subsequence");
+});
+
+test("buildCreatePayload(subsequence) without triggerConfig throws (defensive guard)", () => {
+  let threw = false;
+  try {
+    buildCreatePayload({ name: "x", persona: "x", steps: [makeDefaultStep(1)] }, "subsequence");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "missing triggerConfig in subsequence mode must throw");
+});
+
+test("buildUpdatePayload(subsequence, triggerConfig) includes the 3 trigger fields", () => {
+  const payload = buildUpdatePayload(
+    { name: "renamed", persona: "ignored", steps: [makeDefaultStep(1)] },
+    "subsequence",
+    sampleTrigger
+  ) as UpdateSubsequencePayload;
+  const keys = Object.keys(payload).sort();
+  assert(
+    JSON.stringify(keys) ===
+      JSON.stringify(["name", "persona", "steps", "trigger_condition", "trigger_event", "trigger_priority"]),
+    `unexpected subsequence update payload keys: ${JSON.stringify(keys)}`
+  );
+  assert(payload.trigger_event === "reply_classified", "update payload must canonicalize trigger_event");
+});
+
+test("validateComposerInput(subsequence) — happy path, plus 4 distinct field-level error scenarios", () => {
+  const baseInput = { name: "x", persona: "", steps: [makeDefaultStep(1)] };
+  // Happy path: Reply Classified + classification + persona + priority>=1 → no errors
+  assert(!hasErrors(validateComposerInput(baseInput, "subsequence", sampleTrigger)), "expected happy path to be error-free");
+  // null triggerConfig → trigger_event error
+  assert(validateComposerInput(baseInput, "subsequence", null).trigger_event, "null triggerConfig must error");
+  // No Reply + days=0 → trigger_condition error; days=3 → no error
+  assert(
+    validateComposerInput(baseInput, "subsequence", { trigger_event: "No Reply", trigger_condition: { days: 0 }, trigger_priority: 1, persona: "p" }).trigger_condition,
+    "No Reply with days=0 must error"
+  );
+  assert(
+    !hasErrors(validateComposerInput(baseInput, "subsequence", { trigger_event: "No Reply", trigger_condition: { days: 3 }, trigger_priority: 1, persona: "p" })),
+    "No Reply with days=3 must be error-free"
+  );
+  // priority < 1 → trigger_priority error
+  assert(validateComposerInput(baseInput, "subsequence", { ...sampleTrigger, trigger_priority: 0 }).trigger_priority, "priority<1 must error");
+  // empty triggerConfig.persona → persona error
+  assert(validateComposerInput(baseInput, "subsequence", { ...sampleTrigger, persona: "" }).persona, "empty subsequence persona must error");
+});
+
 
 // ───── endpointFor / methodFor ─────
 console.log("\nrouting helpers:");
@@ -195,6 +280,28 @@ test("modal consumes existing SequenceStepEditor (does NOT rebuild)", () => {
   assert(/<SequenceStepEditor[\s\S]*onChange=\{setSteps\}/.test(modalSrc), "modal must wire onChange to setSteps");
 });
 
+test("modal imports SubsequenceTriggerEditor (CC #UI-2 wire-up — was dead code prior)", () => {
+  assert(
+    /from\s+["']@\/components\/sequence\/subsequence-trigger-editor["']/.test(modalSrc),
+    "modal must import SubsequenceTriggerEditor"
+  );
+});
+
+test("modal renders <SubsequenceTriggerEditor> JSX (gated on sequenceType)", () => {
+  // The JSX site is under `isSubsequence &&` block — match the JSX usage itself.
+  assert(/<SubsequenceTriggerEditor[\s\S]*?onChange=\{[\s\S]*?\}/.test(modalSrc), "modal must render <SubsequenceTriggerEditor> with onChange");
+});
+
+test("modal title branches between Primary and Subsequence", () => {
+  assert(/New Subsequence/.test(modalSrc), "modal must contain 'New Subsequence' title text");
+  assert(/Edit Subsequence/.test(modalSrc), "modal must contain 'Edit Subsequence' title text");
+  assert(/New Primary Sequence/.test(modalSrc), "modal must STILL contain 'New Primary Sequence' (regression)");
+});
+
+test("modal accepts sequenceType prop", () => {
+  assert(/sequenceType\??:\s*SequenceType/.test(modalSrc), "modal props must include sequenceType: SequenceType");
+});
+
 test("SequenceStepEditor is rendered WITHOUT readOnly={true} (write mode)", () => {
   // The modal must NOT render the editor read-only — that's the gap we're closing.
   // The existing read-only render path in campaign-detail-client.tsx is preserved separately.
@@ -214,6 +321,13 @@ test("modal POSTs to /api/campaigns/[id]/sequences via helper", () => {
   );
   assert(/endpointFor\(\s*mode\s*,\s*campaignId/.test(modalSrc), "modal must call endpointFor with mode + campaignId");
   assert(/methodFor\(\s*mode\s*\)/.test(modalSrc), "modal must call methodFor with mode");
+});
+
+test("modal threads triggerConfig into buildCreatePayload + buildUpdatePayload", () => {
+  // Ensures the new 3-arg helper signature is actually exercised by the modal,
+  // not just exported and unreachable.
+  assert(/buildCreatePayload\([\s\S]*?triggerConfig/.test(modalSrc), "modal must pass triggerConfig to buildCreatePayload");
+  assert(/buildUpdatePayload\([\s\S]*?triggerConfig/.test(modalSrc), "modal must pass triggerConfig to buildUpdatePayload");
 });
 
 test("modal surfaces persona-required API 400 inline", () => {
@@ -252,7 +366,7 @@ test("detail page imports the modal", () => {
 test("dead 'Create Sequence' button now has an onClick", () => {
   // Pre-fix line was: <button className="mt-4 px-4 py-2 ...">Create Sequence</button>
   // Post-fix must include an onClick that opens the composer in create mode.
-  const emptyStateBlock = detailSrc.match(/No sequences created yet[\s\S]{0,400}Create Sequence/);
+  const emptyStateBlock = detailSrc.match(/No sequences created yet[\s\S]{0,500}Create Sequence/);
   assert(emptyStateBlock, "expected to find the 'Create Sequence' empty-state block");
   assert(
     /onClick=\{[^}]*setComposerState\(\{[^}]*open:\s*true[^}]*mode:\s*["']create["']/.test(emptyStateBlock![0]),
@@ -266,8 +380,8 @@ test("primary sequence card has an Edit affordance opening the composer in edit 
     "primary card must expose an Edit button (aria-label preferred)"
   );
   assert(
-    /mode:\s*["']edit["'],\s*seq:\s*primarySequence/.test(detailSrc),
-    "Edit button must pass mode:'edit' + seq:primarySequence to composer"
+    /mode:\s*["']edit["'],\s*sequenceType:\s*["']primary["'],\s*seq:\s*primarySequence/.test(detailSrc),
+    "Edit button must pass mode:'edit' + sequenceType:'primary' + seq:primarySequence to composer"
   );
 });
 
@@ -280,6 +394,10 @@ test("modal is rendered once at end of component with composerState bound", () =
     /campaignId=\{campaign\.id\}/.test(detailSrc),
     "modal must receive campaignId from the campaign prop"
   );
+  assert(
+    /sequenceType=\{composerState\.sequenceType\}/.test(detailSrc),
+    "<SequenceComposerModal> must receive sequenceType from composerState"
+  );
 });
 
 test("existing read-only <SequenceStepEditor> render path is preserved", () => {
@@ -289,6 +407,47 @@ test("existing read-only <SequenceStepEditor> render path is preserved", () => {
     /steps=\{primarySequence\.steps\}[\s\S]{0,200}readOnly=\{true\}/.test(detailSrc) ||
       /readOnly=\{true\}/.test(detailSrc),
     "read-only SequenceStepEditor render must still exist in detail page"
+  );
+});
+
+// ───── CC #UI-2: detail-page subsequence wiring ─────
+console.log("\ncampaign-detail-client.tsx subsequence wiring (CC #UI-2):");
+
+test("detail page contains '+ New Subsequence' button", () => {
+  assert(/\+ New Subsequence/.test(detailSrc), "detail page must contain '+ New Subsequence' button text");
+});
+
+test("'+ New Subsequence' button opens composer with sequenceType:'subsequence'", () => {
+  // Match a setComposerState call with both create + sequenceType:'subsequence' near the button text
+  const subseqRegion = detailSrc.match(/\+ New Subsequence[\s\S]*?setComposerState\(\{[\s\S]*?sequenceType:\s*["']subsequence["']/);
+  assert(
+    subseqRegion ||
+      /setComposerState\(\{[^}]*sequenceType:\s*["']subsequence["']/.test(detailSrc),
+    "'+ New Subsequence' must wire onClick → setComposerState({..., sequenceType:'subsequence'})"
+  );
+});
+
+test("each subsequence card has an Edit affordance with sequenceType:'subsequence'", () => {
+  assert(
+    /aria-label="Edit subsequence"/.test(detailSrc),
+    "subsequence card must expose an Edit button with aria-label='Edit subsequence'"
+  );
+  assert(
+    /mode:\s*["']edit["'],\s*sequenceType:\s*["']subsequence["'],\s*seq\b/.test(detailSrc),
+    "Edit subsequence button must pass mode:'edit' + sequenceType:'subsequence' + seq to composer"
+  );
+});
+
+test("subsequence trigger labels read snake_case canonical values", () => {
+  // After CC #UI-2, persisted trigger_event is snake_case (matches sequence-engine.ts:337,540).
+  // Display layer must accept snake_case (and may keep tolerating display strings for legacy rows).
+  assert(
+    /trigger_event\s*===\s*["']reply_classified["']/.test(detailSrc),
+    "detail page must match seq.trigger_event === 'reply_classified' (snake_case canon)"
+  );
+  assert(
+    /trigger_event\s*===\s*["']no_reply["']/.test(detailSrc),
+    "detail page must match seq.trigger_event === 'no_reply' (snake_case canon)"
   );
 });
 
