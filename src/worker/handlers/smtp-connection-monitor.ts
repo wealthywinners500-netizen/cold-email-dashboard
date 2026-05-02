@@ -36,12 +36,26 @@ function getSupabase() {
   );
 }
 
+// Sidecar-routed accounts have a different liveness path (Exim local-pipe via
+// /admin/send, not SMTP-AUTH from the worker IP). The legacy testConnection()
+// would always fail for them once port 587 is firewalled or the SMTP-AUTH
+// mailbox is locked, cascade-disabling the account at FAILURE_THRESHOLD. Their
+// liveness is owned by sidecar-health-monitor (probes /admin/health) instead.
+//
+// Mirrors shouldUseSidecar() in smtp-manager.ts: same env var, same parsing.
+function getSidecarAccountIds(): Set<string> {
+  const raw = process.env.USE_PANEL_SIDECAR_ACCOUNT_IDS || "";
+  return new Set(raw.split(",").map((s) => s.trim()).filter(Boolean));
+}
+
 export async function handleSmtpConnectionMonitor() {
   const supabase = getSupabase();
 
   try {
+    const sidecarIds = getSidecarAccountIds();
+
     // Fetch all active email accounts
-    const { data: accounts, error: fetchError } = await supabase
+    const { data: rawAccounts, error: fetchError } = await supabase
       .from("email_accounts")
       .select(
         "id, org_id, email, status, smtp_host, smtp_port, smtp_secure, smtp_user, smtp_pass, consecutive_failures, last_error, last_error_at"
@@ -52,7 +66,20 @@ export async function handleSmtpConnectionMonitor() {
       throw new Error(`Failed to fetch email accounts: ${fetchError.message}`);
     }
 
-    if (!accounts || accounts.length === 0) {
+    // Skip sidecar-routed accounts — sidecar-health-monitor owns their liveness.
+    const accounts = (rawAccounts || []).filter(
+      (a) => !sidecarIds.has(a.id)
+    );
+    const skippedCount = (rawAccounts?.length || 0) - accounts.length;
+
+    if (skippedCount > 0) {
+      console.log(
+        `[smtp-connection-monitor] Skipping ${skippedCount} sidecar-routed accounts ` +
+          `(USE_PANEL_SIDECAR_ACCOUNT_IDS contains them; sidecar-health-monitor handles their liveness)`
+      );
+    }
+
+    if (accounts.length === 0) {
       console.log("[smtp-connection-monitor] No active email accounts found");
       return;
     }
