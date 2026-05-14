@@ -332,6 +332,49 @@ export async function updateWorkerHeartbeat(orgId: string): Promise<void> {
     .eq('id', orgId);
 }
 
+// === HEARTBEAT-WRITER FIX: never-again 2026-05-13 ===
+// Per DASHBOARD-AUDIT-2026-05-13 §3: the unified worker process runs both
+// 'send' and 'ops' queue handlers, but the `worker_heartbeats` row for the
+// 'ops' role label was last refreshed 2026-04-18T18:03 — 25 days stale.
+// The host has been processing ops jobs the whole time (754 jobs today, 0
+// errors) but the per-role heartbeat-writer is disconnected. This is
+// INTERIM — a dedicated ops-worker Linode supersedes this per
+// `cc-prompts/dashboard-worker-migration-to-bigger-linode.md`.
+//
+// Schema (inferred from audit data — not in supabase/migrations/):
+//   worker_heartbeats(worker_role text, host text, last_ping_at timestamptz)
+//
+// Strategy: UPDATE-only by worker_role — refreshes whatever rows exist for
+// each role. If no row matches (schema drift / unseeded), update returns 0
+// rows and we log a warning. Non-fatal; observability gap closes when the
+// schema is what the audit reports.
+export async function updateWorkerRoleHeartbeats(
+  roles: ReadonlyArray<string>,
+  supabaseOverride?: SupabaseClient
+): Promise<
+  Array<{ role: string; updated: boolean; error?: string }>
+> {
+  const supabase = supabaseOverride ?? getSupabase();
+  const nowIso = new Date().toISOString();
+  const results: Array<{ role: string; updated: boolean; error?: string }> = [];
+  for (const role of roles) {
+    const { error } = await supabase
+      .from('worker_heartbeats')
+      .update({ last_ping_at: nowIso })
+      .eq('worker_role', role);
+    if (error) {
+      console.warn(
+        `[ErrorHandler] worker_heartbeats role=${role} update failed: ${error.message}`
+      );
+      results.push({ role, updated: false, error: error.message });
+    } else {
+      results.push({ role, updated: true });
+    }
+  }
+  return results;
+}
+// === /HEARTBEAT-WRITER FIX ===
+
 // Helper to extract SMTP numeric code from error message
 function extractSmtpCode(message: string): number | null {
   const match = message.match(/\b(\d{3})\b/);

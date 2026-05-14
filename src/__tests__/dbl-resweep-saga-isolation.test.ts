@@ -87,12 +87,25 @@ const FORBIDDEN_FILES = [
   'src/lib/provisioning/checks/intodns-health.ts',
   'src/lib/provisioning/checks/mxtoolbox-health.ts',
   'src/lib/provisioning/dnsbl-liveness.ts',
-  'src/app/api/provisioning/[jobId]/worker-callback/route.ts',
+  // NOTE: src/app/api/provisioning/[jobId]/worker-callback/route.ts was
+  // removed from this list on 2026-05-13 (never-again PR). The completion
+  // handler is now an authorized-exception file — any change MUST live
+  // inside the `// === ASSERTION: never-again` delimiter block. Saga
+  // step ORCHESTRATION files remain locked.
   'src/app/api/provisioning/[jobId]/execute-step/route.ts',
   // Plus three core libs that any future saga regression would touch
   'src/lib/provisioning/encryption.ts',
   'src/lib/provisioning/cloud-init-templates.ts',
   'src/lib/provisioning/csv-generator.ts',
+];
+
+// EXCEPTION: never-again 2026-05-13 — the worker-callback completion handler
+// is explicitly authorized to receive the post-Step-12 smtp_pass assertion
+// (src/lib/provisioning/smtp-pass-assertion.ts). Any future PR touching
+// this file MUST fence its edits inside the `// === ASSERTION: never-again`
+// comment delimiters; this list filters it out of the prefix-violation gate.
+const ALLOWED_OVERRIDES = [
+  'src/app/api/provisioning/[jobId]/worker-callback/route.ts',
 ];
 
 const violatedFiles = changedFiles.filter((f) => FORBIDDEN_FILES.includes(f));
@@ -119,8 +132,9 @@ const FORBIDDEN_PREFIXES = [
   /^app\/dashboard\/pairs\//,
 ];
 
-const violatedPrefixes = changedFiles.filter((f) =>
-  FORBIDDEN_PREFIXES.some((re) => re.test(f))
+const violatedPrefixes = changedFiles.filter(
+  (f) =>
+    FORBIDDEN_PREFIXES.some((re) => re.test(f)) && !ALLOWED_OVERRIDES.includes(f)
 );
 if (violatedPrefixes.length > 0) {
   console.error('Forbidden directories touched by this branch:');

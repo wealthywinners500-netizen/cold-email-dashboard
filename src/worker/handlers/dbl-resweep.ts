@@ -30,6 +30,10 @@ import {
   checkDomainBlacklist,
   type BlacklistResult,
 } from '@/lib/provisioning/domain-blacklist';
+import {
+  sendAdminAlert,
+  type AdminAlertSender,
+} from '@/lib/email/admin-alert';
 
 // ============================================
 // Types
@@ -58,6 +62,11 @@ export interface DblResweepDeps {
   supabase: SupabaseClient;
   checkDomain: (domain: string) => Promise<BlacklistResult>;
   now: () => string;
+  /**
+   * ALERT: never-again 2026-05-13. Fired on any clean→burnt transition.
+   * Defaults to the env-driven admin-alert helper; tests stub this.
+   */
+  alertSender?: AdminAlertSender;
 }
 
 interface BurnDetail {
@@ -90,6 +99,7 @@ function defaultDeps(): DblResweepDeps {
     ),
     checkDomain: checkDomainBlacklist,
     now: () => new Date().toISOString(),
+    alertSender: sendAdminAlert,
   };
 }
 
@@ -102,7 +112,7 @@ async function sweepOrg(
   data: DblResweepJobData,
   deps: DblResweepDeps
 ): Promise<RunSummary | null> {
-  const { supabase, checkDomain, now } = deps;
+  const { supabase, checkDomain, now, alertSender } = deps;
 
   // 1. Discover in-scope pairs FIRST. Skip the org entirely if there are none —
   //    no point creating an empty sweep_run row that just clutters the audit log.
@@ -244,6 +254,41 @@ async function sweepOrg(
             );
             // Don't abort — still record the flip and continue.
           }
+
+          // === ALERT: never-again 2026-05-13 (DBL clean→burnt email) ===
+          // Surface every new DBL listing to dean.hofer@thestealthmail.com
+          // within the cron cadence (≤24h). The system_alerts row is
+          // primary; the email is the human-noticeable channel. Send is
+          // best-effort: if the env vars are missing or SMTP errors, we
+          // log and continue (system_alerts row already written above).
+          if (alertSender) {
+            try {
+              const alertResult = await alertSender({
+                to: 'dean.hofer@thestealthmail.com',
+                subject: `[DBL ALERT] ${sd.domain} newly listed on Spamhaus`,
+                body:
+                  `Domain ${sd.domain} (pair ${pair.pair_number}) transitioned clean→listed on Spamhaus DBL.\n\n` +
+                  `Lists: ${result.lists.join(', ')}\n` +
+                  `Method: ${result.method}\n` +
+                  `Detected at: ${checkedAt}\n` +
+                  `Trigger: ${data.triggered_by}\n` +
+                  `Pair: #${pair.pair_number} (${pair.ns_domain})\n\n` +
+                  `Action: see reports/spam-bounce-investigation-2026-05-12.md for delisting + diagnosis runbook.`,
+              });
+              if (!alertResult.sent) {
+                console.warn(
+                  `[dbl-resweep] admin alert NOT sent for ${sd.domain} (reason=${alertResult.reason})`
+                );
+              }
+            } catch (alertSendErr) {
+              console.error(
+                `[dbl-resweep] admin alert sender threw for ${sd.domain}:`,
+                alertSendErr instanceof Error ? alertSendErr.message : alertSendErr
+              );
+              // Continue — system_alerts row is the durable record.
+            }
+          }
+          // === /ALERT ===
 
           newBurns.push({
             pair_id: pair.id,
