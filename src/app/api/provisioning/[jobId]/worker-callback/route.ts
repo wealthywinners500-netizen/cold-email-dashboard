@@ -3,6 +3,10 @@ import { NextResponse } from "next/server";
 import { createHmac, timingSafeEqual } from "crypto";
 import { decrypt, encrypt } from "@/lib/provisioning/encryption";
 import { readEncryptedPasswordForJob } from "@/lib/provisioning/smtp-pass-reader";
+import {
+  SagaAssertionError,
+  assertSmtpAccountsForJob,
+} from "@/lib/provisioning/smtp-pass-assertion";
 import type { StepType } from "@/lib/provisioning/types";
 
 export const dynamic = "force-dynamic";
@@ -389,6 +393,49 @@ export async function POST(
               .eq("id", serverPair.id);
           }
         }
+
+        // === ASSERTION: never-again 2026-05-13 ===
+        // Validates that email_accounts.smtp_pass rows just written contain
+        // real passwords (placeholder/empty/short-rejected) and runs one
+        // live nodemailer.verify() AUTH probe before marking the job
+        // 'completed'. Triggered by the 2026-04-24 P18 incident — see
+        // src/lib/provisioning/smtp-pass-assertion.ts for full rationale.
+        if (serverPair && accountsCreated > 0) {
+          try {
+            const probeResult = await assertSmtpAccountsForJob(
+              supabase,
+              serverPair.id
+            );
+            console.log(
+              `[WorkerCallback] saga-assertion PASS: rowsChecked=${probeResult.rowsChecked} probedEmail=${probeResult.probedEmail}`
+            );
+          } catch (err) {
+            const reason =
+              err instanceof SagaAssertionError
+                ? `${err.kind}: ${err.message}`
+                : err instanceof Error
+                  ? err.message
+                  : String(err);
+            console.error(`[WorkerCallback] saga-assertion FAIL: ${reason}`);
+            await supabase
+              .from("provisioning_jobs")
+              .update({
+                status: "failed",
+                error_message: `Saga assertion failed (never-again 2026-05-13): ${reason}`,
+              })
+              .eq("id", jobId);
+            return NextResponse.json(
+              {
+                jobId,
+                stepType,
+                status: "failed",
+                message: `saga assertion failed: ${reason}`,
+              },
+              { status: 500 }
+            );
+          }
+        }
+        // === /ASSERTION ===
 
         // Mark job completed (include account creation status in metadata)
         await supabase

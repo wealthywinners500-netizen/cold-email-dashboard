@@ -25,7 +25,12 @@ import {
 } from "./handlers/list-registrar-domains";
 import { closeAll } from "../lib/email/smtp-manager";
 import { createClient } from "@supabase/supabase-js";
-import { handleWorkerError, updateWorkerHeartbeat, resetDailyCounters } from "../lib/email/error-handler";
+import {
+  handleWorkerError,
+  updateWorkerHeartbeat,
+  updateWorkerRoleHeartbeats,
+  resetDailyCounters,
+} from "../lib/email/error-handler";
 import { startBlacklistProxy } from "./blacklist-proxy";
 
 function getSupabase() {
@@ -105,6 +110,12 @@ async function main() {
       for (const org of orgs || []) {
         await updateWorkerHeartbeat(org.id);
       }
+      // === HEARTBEAT-WRITER FIX: never-again 2026-05-13 ===
+      // Refresh per-role worker_heartbeats rows from the unified worker.
+      // See src/lib/email/error-handler.ts -> updateWorkerRoleHeartbeats
+      // for full rationale (audit reference + interim scope).
+      await updateWorkerRoleHeartbeats(["send", "ops"]);
+      // === /HEARTBEAT-WRITER FIX ===
     } catch (err) {
       console.error("[Worker] Heartbeat failed:", err);
     }
