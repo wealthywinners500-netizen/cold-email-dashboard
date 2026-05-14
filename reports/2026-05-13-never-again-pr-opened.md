@@ -18,11 +18,12 @@ GREEN on Phases 0-5. PR opened on the `fix/never-again-saga-smtp-pass-assertion-
 
 ## 2. PR details
 
-- **PR URL:** (filled in by Phase 5)
+- **PR URL:** https://github.com/wealthywinners500-netizen/cold-email-dashboard/pull/57
 - **Branch:** `fix/never-again-saga-smtp-pass-assertion-and-ops-worker`
+- **Commit:** `da8f0b5`
 - **Base:** `origin/main`
 - **Title:** `fix: never-again — saga smtp_pass assertion + Ops role heartbeat + DBL alert wiring`
-- **State:** OPEN (NOT merged — review-first per Dean's locked decision)
+- **State:** OPEN (verified via `gh pr view 57 --json state` → `"state":"OPEN"`)
 
 ---
 
@@ -98,8 +99,9 @@ GREEN on Phases 0-5. PR opened on the `fix/never-again-saga-smtp-pass-assertion-
 | dbl-alert.test.ts | 13 | PASS | `npx tsx` |
 | worker-heartbeat-ops-role.test.ts | 16 | PASS | `npx tsx` |
 | dbl-resweep-saga-isolation.test.ts | (existing — invariants) | PASS | `npx tsx` |
-| typecheck | full project | PASS | `npm run typecheck` |
-| test:gate0 | full chain | (in progress at report time) | `npm run test:gate0` |
+| typecheck | full project | PASS (exit 0) | `npm run typecheck` |
+| build | full Next.js production build | PASS (exit 0) | `npm run build` |
+| test:gate0 | full chain (~50 test files) | PASS (exit 0) | `npm run test:gate0` |
 
 ---
 
