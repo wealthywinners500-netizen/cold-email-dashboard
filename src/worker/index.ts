@@ -68,7 +68,6 @@ async function main() {
     "send-email",
     "process-sequence-step",
     "queue-sequence-steps",
-    "distribute-campaign-sends",
     "sync-all-accounts",
     "classify-batch",
     "check-no-reply",
