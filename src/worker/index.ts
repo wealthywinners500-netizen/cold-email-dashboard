@@ -28,10 +28,10 @@ import { createClient } from "@supabase/supabase-js";
 import {
   handleWorkerError,
   updateWorkerHeartbeat,
-  updateWorkerRoleHeartbeats,
   resetDailyCounters,
 } from "../lib/email/error-handler";
 import { startBlacklistProxy } from "./blacklist-proxy";
+import os from "os";
 
 function getSupabase() {
   return createClient(
@@ -47,12 +47,107 @@ async function main() {
   const boss = await initBoss();
   console.log("[Worker] pg-boss started");
 
+  // -------------------------------------------------------------------------
+  // Phase 6A: WORKER_ROLE partitioning
+  //
+  // Single codebase, two deployments. WORKER_ROLE=ops (default, back-compat)
+  // keeps the existing 200.234.226.226 box running provisioning + telemetry.
+  // WORKER_ROLE=send runs everything that touches mail (send-email,
+  // process-sequence-step, IMAP sync, classification, warmup, bounce parsing).
+  // WORKER_ROLE=all keeps the pre-split behavior for single-box setups.
+  //
+  // Queue/cron NAMES as wired into pg-boss below. If you add a new handler,
+  // append its queue name to the correct set OR the shouldRegister() guard
+  // will throw at startup. (Failing loud here is intentional — a silently
+  // unclassified handler running on the wrong worker is worse than a crash.)
+  // -------------------------------------------------------------------------
+  const WORKER_ROLE = (process.env.WORKER_ROLE || "ops") as "ops" | "send" | "all";
+  console.log(`[Worker] WORKER_ROLE=${WORKER_ROLE}`);
+
+  const SEND_HANDLERS = new Set<string>([
+    "send-email",
+    "process-sequence-step",
+    "queue-sequence-steps",
+    "sync-all-accounts",
+    "classify-batch",
+    "check-no-reply",
+    "process-bounce",
+    "warm-up-increment-cron",
+    "classify-reply",
+    "reset-daily-counts",
+  ]);
+
+  const OPS_HANDLERS = new Set<string>([
+    // Actual queue names verified against createQueue list above — the phase
+    // spec used "provision-pair" and "health-check" but the real names in
+    // this worker are "provision-server-pair" and "server-health-check".
+    "provision-server-pair",
+    "provision-step",
+    "rollback-provision",
+    "list-registrar-domains",
+    "server-health-check-cron",
+    "server-health-check",
+    "verify-new-leads",
+    "smtp-connection-monitor",
+    "account-deliverability-monitor",
+    "campaign-performance-monitor",
+    // 7 handlers added to HEAD after phase-6a-worker-split branched (PRs
+    // #25/#32/#34/#44). Ops-classified per Cycle 2 v2 LOCKED DECISION #3 —
+    // DBL probing / Outscraper polling / pair-verify / sidecar health; none
+    // is an SMTP-emit (send-path) handler.
+    "dbl-resweep",
+    "dbl-resweep-cron",
+    "outscraper-task-poll",
+    "outscraper-task-poll-cron",
+    "outscraper-task-complete",
+    "pair-verify",
+    "sidecar-health-monitor",
+  ]);
+
+  function classify(name: string): "send" | "ops" | "unknown" {
+    if (SEND_HANDLERS.has(name)) return "send";
+    if (OPS_HANDLERS.has(name)) return "ops";
+    return "unknown";
+  }
+
+  let registeredCount = 0;
+  let skippedCount = 0;
+  function shouldRegister(name: string): boolean {
+    const kind = classify(name);
+    if (kind === "unknown") {
+      // Fail loud — a handler slipping through unclassified means the send
+      // worker could accidentally run ops crons (or vice versa). Crash at
+      // startup rather than let that ship.
+      throw new Error(
+        `[Worker] Unclassified pg-boss handler "${name}" — add it to SEND_HANDLERS or OPS_HANDLERS`
+      );
+    }
+    const run =
+      WORKER_ROLE === "all" ||
+      (WORKER_ROLE === "send" && kind === "send") ||
+      (WORKER_ROLE === "ops" && kind === "ops");
+    if (run) registeredCount++;
+    else skippedCount++;
+    return run;
+  }
+
+  // The setInterval-based provisioning pollers (pollDispatchedSteps,
+  // pollAdvanceableJobs, pollRegistrarDomainListings) are not pg-boss handlers
+  // — they're bare polls that read provisioning tables directly. They're
+  // semantically ops-only; gate them separately.
+  const OPS_SIDE_EFFECTS_ENABLED = WORKER_ROLE === "all" || WORKER_ROLE === "ops";
+
   // Hard lesson #47 (2026-04-10): Spamhaus blocks DNSBL queries from cloud
   // IPs. The worker VPS lives on a non-cloud IP and exposes an HTTP proxy
   // for the Vercel app's domain-blacklist helper to fall back to whenever
   // the primary Spamhaus DQS check returns 'unknown'. Auth via the shared
   // WORKER_CALLBACK_SECRET that's already used for the worker callback.
-  const blacklistServer = startBlacklistProxy();
+  //
+  // Phase 6A: gate on ops role. The send-worker lives on a Linode cloud IP
+  // which is DBL-blocked identically to Vercel's cloud IPs, so a fallback
+  // listener there would give Vercel a useless second endpoint. Only the
+  // ops VPS's non-cloud IP can answer these queries.
+  const blacklistServer = OPS_SIDE_EFFECTS_ENABLED ? startBlacklistProxy() : null;
 
   // Create all queues (required by pg-boss v12+)
   const queueNames = [
@@ -103,23 +198,27 @@ async function main() {
   console.log("[Worker] All queues created");
 
   // --- Heartbeat: pulse every 60 seconds for all orgs ---
-  const heartbeatInterval = setInterval(async () => {
-    try {
-      const supabase = getSupabase();
-      const { data: orgs } = await supabase.from("organizations").select("id");
-      for (const org of orgs || []) {
-        await updateWorkerHeartbeat(org.id);
-      }
-      // === HEARTBEAT-WRITER FIX: never-again 2026-05-13 ===
-      // Refresh per-role worker_heartbeats rows from the unified worker.
-      // See src/lib/email/error-handler.ts -> updateWorkerRoleHeartbeats
-      // for full rationale (audit reference + interim scope).
-      await updateWorkerRoleHeartbeats(["send", "ops"]);
-      // === /HEARTBEAT-WRITER FIX ===
-    } catch (err) {
-      console.error("[Worker] Heartbeat failed:", err);
-    }
-  }, 60000);
+  //
+  // Phase 6A: gate on ops role. This legacy per-org heartbeat predates the
+  // infra-level worker_heartbeats upsert added in Edit 4 below. Leaving it
+  // on both roles would double the write volume to every org row AND create
+  // dual-source ambiguity (two stores that could disagree about whether a
+  // worker is alive). Keep it ops-only to preserve pre-6A write volume; the
+  // new worker_heartbeats table is the infra-level source of truth for
+  // "which workers are alive" across both roles.
+  const heartbeatInterval = OPS_SIDE_EFFECTS_ENABLED
+    ? setInterval(async () => {
+        try {
+          const supabase = getSupabase();
+          const { data: orgs } = await supabase.from("organizations").select("id");
+          for (const org of orgs || []) {
+            await updateWorkerHeartbeat(org.id);
+          }
+        } catch (err) {
+          console.error("[Worker] Heartbeat failed:", err);
+        }
+      }, 60000)
+    : null;
 
   // --- Error handling wrapper ---
   function withErrorHandling<T extends Record<string, any>>(
@@ -151,10 +250,12 @@ async function main() {
     orgId: string;
   }
 
-  await boss.work<SendEmailPayload>(
-    "send-email",
-    withErrorHandling(handleSendEmail, "send-email")
-  );
+  if (shouldRegister("send-email")) {
+    await boss.work<SendEmailPayload>(
+      "send-email",
+      withErrorHandling(handleSendEmail, "send-email")
+    );
+  }
 
   // Register process-sequence-step handler
   interface ProcessSequenceStepPayload {
@@ -166,82 +267,94 @@ async function main() {
     orgId: string;
   }
 
-  await boss.work<ProcessSequenceStepPayload>(
-    "process-sequence-step",
-    withErrorHandling(handleProcessSequenceStep, "process-sequence-step")
-  );
+  if (shouldRegister("process-sequence-step")) {
+    await boss.work<ProcessSequenceStepPayload>(
+      "process-sequence-step",
+      withErrorHandling(handleProcessSequenceStep, "process-sequence-step")
+    );
+  }
 
   // Register sync-all-accounts cron (every 5 minutes)
-  await boss.schedule("sync-all-accounts", "*/5 * * * *");
-  await boss.work("sync-all-accounts", async () => {
-    console.log("[Worker] Syncing all email accounts...");
-    try {
-      await handleSyncAllAccounts();
-    } catch (err) {
-      console.error("[Worker] Account sync failed:", err);
-      throw err;
-    }
-  });
+  if (shouldRegister("sync-all-accounts")) {
+    await boss.schedule("sync-all-accounts", "*/5 * * * *");
+    await boss.work("sync-all-accounts", async () => {
+      console.log("[Worker] Syncing all email accounts...");
+      try {
+        await handleSyncAllAccounts();
+      } catch (err) {
+        console.error("[Worker] Account sync failed:", err);
+        throw err;
+      }
+    });
+  }
 
   // Register classify-batch cron (every hour)
-  await boss.schedule("classify-batch", "0 * * * *");
-  await boss.work("classify-batch", async () => {
-    console.log("[Worker] Running batch classification...");
-    try {
-      await handleClassifyBatch();
-    } catch (err) {
-      console.error("[Worker] Batch classification failed:", err);
-      throw err;
-    }
-  });
+  if (shouldRegister("classify-batch")) {
+    await boss.schedule("classify-batch", "0 * * * *");
+    await boss.work("classify-batch", async () => {
+      console.log("[Worker] Running batch classification...");
+      try {
+        await handleClassifyBatch();
+      } catch (err) {
+        console.error("[Worker] Batch classification failed:", err);
+        throw err;
+      }
+    });
+  }
 
   // Register daily cron to reset sends_today + worker counters
-  await boss.schedule("reset-daily-counts", "0 0 * * *");
-  await boss.work("reset-daily-counts", async () => {
-    console.log("[Worker] Resetting daily counts...");
-    const supabase = getSupabase();
+  if (shouldRegister("reset-daily-counts")) {
+    await boss.schedule("reset-daily-counts", "0 0 * * *");
+    await boss.work("reset-daily-counts", async () => {
+      console.log("[Worker] Resetting daily counts...");
+      const supabase = getSupabase();
 
-    // Reset email account sends_today
-    const { error } = await supabase
-      .from("email_accounts")
-      .update({ sends_today: 0 })
-      .neq("sends_today", 0);
+      // Reset email account sends_today
+      const { error } = await supabase
+        .from("email_accounts")
+        .update({ sends_today: 0 })
+        .neq("sends_today", 0);
 
-    if (error) {
-      console.error("[Worker] Failed to reset daily counts:", error);
-      throw error;
-    }
+      if (error) {
+        console.error("[Worker] Failed to reset daily counts:", error);
+        throw error;
+      }
 
-    // Reset worker counters for all orgs
-    const { data: orgs } = await supabase.from("organizations").select("id");
-    for (const org of orgs || []) {
-      await resetDailyCounters(org.id);
-    }
+      // Reset worker counters for all orgs
+      const { data: orgs } = await supabase.from("organizations").select("id");
+      for (const org of orgs || []) {
+        await resetDailyCounters(org.id);
+      }
 
-    console.log("[Worker] Daily counts reset successfully");
-  });
+      console.log("[Worker] Daily counts reset successfully");
+    });
+  }
 
   // Register check-no-reply cron (every hour)
-  await boss.schedule("check-no-reply", "0 * * * *");
-  await boss.work("check-no-reply", async () => {
-    console.log("[Worker] Running no-reply trigger check...");
-    try {
-      await handleCheckNoReply();
-    } catch (err) {
-      console.error("[Worker] No-reply trigger check failed:", err);
-      throw err;
-    }
-  });
+  if (shouldRegister("check-no-reply")) {
+    await boss.schedule("check-no-reply", "0 * * * *");
+    await boss.work("check-no-reply", async () => {
+      console.log("[Worker] Running no-reply trigger check...");
+      try {
+        await handleCheckNoReply();
+      } catch (err) {
+        console.error("[Worker] No-reply trigger check failed:", err);
+        throw err;
+      }
+    });
+  }
 
   // Register classify-reply handler (called directly from sync)
   interface ClassifyReplyPayload {
     messageId: number;
   }
 
-  await boss.work<ClassifyReplyPayload>(
-    "classify-reply",
-    withErrorHandling(handleClassifyReply, "classify-reply")
-  );
+  if (shouldRegister("classify-reply")) {
+    await boss.work<ClassifyReplyPayload>(
+      "classify-reply",
+      withErrorHandling(handleClassifyReply, "classify-reply")
+    );
+  }
 
   // Register process-bounce handler (B10)
   interface ProcessBouncePayload {
@@ -251,86 +364,100 @@ async function main() {
     orgId: string;
   }
 
-  await boss.work<ProcessBouncePayload>(
-    "process-bounce",
-    withErrorHandling(handleProcessBounce, "process-bounce")
-  );
+  if (shouldRegister("process-bounce")) {
+    await boss.work<ProcessBouncePayload>(
+      "process-bounce",
+      withErrorHandling(handleProcessBounce, "process-bounce")
+    );
+  }
 
   // Register queue-sequence-steps cron (every 5 minutes)
-  await boss.schedule("queue-sequence-steps", "*/5 * * * *");
-  await boss.work("queue-sequence-steps", async () => {
-    console.log("[Worker] Queuing ready sequence steps...");
-    try {
-      await handleQueueSequenceSteps();
-    } catch (err) {
-      console.error("[Worker] Queue sequence steps failed:", err);
-      throw err;
-    }
-  });
+  if (shouldRegister("queue-sequence-steps")) {
+    await boss.schedule("queue-sequence-steps", "*/5 * * * *");
+    await boss.work("queue-sequence-steps", async () => {
+      console.log("[Worker] Queuing ready sequence steps...");
+      try {
+        await handleQueueSequenceSteps();
+      } catch (err) {
+        console.error("[Worker] Queue sequence steps failed:", err);
+        throw err;
+      }
+    });
+  }
 
   // Register warm-up-increment-cron (daily at 1 AM)
-  await boss.schedule("warm-up-increment-cron", "0 1 * * *");
-  await boss.work("warm-up-increment-cron", async () => {
-    console.log("[Worker] Running warm-up increment...");
-    try {
-      await handleWarmupIncrement();
-    } catch (err) {
-      console.error("[Worker] Warm-up increment failed:", err);
-      throw err;
-    }
-  });
+  if (shouldRegister("warm-up-increment-cron")) {
+    await boss.schedule("warm-up-increment-cron", "0 1 * * *");
+    await boss.work("warm-up-increment-cron", async () => {
+      console.log("[Worker] Running warm-up increment...");
+      try {
+        await handleWarmupIncrement();
+      } catch (err) {
+        console.error("[Worker] Warm-up increment failed:", err);
+        throw err;
+      }
+    });
+  }
 
   // Register smtp-connection-monitor cron (every 15 minutes)
-  await boss.schedule("smtp-connection-monitor", "*/15 * * * *");
-  await boss.work("smtp-connection-monitor", async () => {
-    console.log("[Worker] Monitoring SMTP connections...");
-    try {
-      await handleSmtpConnectionMonitor();
-    } catch (err) {
-      console.error("[Worker] SMTP connection monitor failed:", err);
-      throw err;
-    }
-  });
+  if (shouldRegister("smtp-connection-monitor")) {
+    await boss.schedule("smtp-connection-monitor", "*/15 * * * *");
+    await boss.work("smtp-connection-monitor", async () => {
+      console.log("[Worker] Monitoring SMTP connections...");
+      try {
+        await handleSmtpConnectionMonitor();
+      } catch (err) {
+        console.error("[Worker] SMTP connection monitor failed:", err);
+        throw err;
+      }
+    });
+  }
 
   // Register sidecar-health-monitor cron (every 15 minutes)
   // Probes /admin/health on each host in SIDECAR_DEPLOYED_HOSTS env var.
   // Alerts via system_alerts.alert_type='sidecar_unhealthy' on 3 consecutive
   // failures (60-min dedup window). ALERTS ONLY — does NOT auto-disable
   // accounts. With SIDECAR_DEPLOYED_HOSTS empty (default) this is a no-op.
-  await boss.schedule("sidecar-health-monitor", "*/15 * * * *");
-  await boss.work("sidecar-health-monitor", async () => {
-    console.log("[Worker] Probing sidecar health...");
-    try {
-      await handleSidecarHealthMonitor();
-    } catch (err) {
-      console.error("[Worker] Sidecar health monitor failed:", err);
-      throw err;
-    }
-  });
+  if (shouldRegister("sidecar-health-monitor")) {
+    await boss.schedule("sidecar-health-monitor", "*/15 * * * *");
+    await boss.work("sidecar-health-monitor", async () => {
+      console.log("[Worker] Probing sidecar health...");
+      try {
+        await handleSidecarHealthMonitor();
+      } catch (err) {
+        console.error("[Worker] Sidecar health monitor failed:", err);
+        throw err;
+      }
+    });
+  }
 
   // Register account-deliverability-monitor cron (daily at 3 AM)
-  await boss.schedule("account-deliverability-monitor", "0 3 * * *");
-  await boss.work("account-deliverability-monitor", async () => {
-    console.log("[Worker] Monitoring account deliverability...");
-    try {
-      await handleAccountDeliverabilityMonitor();
-    } catch (err) {
-      console.error("[Worker] Account deliverability monitor failed:", err);
-      throw err;
-    }
-  });
+  if (shouldRegister("account-deliverability-monitor")) {
+    await boss.schedule("account-deliverability-monitor", "0 3 * * *");
+    await boss.work("account-deliverability-monitor", async () => {
+      console.log("[Worker] Monitoring account deliverability...");
+      try {
+        await handleAccountDeliverabilityMonitor();
+      } catch (err) {
+        console.error("[Worker] Account deliverability monitor failed:", err);
+        throw err;
+      }
+    });
+  }
 
   // Register campaign-performance-monitor cron (daily at 4 AM)
-  await boss.schedule("campaign-performance-monitor", "0 4 * * *");
-  await boss.work("campaign-performance-monitor", async () => {
-    console.log("[Worker] Monitoring campaign performance...");
-    try {
-      await handleCampaignPerformanceMonitor();
-    } catch (err) {
-      console.error("[Worker] Campaign performance monitor failed:", err);
-      throw err;
-    }
-  });
+  if (shouldRegister("campaign-performance-monitor")) {
+    await boss.schedule("campaign-performance-monitor", "0 4 * * *");
+    await boss.work("campaign-performance-monitor", async () => {
+      console.log("[Worker] Monitoring campaign performance...");
+      try {
+        await handleCampaignPerformanceMonitor();
+      } catch (err) {
+        console.error("[Worker] Campaign performance monitor failed:", err);
+        throw err;
+      }
+    });
+  }
 
   // distribute-campaign-sends cron REMOVED 2026-05-01 (V9 CC #4):
   // the cron's payload-shape was wrong (4-key {recipientId,campaignId,accountId,step}
@@ -353,10 +480,12 @@ async function main() {
     lead_list_id?: string;
   }
 
-  await boss.work<VerifyNewLeadsPayload>(
-    "verify-new-leads",
-    withErrorHandling(handleVerifyNewLeads, "verify-new-leads")
-  );
+  if (shouldRegister("verify-new-leads")) {
+    await boss.work<VerifyNewLeadsPayload>(
+      "verify-new-leads",
+      withErrorHandling(handleVerifyNewLeads, "verify-new-leads")
+    );
+  }
 
   // --- Leads V1a: async Outscraper task lifecycle ---
   // Cron fans out one outscraper-task-poll job per pending row in
@@ -365,72 +494,80 @@ async function main() {
   // it failed (Outscraper terminal error). See:
   //   - src/worker/handlers/outscraper-task-poll.ts
   //   - src/worker/handlers/outscraper-task-complete.ts
-  await boss.schedule("outscraper-task-poll-cron", "*/2 * * * *");
-  await boss.work("outscraper-task-poll-cron", async () => {
-    try {
-      const supabase = getSupabase();
-      const { data: pending } = await supabase
-        .from("outscraper_tasks")
-        .select("outscraper_task_id")
-        .in("status", ["submitted", "polling"])
-        .order("created_at", { ascending: true })
-        .limit(50);
-      for (const row of pending || []) {
-        await boss.send("outscraper-task-poll", {
-          outscraperTaskId: row.outscraper_task_id,
-        });
+  if (shouldRegister("outscraper-task-poll-cron")) {
+    await boss.schedule("outscraper-task-poll-cron", "*/2 * * * *");
+    await boss.work("outscraper-task-poll-cron", async () => {
+      try {
+        const supabase = getSupabase();
+        const { data: pending } = await supabase
+          .from("outscraper_tasks")
+          .select("outscraper_task_id")
+          .in("status", ["submitted", "polling"])
+          .order("created_at", { ascending: true })
+          .limit(50);
+        for (const row of pending || []) {
+          await boss.send("outscraper-task-poll", {
+            outscraperTaskId: row.outscraper_task_id,
+          });
+        }
+        if (pending && pending.length > 0) {
+          console.log(
+            `[Worker] Enqueued ${pending.length} outscraper-task-poll jobs`
+          );
+        }
+      } catch (err) {
+        console.error("[Worker] outscraper-task-poll-cron failed:", err);
+        throw err;
       }
-      if (pending && pending.length > 0) {
-        console.log(
-          `[Worker] Enqueued ${pending.length} outscraper-task-poll jobs`
-        );
-      }
-    } catch (err) {
-      console.error("[Worker] outscraper-task-poll-cron failed:", err);
-      throw err;
-    }
-  });
+    });
+  }
 
-  await boss.work<{ outscraperTaskId: string }>(
-    "outscraper-task-poll",
-    withErrorHandling(handleOutscraperTaskPoll, "outscraper-task-poll")
-  );
+  if (shouldRegister("outscraper-task-poll")) {
+    await boss.work<{ outscraperTaskId: string }>(
+      "outscraper-task-poll",
+      withErrorHandling(handleOutscraperTaskPoll, "outscraper-task-poll")
+    );
+  }
 
   // localConcurrency=1 so two duplicate-delivered jobs can't double-insert
   // the same Outscraper result set. The complete handler is also idempotent
   // (status guard at top), but the concurrency cap is the cheaper guarantee.
-  await boss.work<{ outscraperTaskId: string }>(
-    "outscraper-task-complete",
-    {
-      batchSize: 1,
-      pollingIntervalSeconds: 5,
-      localConcurrency: 1,
-    },
-    async (jobs) => {
-      for (const job of jobs) {
-        try {
-          await handleOutscraperTaskComplete(job.data);
-          console.log(
-            `[Worker] outscraper-task-complete job ${job.id} done`
-          );
-        } catch (err) {
-          console.error(
-            `[Worker] outscraper-task-complete job ${job.id} failed:`,
-            err
-          );
-          throw err;
+  if (shouldRegister("outscraper-task-complete")) {
+    await boss.work<{ outscraperTaskId: string }>(
+      "outscraper-task-complete",
+      {
+        batchSize: 1,
+        pollingIntervalSeconds: 5,
+        localConcurrency: 1,
+      },
+      async (jobs) => {
+        for (const job of jobs) {
+          try {
+            await handleOutscraperTaskComplete(job.data);
+            console.log(
+              `[Worker] outscraper-task-complete job ${job.id} done`
+            );
+          } catch (err) {
+            console.error(
+              `[Worker] outscraper-task-complete job ${job.id} failed:`,
+              err
+            );
+            throw err;
+          }
         }
       }
-    }
-  );
+    );
+  }
 
   // Register pair-verify handler (in-app Pair Verify feature).
   // Runs the 4-check deliverability audit and writes results back to
   // pair_verifications. See src/lib/provisioning/pair-verify.ts.
-  await boss.work<PairVerifyPayload>(
-    "pair-verify",
-    withErrorHandling(handlePairVerify, "pair-verify")
-  );
+  if (shouldRegister("pair-verify")) {
+    await boss.work<PairVerifyPayload>(
+      "pair-verify",
+      withErrorHandling(handlePairVerify, "pair-verify")
+    );
+  }
 
   // Register dbl-resweep cron — weekly Monday 09:00 ET = Monday 13:00 UTC.
   // (Picked UTC-stable instead of America/New_York to match every other cron
@@ -441,43 +578,47 @@ async function main() {
   // queue, fan out a single dbl-resweep job with explicit data. This way the
   // manual /api/admin/dbl-monitor/run endpoint can publish to the SAME
   // dbl-resweep queue and share the handler code path.
-  await boss.schedule("dbl-resweep-cron", "0 13 * * 1");
-  await boss.work("dbl-resweep-cron", async () => {
-    console.log("[Worker] DBL re-sweep cron fired — enqueuing dbl-resweep job");
-    try {
-      await boss.send("dbl-resweep", { triggered_by: "cron" });
-    } catch (err) {
-      console.error("[Worker] Failed to enqueue dbl-resweep job:", err);
-      throw err;
-    }
-  });
+  if (shouldRegister("dbl-resweep-cron")) {
+    await boss.schedule("dbl-resweep-cron", "0 13 * * 1");
+    await boss.work("dbl-resweep-cron", async () => {
+      console.log("[Worker] DBL re-sweep cron fired — enqueuing dbl-resweep job");
+      try {
+        await boss.send("dbl-resweep", { triggered_by: "cron" });
+      } catch (err) {
+        console.error("[Worker] Failed to enqueue dbl-resweep job:", err);
+        throw err;
+      }
+    });
+  }
 
   // Register the actual dbl-resweep handler. localConcurrency=1 ensures the
   // weekly cron and a manual Run Now never race — only one sweep at a time.
-  await boss.work<DblResweepJobData>(
-    "dbl-resweep",
-    {
-      batchSize: 1,
-      pollingIntervalSeconds: 10,
-      localConcurrency: 1,
-    },
-    async (jobs) => {
-      for (const job of jobs) {
-        console.log(
-          `[Worker] Starting dbl-resweep job ${job.id} (triggered_by=${job.data.triggered_by})`
-        );
-        try {
-          const summary = await dblResweepHandler(job.data);
+  if (shouldRegister("dbl-resweep")) {
+    await boss.work<DblResweepJobData>(
+      "dbl-resweep",
+      {
+        batchSize: 1,
+        pollingIntervalSeconds: 10,
+        localConcurrency: 1,
+      },
+      async (jobs) => {
+        for (const job of jobs) {
           console.log(
-            `[Worker] dbl-resweep job ${job.id} completed — ${JSON.stringify(summary)}`
+            `[Worker] Starting dbl-resweep job ${job.id} (triggered_by=${job.data.triggered_by})`
           );
-        } catch (err) {
-          console.error(`[Worker] dbl-resweep job ${job.id} failed:`, err);
-          throw err;
+          try {
+            const summary = await dblResweepHandler(job.data);
+            console.log(
+              `[Worker] dbl-resweep job ${job.id} completed — ${JSON.stringify(summary)}`
+            );
+          } catch (err) {
+            console.error(`[Worker] dbl-resweep job ${job.id} failed:`, err);
+            throw err;
+          }
         }
       }
-    }
-  );
+    );
+  }
 
   // Register provision-server-pair handler (B15-3, B16-hands-free)
   interface ProvisionPairPayload {
@@ -500,7 +641,7 @@ async function main() {
   // See feedback_hard_lessons.md hard lessons #11-#14.
   const enableLegacyMonolithic = process.env.ENABLE_LEGACY_MONOLITHIC_PROVISIONING === 'true';
 
-  if (enableLegacyMonolithic) {
+  if (enableLegacyMonolithic && shouldRegister("provision-server-pair")) {
     console.warn("[Worker] WARNING: ENABLE_LEGACY_MONOLITHIC_PROVISIONING=true — registering legacy provision-server-pair handler. This path races with the canonical execute-step path.");
     await boss.work<ProvisionPairPayload>(
       "provision-server-pair",
@@ -523,7 +664,7 @@ async function main() {
       }
     );
   } else {
-    console.log("[Worker] Legacy provision-server-pair handler DISABLED (ENABLE_LEGACY_MONOLITHIC_PROVISIONING not set). Using canonical execute-step → provision-step bridge.");
+    console.log("[Worker] Legacy provision-server-pair handler DISABLED (ENABLE_LEGACY_MONOLITHIC_PROVISIONING not set or role mismatch). Using canonical execute-step → provision-step bridge.");
   }
 
   // Register provision-step handler (per-step SSH execution via worker bridge)
@@ -542,100 +683,108 @@ async function main() {
   // expireInSeconds=1800 are set on the queue itself via createQueue above —
   // pg-boss v12 moved those off the work() options and onto the queue
   // definition. WorkOptions here only control fetch/polling/concurrency.
-  await boss.work<ProvisionStepPayload>(
-    "provision-step",
-    {
-      batchSize: 1,
-      pollingIntervalSeconds: 10,
-      localConcurrency: 1,
-    },
-    async (jobs) => {
-      for (const job of jobs) {
-        console.log(`[Worker] Starting provision-step job ${job.id} (${job.data.stepType})`);
-        try {
-          await handleProvisionStep(job.data);
-          console.log(`[Worker] Provision-step job ${job.id} completed successfully`);
-        } catch (err) {
-          console.error(`[Worker] Provision-step job ${job.id} failed:`, err);
-          throw err;
+  if (shouldRegister("provision-step")) {
+    await boss.work<ProvisionStepPayload>(
+      "provision-step",
+      {
+        batchSize: 1,
+        pollingIntervalSeconds: 10,
+        localConcurrency: 1,
+      },
+      async (jobs) => {
+        for (const job of jobs) {
+          console.log(`[Worker] Starting provision-step job ${job.id} (${job.data.stepType})`);
+          try {
+            await handleProvisionStep(job.data);
+            console.log(`[Worker] Provision-step job ${job.id} completed successfully`);
+          } catch (err) {
+            console.error(`[Worker] Provision-step job ${job.id} failed:`, err);
+            throw err;
+          }
         }
       }
-    }
-  );
+    );
+  }
 
   // Register rollback-provision handler (B15-3, B16-hands-free)
   interface RollbackProvisionPayload {
     jobId: string;
   }
 
-  await boss.work<RollbackProvisionPayload>(
-    "rollback-provision",
-    {
-      batchSize: 1,
-      pollingIntervalSeconds: 10,
-      localConcurrency: 1,
-    },
-    async (jobs) => {
-      for (const job of jobs) {
-        console.log(`[Worker] Starting rollback-provision job ${job.id}`);
-        try {
-          await handleRollbackProvision(job.data);
-          console.log(`[Worker] Rollback job ${job.id} completed successfully`);
-        } catch (err) {
-          console.error(`[Worker] Rollback job ${job.id} failed:`, err);
-          throw err;
+  if (shouldRegister("rollback-provision")) {
+    await boss.work<RollbackProvisionPayload>(
+      "rollback-provision",
+      {
+        batchSize: 1,
+        pollingIntervalSeconds: 10,
+        localConcurrency: 1,
+      },
+      async (jobs) => {
+        for (const job of jobs) {
+          console.log(`[Worker] Starting rollback-provision job ${job.id}`);
+          try {
+            await handleRollbackProvision(job.data);
+            console.log(`[Worker] Rollback job ${job.id} completed successfully`);
+          } catch (err) {
+            console.error(`[Worker] Rollback job ${job.id} failed:`, err);
+            throw err;
+          }
         }
       }
-    }
-  );
+    );
+  }
 
   // Register server-health-check cron (every 6 hours)
-  await boss.schedule("server-health-check-cron", "0 */6 * * *");
-  await boss.work("server-health-check-cron", async () => {
-    console.log("[Worker] Running scheduled server health checks...");
-    try {
-      const supabase = getSupabase();
-      const { data: pairs } = await supabase
-        .from("server_pairs")
-        .select("id")
-        .eq("status", "active");
+  if (shouldRegister("server-health-check-cron")) {
+    await boss.schedule("server-health-check-cron", "0 */6 * * *");
+    await boss.work("server-health-check-cron", async () => {
+      console.log("[Worker] Running scheduled server health checks...");
+      try {
+        const supabase = getSupabase();
+        const { data: pairs } = await supabase
+          .from("server_pairs")
+          .select("id")
+          .eq("status", "active");
 
-      if (pairs && pairs.length > 0) {
-        for (const pair of pairs) {
-          await boss.send("server-health-check", { serverPairId: pair.id });
+        if (pairs && pairs.length > 0) {
+          for (const pair of pairs) {
+            await boss.send("server-health-check", { serverPairId: pair.id });
+          }
+          console.log(`[Worker] Queued health checks for ${pairs.length} active server pairs`);
         }
-        console.log(`[Worker] Queued health checks for ${pairs.length} active server pairs`);
+      } catch (err) {
+        console.error("[Worker] Health check cron failed:", err);
+        throw err;
       }
-    } catch (err) {
-      console.error("[Worker] Health check cron failed:", err);
-      throw err;
-    }
-  });
+    });
+  }
 
   // Register server-health-check handler
   interface HealthCheckPayload {
     serverPairId: string;
   }
 
-  await boss.work<HealthCheckPayload>(
-    "server-health-check",
-    {
-      batchSize: 1,
-      pollingIntervalSeconds: 10,
-    },
-    async (jobs) => {
-      for (const job of jobs) {
-        console.log(`[Worker] Starting health check for pair ${job.data.serverPairId}`);
-        try {
-          await handleHealthCheck(job.data);
-          console.log(`[Worker] Health check job ${job.id} completed successfully`);
-        } catch (err) {
-          console.error(`[Worker] Health check job ${job.id} failed:`, err);
-          throw err;
+  if (shouldRegister("server-health-check")) {
+    await boss.work<HealthCheckPayload>(
+      "server-health-check",
+      {
+        batchSize: 1,
+        pollingIntervalSeconds: 10,
+      },
+      async (jobs) => {
+        for (const job of jobs) {
+          console.log(`[Worker] Starting health check for pair ${job.data.serverPairId}`);
+          try {
+            await handleHealthCheck(job.data);
+            console.log(`[Worker] Health check job ${job.id} completed successfully`);
+          } catch (err) {
+            console.error(`[Worker] Health check job ${job.id} failed:`, err);
+            throw err;
+          }
         }
       }
-    }
-  );
+    );
+  }
 
   // Register list-registrar-domains handler.
   // Async-polling worker for the /api/dns-registrars/[id]/domains endpoint.
@@ -649,33 +798,35 @@ async function main() {
   // localConcurrency=1 + batchSize=1: we never want two simultaneous full
   // registrar listings against the same account — Ionos's throttle is
   // per-account and concurrent listings would just rate-limit each other.
-  await boss.work<ListRegistrarDomainsPayload>(
-    "list-registrar-domains",
-    {
-      batchSize: 1,
-      pollingIntervalSeconds: 5,
-      localConcurrency: 1,
-    },
-    async (jobs) => {
-      for (const job of jobs) {
-        console.log(
-          `[Worker] Starting list-registrar-domains job ${job.id} for registrar ${job.data.registrarId}`
-        );
-        try {
-          await handleListRegistrarDomains(job.data);
+  if (shouldRegister("list-registrar-domains")) {
+    await boss.work<ListRegistrarDomainsPayload>(
+      "list-registrar-domains",
+      {
+        batchSize: 1,
+        pollingIntervalSeconds: 5,
+        localConcurrency: 1,
+      },
+      async (jobs) => {
+        for (const job of jobs) {
           console.log(
-            `[Worker] list-registrar-domains job ${job.id} completed successfully`
+            `[Worker] Starting list-registrar-domains job ${job.id} for registrar ${job.data.registrarId}`
           );
-        } catch (err) {
-          console.error(
-            `[Worker] list-registrar-domains job ${job.id} failed:`,
-            err
-          );
-          throw err;
+          try {
+            await handleListRegistrarDomains(job.data);
+            console.log(
+              `[Worker] list-registrar-domains job ${job.id} completed successfully`
+            );
+          } catch (err) {
+            console.error(
+              `[Worker] list-registrar-domains job ${job.id} failed:`,
+              err
+            );
+            throw err;
+          }
         }
       }
-    }
-  );
+    );
+  }
 
   // --- Provisioning job-polling cron DISABLED 2026-04-10 ---
   // Hard lesson #11: This legacy monolithic path raced with the Vercel
@@ -737,9 +888,12 @@ async function main() {
     }
   };
 
-  // Poll every 10 seconds for dispatched steps
-  setInterval(pollDispatchedSteps, 10000);
-  await pollDispatchedSteps();
+  // Poll every 10 seconds for dispatched steps (OPS only — send-worker has
+  // no business touching provisioning_steps).
+  if (OPS_SIDE_EFFECTS_ENABLED) {
+    setInterval(pollDispatchedSteps, 10000);
+    await pollDispatchedSteps();
+  }
 
   // --- Poll for advanceable provisioning jobs (Test #15, hands-off driver) ---
   // The wizard-driven flow has Vercel's execute-step route choose the next
@@ -891,9 +1045,11 @@ async function main() {
   };
 
   // Poll every 15 seconds — slightly slower than pollDispatchedSteps so
-  // a freshly-claimed step gets dispatched in roughly one tick.
-  setInterval(pollAdvanceableJobs, 15000);
-  await pollAdvanceableJobs();
+  // a freshly-claimed step gets dispatched in roughly one tick. OPS only.
+  if (OPS_SIDE_EFFECTS_ENABLED) {
+    setInterval(pollAdvanceableJobs, 15000);
+    await pollAdvanceableJobs();
+  }
 
   // --- Poll for pending registrar domain-listing requests (worker bridge) ---
   // Vercel /api/dns-registrars/[id]/domains writes a 'fetching' cache entry
@@ -981,9 +1137,42 @@ async function main() {
 
   // Poll every 5 seconds for pending registrar listings. Faster than the
   // step-dispatch poll because the wizard UX benefits from shorter latency
-  // at the start of the fetch.
-  setInterval(pollRegistrarDomainListings, 5000);
-  await pollRegistrarDomainListings();
+  // at the start of the fetch. OPS only.
+  if (OPS_SIDE_EFFECTS_ENABLED) {
+    setInterval(pollRegistrarDomainListings, 5000);
+    await pollRegistrarDomainListings();
+  }
+
+  // Phase 6A: log role summary once all pg-boss registration is done so an
+  // operator can see at a glance which queues this worker is subscribing to.
+  console.log(
+    `[Worker] Role=${WORKER_ROLE}: registered ${registeredCount} handlers, skipped ${skippedCount}`
+  );
+
+  // Phase 6A: infra-level heartbeat (NEW — distinct from the per-org
+  // heartbeatInterval above). Upserts one row per WORKER_ROLE into
+  // worker_heartbeats every 30s so Dean can see both workers are alive from
+  // a single query. Best-effort: errors are logged, never thrown.
+  const hostName = process.env.HOSTNAME || os.hostname();
+  const infraHeartbeatPing = async () => {
+    try {
+      const supabase = getSupabase();
+      await supabase
+        .from("worker_heartbeats")
+        .upsert(
+          {
+            worker_role: WORKER_ROLE,
+            host: hostName,
+            last_ping_at: new Date().toISOString(),
+          },
+          { onConflict: "worker_role" }
+        );
+    } catch (err) {
+      console.error("[Worker] infra heartbeat ping failed:", err);
+    }
+  };
+  await infraHeartbeatPing();
+  const infraHeartbeatInterval = setInterval(infraHeartbeatPing, 30_000);
 
   console.log("[Worker] Email worker is running. Waiting for jobs...");
 
@@ -995,7 +1184,8 @@ async function main() {
   // premature SIGTERM kills are the zombie-retry trigger.
   const shutdownHandler = async (signal: string) => {
     console.log(`[Worker] ${signal} received, draining pg-boss (up to 5 min)...`);
-    clearInterval(heartbeatInterval);
+    if (heartbeatInterval) clearInterval(heartbeatInterval);
+    clearInterval(infraHeartbeatInterval);
     if (blacklistServer) {
       await new Promise<void>((resolve) => blacklistServer.close(() => resolve()));
     }
