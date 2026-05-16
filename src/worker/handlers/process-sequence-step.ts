@@ -169,14 +169,26 @@ export async function handleProcessSequenceStep(
   // 9. Generate tracking ID
   const trackingId = randomUUID();
 
-  // 9b. Prepare email with tracking (pixel, click rewrite, unsub link + headers)
+  // 9a. Fetch campaign-level send options (sub-cycle 1d). This handler does not
+  //     otherwise load the campaigns row, so this is a minimal targeted select.
+  //     include_unsubscribe gates the unsubscribe footer + RFC-8058 headers.
+  //     `?? true` keeps CAN-SPAM-safe behavior if the row/column is unreadable.
+  const { data: campaign } = await supabase
+    .from("campaigns")
+    .select("include_unsubscribe")
+    .eq("id", campaignId)
+    .single();
+  const includeUnsubscribe = campaign?.include_unsubscribe ?? true;
+
+  // 9b. Prepare email (open pixel + click rewrite always on; unsub gated)
   const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://cold-email-dashboard.vercel.app";
-  const prepared = prepareEmail(renderedHtml, trackingId, baseUrl);
+  const prepared = prepareEmail(renderedHtml, trackingId, baseUrl, includeUnsubscribe);
   const trackedHtml = prepared.html;
-  const extraHeaders: Record<string, string> = {
-    "List-Unsubscribe": prepared.listUnsubscribe,
-    "List-Unsubscribe-Post": prepared.listUnsubscribePost,
-  };
+  const extraHeaders: Record<string, string> = {};
+  if (prepared.listUnsubscribe && prepared.listUnsubscribePost) {
+    extraHeaders["List-Unsubscribe"] = prepared.listUnsubscribe;
+    extraHeaders["List-Unsubscribe-Post"] = prepared.listUnsubscribePost;
+  }
 
   // Add threading headers on top
   if (Object.keys(threadingHeaders).length > 0) {
