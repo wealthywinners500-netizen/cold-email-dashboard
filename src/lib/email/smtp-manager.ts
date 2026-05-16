@@ -22,12 +22,19 @@ interface SendResult {
 const transporterCache = new Map<string, Transporter>();
 const panelHostnameCache = new Map<string, string | null>();
 
-function getCacheKey(host: string, port: number, secure: boolean): string {
-  return `${host}:${port}:${secure}`;
+function getCacheKey(host: string, port: number, secure: boolean, name?: string): string {
+  return `${host}:${port}:${secure}:${name || ""}`;
 }
 
-function getTransporter(host: string, port: number, secure: boolean, user: string, pass: string): Transporter {
-  const key = getCacheKey(host, port, secure);
+function getTransporter(
+  host: string,
+  port: number,
+  secure: boolean,
+  user: string,
+  pass: string,
+  name?: string
+): Transporter {
+  const key = getCacheKey(host, port, secure, name);
   const cached = transporterCache.get(key);
   if (cached) return cached;
 
@@ -36,6 +43,10 @@ function getTransporter(host: string, port: number, secure: boolean, user: strin
     port,
     secure,
     auth: { user, pass },
+    // sub-cycle 1d: identify in HELO/EHLO as the panel FQDN instead of
+    // nodemailer's default "[127.0.0.1]" (an obvious automation tell in the
+    // Received: chain). undefined → nodemailer falls back to its default.
+    name,
     pool: true,
     maxConnections: 5,
     maxMessages: 100,
@@ -199,8 +210,12 @@ export async function sendEmail(
     ? `"${account.display_name}" <${account.email}>`
     : account.email;
 
+  // sub-cycle 1d: X-Tracking-Id wire header removed — it was an automation
+  // tell with zero read path (correlation is via email_send_log.tracking_id
+  // and the Message-ID). `trackingId` param retained for caller-signature
+  // stability (process-sequence-step.ts / send-email.ts pass it positionally).
+  void trackingId;
   const headers: Record<string, string> = {};
-  if (trackingId) headers["X-Tracking-Id"] = trackingId;
   if (extraHeaders) Object.assign(headers, extraHeaders);
 
   if (shouldUseSidecar(account.id)) {
@@ -215,12 +230,19 @@ export async function sendEmail(
     return sidecarSend(account, raw);
   }
 
+  // sub-cycle 1d: resolve the panel FQDN for the SMTP HELO/EHLO name so the
+  // Received: chain shows e.g. mail2.<domain> instead of "[127.0.0.1]". Reuses
+  // the same server_pairs resolver the sidecar path uses; falls back to
+  // smtp_host if the pair can't be resolved (still better than 127.0.0.1).
+  const heloName = (await resolvePanelHostname(account.smtp_host)) || account.smtp_host;
+
   const transporter = getTransporter(
     account.smtp_host,
     account.smtp_port,
     account.smtp_secure,
     account.smtp_user,
-    account.smtp_pass
+    account.smtp_pass,
+    heloName
   );
 
   const info = await transporter.sendMail({
